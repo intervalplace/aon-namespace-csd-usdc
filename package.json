@@ -1,5 +1,5 @@
 {
-  "name": "@aon/namespace-csd-usdc",
+  "name": "@intervalplace/namespace-csd-usdc",
   "version": "0.1.0",
   "description": "CSD/USDC settlement namespace for the Authorization Object Network",
   "type": "module",
@@ -11,19 +11,24 @@
       "types": "./dist/index.d.ts"
     }
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "build": "tsc"
   },
   "dependencies": {
-    "@aon/sdk": "^0.1.0",
-    "viem": "^2.21.0"
+    "viem": "^2.21.0",
+    "@intervalplace/aon-sdk": "^0.1.0"
   },
   "devDependencies": {
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   },
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/intervalplace/aon-namespace-csd-usdc.git"
