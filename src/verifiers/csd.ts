@@ -1,6 +1,6 @@
 import { createHash } from "crypto";
 import type { Hex } from "viem";
-import type { AonObject } from "../object.js";
+import type { AonObject } from "@intervalplace/aon-sdk";
 
 export type CsdProof = any;
 
