@@ -1,6 +1,6 @@
 // validators/authorization.ts
 import { getAddress, verifyTypedData, type Address, type Hex } from "viem";
-import type { AonObject } from "../object.js";
+import type { AonObject } from "@intervalplace/aon-sdk";
 import { assertSameCanonical } from "../utils/canonical.js";
 
 function assertSameObject(a: any, b: any) {

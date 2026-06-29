@@ -1,4 +1,4 @@
-import type { AonObject } from "../object.js";
+import type { AonObject } from "@intervalplace/aon-sdk";
 import { verifyObjectSignature } from "./signatures.js";
 import {
   requireReferenceTypes,
