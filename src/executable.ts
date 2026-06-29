@@ -1,4 +1,4 @@
-import { AonObject } from "./object.js";
+import { type AonObject } from "@intervalplace/aon-sdk";
 
 function lowerRefs(obj: AonObject) {
   return (obj.references ?? []).map((x) => x.toLowerCase());
