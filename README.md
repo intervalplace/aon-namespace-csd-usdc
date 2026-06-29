@@ -2,7 +2,7 @@
 
 CSD/USDC cross-system settlement namespace for the Authorization Object Network.
 
-Implements the `aon:csd-usdc` namespace: atomic settlement between CSD on Compute Substrate and USDC on EVM.
+Implements the `aon:csd-usdc` namespace — atomic settlement between CSD (a custom settlement layer) and USDC on EVM.
 
 ## Install
 
