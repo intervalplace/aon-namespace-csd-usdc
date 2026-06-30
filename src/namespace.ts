@@ -1,9 +1,7 @@
-import type { NamespaceDriver } from "../index.js";
+import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { findExecutableGraphs } from "@intervalplace/aon-sdk";
-import { verifyCsdPaymentProof } from "../../verifiers/csd.js";
-import {
-  executeCsdUsdcSettlementOnEvm,
-} from "../../executors/evmCsdUsdcSettlement.js";
+import { verifyCsdPaymentProof } from "./verifiers/csd.js";
+import { executeCsdUsdcSettlementOnEvm } from "./executors/evmCsdUsdcSettlement.js";
 
 export const csdUsdcNamespace: NamespaceDriver = {
   namespace: "aon:csd-usdc",
