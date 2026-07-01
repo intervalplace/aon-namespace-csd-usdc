@@ -1,10 +1,77 @@
 import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { findExecutableGraphs } from "@intervalplace/aon-sdk";
+import { getAddress } from "viem";
 import { verifyCsdPaymentProof } from "./verifiers/csd.js";
 import { executeCsdUsdcSettlementOnEvm } from "./executors/evmCsdUsdcSettlement.js";
 
-export const csdUsdcNamespace: NamespaceDriver = {
+// ── Extended driver type ───────────────────────────────────────────────────────
+
+type EIP712Field = { name: string; type: string };
+type EIP712Types = Record<string, EIP712Field[]>;
+
+export type CsdUsdcDriver = NamespaceDriver & {
+  types(): EIP712Types;
+  revocationTypes(): EIP712Types;
+  normalizeAuthorization(auth: any): any;
+};
+
+// ── EIP-712 schemas ────────────────────────────────────────────────────────────
+// Derived from CsdUsdcSettlement.sol AUTH_TYPEHASH.
+
+const AUTH_TYPES: EIP712Types = {
+  CsdUsdcAuthorization: [
+    { name: "buyer",                  type: "address" },
+    { name: "sellerUsdcRecipient",    type: "address" },
+    { name: "sellerCsdScriptHash",    type: "bytes32" },
+    { name: "csdGenesisHash",         type: "bytes32" },
+    { name: "tradeIntentHash",        type: "bytes32" },
+    { name: "csdAmount",              type: "uint256" },
+    { name: "usdc",                   type: "address" },
+    { name: "usdcAmount",             type: "uint256" },
+    { name: "minConfirmations",       type: "uint256" },
+    { name: "executorFeeAmount",      type: "uint256" },
+    { name: "validAfter",             type: "uint64"  },
+    { name: "validBefore",            type: "uint64"  },
+    { name: "nonce",                  type: "bytes32" },
+  ],
+};
+
+const REVOCATION_TYPES: EIP712Types = {
+  AonRevocation: [
+    { name: "targetHash",  type: "bytes32" },
+    { name: "targetType",  type: "string"  },
+    { name: "reason",      type: "string"  },
+    { name: "nonce",       type: "bytes32" },
+  ],
+};
+
+export const csdUsdcNamespace: CsdUsdcDriver = {
   namespace: "aon:csd-usdc",
+
+  // ── EIP-712 schemas ──────────────────────────────────────────────────────────
+
+  types() { return AUTH_TYPES; },
+  revocationTypes() { return REVOCATION_TYPES; },
+
+  // ── Authorization normalization ───────────────────────────────────────────────
+
+  normalizeAuthorization(auth: any) {
+    return {
+      buyer:                getAddress(auth.buyer),
+      sellerUsdcRecipient:  getAddress(auth.sellerUsdcRecipient),
+      sellerCsdScriptHash:  auth.sellerCsdScriptHash,
+      csdGenesisHash:       auth.csdGenesisHash,
+      tradeIntentHash:      auth.tradeIntentHash,
+      csdAmount:            String(auth.csdAmount),
+      usdc:                 getAddress(auth.usdc),
+      usdcAmount:           String(auth.usdcAmount),
+      minConfirmations:     String(auth.minConfirmations),
+      executorFeeAmount:    String(auth.executorFeeAmount ?? "0"),
+      validAfter:           String(auth.validAfter),
+      validBefore:          String(auth.validBefore),
+      nonce:                auth.nonce,
+    };
+  },
 
   evaluate(objects, opts) {
     return findExecutableGraphs(objects, {
