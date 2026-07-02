@@ -203,16 +203,9 @@ export function verifyCsdProofObject(condition: AonObject, proofObj: AonObject) 
   const proofType = proofObj.payload.proofType;
 
   if (proofType !== "csd_payment") {
-    if (process.env.AON_DEV_ALLOW_UNVERIFIED === "true") {
-      return {
-        ok: true,
-        skipped: true,
-        reason: "DEV_MODE_UNVERIFIED_PROOF_ALLOWED",
-      };
-    }
-
     throw new Error("UNSUPPORTED_PROOF_TYPE");
   }
+
 
   if (!proofObj.payload.proof) {
     throw new Error("CSD_PROOF_PAYLOAD_MISSING");
