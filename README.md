@@ -39,7 +39,7 @@ const client = new AonNodeClient("http://localhost:8787");
 const buyer  = privateKeyToAccount("0x...");
 
 const domain = {
-  name: "AON CSD USDC",
+  name: "AON CSD/USDC",
   version: "1",
   chainId: 1,
   verifyingContract: "0x...",  // your settlement contract
