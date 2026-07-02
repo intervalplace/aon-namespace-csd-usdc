@@ -21,6 +21,14 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
+interface ICsdHeaderOracle {
+    function isConfirmed(
+        bytes32 blockHash,
+        bytes32 genesisHash,
+        uint256 minConfirmations
+    ) external view returns (bool);
+}
+
 contract CsdUsdcSettlement {
 
     bytes32 public constant CSD_USDC_AUTH_TYPEHASH = keccak256(
@@ -32,9 +40,9 @@ contract CsdUsdcSettlement {
 
     bytes32 private immutable DOMAIN_SEPARATOR;
 
-    // Starts at uint256 max (any hash passes). Updated on every successful settlement
-    // to the min of the current value and the settled block's difficulty target.
-    uint256 public minimumTarget = type(uint256).max;
+
+    ICsdHeaderOracle public immutable csdHeaderOracle;
+
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
     mapping(bytes32 => bool)    public consumedCsdTx;
@@ -96,7 +104,6 @@ contract CsdUsdcSettlement {
     );
     event CsdUsdcAuthorizationLocked(bytes32 indexed authHash, uint256 lockedUntil);
     event CsdUsdcAuthorizationFinalized(bytes32 indexed authHash, bytes32 indexed csdTxid);
-    event CsdMinimumDifficultyUpdated(uint256 newMinimumTarget);
 
     // ── Errors ────────────────────────────────────────────────────────────────
 
@@ -111,18 +118,25 @@ contract CsdUsdcSettlement {
     error CsdPaymentOutputNotFound();
     error CsdInsufficientPoW();
     error TransferFailed();
+    error CsdBitsInvalid();
+    error CsdBlockNotConfirmed();
+    error InvalidHeaderOracle();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-    constructor() {
-        DOMAIN_SEPARATOR = keccak256(abi.encode(
-            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
-            keccak256(bytes("AON CSD/USDC")),
-            keccak256(bytes("2")),
-            block.chainid,
-            address(this)
-        ));
-    }
+constructor(address _csdHeaderOracle) {
+    if (_csdHeaderOracle == address(0)) revert InvalidHeaderOracle();
+
+    csdHeaderOracle = ICsdHeaderOracle(_csdHeaderOracle);
+
+    DOMAIN_SEPARATOR = keccak256(abi.encode(
+        keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+        keccak256(bytes("AON CSD/USDC")),
+        keccak256(bytes("2")),
+        block.chainid,
+        address(this)
+    ));
+}
 
     function domainSeparator() external view returns (bytes32) { return DOMAIN_SEPARATOR; }
 
@@ -211,10 +225,14 @@ contract CsdUsdcSettlement {
             revert AuthorizationExpired(authHash);
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
 
-        // Full on-chain SPV — returns verified txid and updates difficulty floor
-        bytes32 csdTxid = _verifyCsdSpv(
-            spvProof, auth.sellerCsdScriptHash, auth.csdAmount, auth.csdGenesisHash
-        );
+// Verifies tx inclusion and confirms the containing block via CSD header oracle
+bytes32 csdTxid = _verifyCsdSpv(
+    spvProof,
+    auth.sellerCsdScriptHash,
+    auth.csdAmount,
+    auth.csdGenesisHash,
+    auth.minConfirmations
+);
 
         if (consumedCsdTx[csdTxid]) revert CsdTxAlreadyConsumed(csdTxid);
 
@@ -241,12 +259,13 @@ contract CsdUsdcSettlement {
 
     // ── SPV verification ──────────────────────────────────────────────────────
 
-    function _verifyCsdSpv(
-        CsdSpvProof calldata proof,
-        bytes32 expectedScriptHash,
-        uint256 expectedAmount,
-        bytes32 expectedGenesisHash
-    ) internal returns (bytes32 csdTxid) {
+function _verifyCsdSpv(
+    CsdSpvProof calldata proof,
+    bytes32 expectedScriptHash,
+    uint256 expectedAmount,
+    bytes32 expectedGenesisHash,
+    uint256 expectedConfirmations
+) internal view returns (bytes32 csdTxid) {
         if (proof.genesisHash != expectedGenesisHash) revert CsdGenesisHashMismatch();
 
         // 1. Compute txid from raw bytes (strips input script_sigs, dsha256)
@@ -259,18 +278,20 @@ contract CsdUsdcSettlement {
         bytes32 computedMerkle = _csdMerkleRoot(csdTxid, proof.merkleBranch);
         if (computedMerkle != proof.header.merkle) revert CsdMerkleInvalid();
 
-        // 4. Hash the block header and verify it meets the ratcheted difficulty floor
-        bytes32 blockHash = _csdHeaderHash(proof.header);
-        if (uint256(blockHash) > minimumTarget) revert CsdInsufficientPoW();
+bytes32 blockHash = _csdHeaderHash(proof.header);
+uint256 blockDifficultyTarget = _bitsToTarget(proof.header.bits);
 
-        // 5. Ratchet: update the floor using the difficulty TARGET (from bits),
-        //    not the raw block hash. This allows consecutive blocks at the same
-        //    difficulty to settle — a lucky hash does not inflate the floor.
-        uint256 blockDifficultyTarget = _bitsToTarget(proof.header.bits);
-        if (blockDifficultyTarget < minimumTarget) {
-            minimumTarget = blockDifficultyTarget;
-            emit CsdMinimumDifficultyUpdated(blockDifficultyTarget);
-        }
+if (uint256(blockHash) > blockDifficultyTarget) revert CsdInsufficientPoW();
+
+if (
+    !csdHeaderOracle.isConfirmed(
+        blockHash,
+        expectedGenesisHash,
+        expectedConfirmations
+    )
+) {
+    revert CsdBlockNotConfirmed();
+}
     }
 
     // ── SPV primitives ────────────────────────────────────────────────────────
@@ -380,20 +401,27 @@ contract CsdUsdcSettlement {
         ))));
     }
 
-    // Decode Bitcoin compact target format (same as CSD uses)
-    function _bitsToTarget(uint32 bits) internal pure returns (uint256) {
-        uint256 exp  = bits >> 24;
-        uint256 mant = bits & 0xFFFFFF;
-        return exp > 3
-            ? mant << (8 * (exp - 3))
-            : mant >> (8 * (3 - exp));
-    }
+function _bitsToTarget(uint32 bits) internal pure returns (uint256) {
+    uint256 exp  = bits >> 24;
+    uint256 mant = bits & 0xFFFFFF;
+
+    if (exp == 0 || exp > 32 || mant == 0) revert CsdBitsInvalid();
+
+    uint256 target = exp > 3
+        ? mant << (8 * (exp - 3))
+        : mant >> (8 * (3 - exp));
+
+    if (target == 0 || target == type(uint256).max) revert CsdBitsInvalid();
+
+    return target;
+}
 
     // ── Byte helpers ──────────────────────────────────────────────────────────
 
-    function _readU64LE(bytes calldata data, uint256 off) internal pure returns (uint64 v) {
-        for (uint i = 0; i < 8; i++) v |= uint64(uint8(data[off + i])) << (i * 8);
-    }
+function _readU64LE(bytes calldata data, uint256 off) internal pure returns (uint64 v) {
+    require(off + 8 <= data.length, "CSD_U64_OVF");
+    for (uint i = 0; i < 8; i++) v |= uint64(uint8(data[off + i])) << (i * 8);
+}
 
     function _u32LE(uint32 v) internal pure returns (bytes4) {
         return bytes4(abi.encodePacked(uint8(v), uint8(v>>8), uint8(v>>16), uint8(v>>24)));
