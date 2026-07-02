@@ -55,11 +55,13 @@ const authData = {
   executorFeeAmount:   "1000",
   sellerCsdScriptHash: "0x" + "cc".repeat(32),
   csdGenesisHash:      "0x" + "dd".repeat(32),
-  minConfirmations:    3,
+  tradeIntentHash:     "0x" + "ff".repeat(32),
+  minConfirmations:    "3",
   validAfter:          String(Math.floor(Date.now() / 1000) - 60),
   validBefore:         String(Math.floor(Date.now() / 1000) + 86400),
   authNonce:           "0x" + "ee".repeat(32),
 };
+
 
 const sig = await buyer.signTypedData({
   domain,
