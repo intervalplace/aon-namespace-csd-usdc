@@ -22,6 +22,20 @@ interface IERC20 {
 }
 
 interface ICsdHeaderOracle {
+    struct CsdBlockHeader {
+        uint32  version;
+        bytes32 prev;
+        bytes32 merkle;
+        uint64  time;
+        uint32  bits;
+        uint32  nonce;
+    }
+
+    function submitHeaders(
+        bytes32 genesisHash,
+        CsdBlockHeader[] calldata newHeaders
+    ) external;
+
     function isConfirmed(
         bytes32 blockHash,
         bytes32 genesisHash,
@@ -75,20 +89,12 @@ contract CsdUsdcSettlement {
         bool    isLeft;               // true = sibling is on the left
     }
 
-    struct CsdBlockHeader {
-        uint32  version;
-        bytes32 prev;
-        bytes32 merkle;
-        uint64  time;
-        uint32  bits;
-        uint32  nonce;
-    }
-
     struct CsdSpvProof {
-        bytes           txRaw;         // Full raw transaction bytes
-        CsdMerkleStep[] merkleBranch;  // Merkle inclusion proof
-        CsdBlockHeader  header;        // Block header containing the tx
-        bytes32         genesisHash;   // CSD chain identifier
+        bytes                             txRaw;              // Full raw transaction bytes
+        CsdMerkleStep[]                   merkleBranch;       // Merkle inclusion proof
+        ICsdHeaderOracle.CsdBlockHeader   header;             // Block header containing the tx
+        bytes32                           genesisHash;        // CSD chain identifier
+        ICsdHeaderOracle.CsdBlockHeader[] confirmationChain;  // Headers from settlement block+1 to current tip
     }
 
     // ── Events ────────────────────────────────────────────────────────────────
@@ -224,6 +230,16 @@ constructor(address _csdHeaderOracle) {
         if (block.timestamp < auth.validAfter || block.timestamp > auth.validBefore)
             revert AuthorizationExpired(authHash);
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
+
+// Fold header submission into settlement — no separate operational step needed.
+// submitHeaders skips already-known headers so this is safe to call repeatedly.
+ICsdHeaderOracle.CsdBlockHeader[] memory single = new ICsdHeaderOracle.CsdBlockHeader[](1);
+single[0] = spvProof.header;
+csdHeaderOracle.submitHeaders(auth.csdGenesisHash, single);
+
+if (spvProof.confirmationChain.length > 0) {
+    csdHeaderOracle.submitHeaders(auth.csdGenesisHash, spvProof.confirmationChain);
+}
 
 // Verifies tx inclusion and confirms the containing block via CSD header oracle
 bytes32 csdTxid = _verifyCsdSpv(
@@ -390,7 +406,7 @@ if (
     }
 
     // dsha256 of: version(4le) + prev(32) + merkle(32) + time(8le) + bits(4le) + nonce(4le)
-    function _csdHeaderHash(CsdBlockHeader calldata h) internal pure returns (bytes32) {
+    function _csdHeaderHash(ICsdHeaderOracle.CsdBlockHeader calldata h) internal pure returns (bytes32) {
         return sha256(abi.encodePacked(sha256(abi.encodePacked(
             _u32LE(h.version),
             h.prev,

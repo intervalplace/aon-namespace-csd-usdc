@@ -133,7 +133,7 @@ contract CsdHeaderOracle {
             CsdBlockHeader calldata h = newHeaders[i];
 
             bytes32 blockHash = _csdHeaderHash(h);
-            if (headers[blockHash].exists) revert HeaderAlreadyKnown();
+            if (headers[blockHash].exists) continue; // already known, skip
 
             StoredHeader storage parent = headers[h.prev];
             if (!parent.exists) revert ParentUnknown();
