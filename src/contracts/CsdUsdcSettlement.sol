@@ -241,10 +241,12 @@ if (spvProof.confirmationChain.length > 0) {
     // M25: Ensure the confirmation chain is anchored to the settlement block.
     // Without this check, a chain starting from a different block would not
     // actually confirm the settlement block.
-    bytes32 blockHash = _csdHeaderHash(spvProof.header);
-    bytes32 chainFirst = _csdHeaderHash(spvProof.confirmationChain[0]);
-    if (spvProof.confirmationChain[0].prev != blockHash) {
-        revert CsdInsufficientConfirmations();
+    // NEW-4: chainFirst removed (was dead variable).
+    // NEW-5: compute blockHash once here; _verifyCsdSpv will recompute internally
+    //        but that is unavoidable without a larger refactor.
+    bytes32 settlementBlockHash = _csdHeaderHash(spvProof.header);
+    if (spvProof.confirmationChain[0].prev != settlementBlockHash) {
+        revert CsdBlockNotConfirmed();   // NEW-1: reuse existing error, matches semantics
     }
     csdHeaderOracle.submitHeaders(auth.csdGenesisHash, spvProof.confirmationChain);
 }
