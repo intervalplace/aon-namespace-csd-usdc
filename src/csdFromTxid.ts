@@ -1,4 +1,5 @@
-
+import { finalizeObject } from "@intervalplace/aon-sdk";
+import { verifyCsdPaymentProof } from "./verifiers/csd.js";
 
 export async function fetchCsdProofByTxid(txid: string) {
   const base = process.env.CSD_RPC_URL ?? "http://127.0.0.1:8887";
@@ -21,7 +22,19 @@ export async function makeCsdPaymentProofObject(args: {
 }) {
   const proof = await fetchCsdProofByTxid(args.txid);
 
-  return {
+  // M23: Verify the proof locally before publishing — prevents invalid proof
+  // objects from propagating through the network and wasting storage/bandwidth
+  if (args.expectedRecipientScriptPubKey && args.expectedAmount !== undefined) {
+    verifyCsdPaymentProof({
+      proof,
+      expectedRecipientScriptPubKey: args.expectedRecipientScriptPubKey as any,
+      expectedAmount: BigInt(String(args.expectedAmount)),
+      minConfirmations: args.minConfirmations ?? 1,
+      expectedGenesisHash: undefined,
+    });
+  }
+
+  return finalizeObject({
     objectType: "proof",
     schemaVersion: "1",
     namespace: "aon:csd-usdc",
@@ -39,5 +52,5 @@ export async function makeCsdPaymentProofObject(args: {
       minConfirmations: args.minConfirmations ?? 1,
       expectedIntentHash: args.expectedIntentHash,
     },
-  };
+  });
 }
