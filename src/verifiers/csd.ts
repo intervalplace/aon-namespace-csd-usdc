@@ -217,49 +217,45 @@ export function verifyCsdProofObject(condition: AonObject, proofObj: AonObject) 
 
   const expectedRecipientScriptPubKey =
     condition.payload.expectedRecipientScriptPubKey;
+  const expectedAmount        = condition.payload.expectedAmount;
+  const minConfirmations      = condition.payload.minConfirmations ?? 1;
+  const expectedIntentHash    = condition.payload.expectedIntentHash;
+  const expectedGenesisHash   = condition.payload.expectedGenesisHash;
 
-  const expectedAmount = condition.payload.expectedAmount;
-  const minConfirmations = condition.payload.minConfirmations ?? 1;
-  const expectedIntentHash = condition.payload.expectedIntentHash;
-  const expectedGenesisHash = condition.payload.expectedGenesisHash;
-const proofExpectedRecipientScriptPubKey =
-  proofObj.payload.expectedRecipientScriptPubKey;
-
-const proofExpectedAmount = proofObj.payload.expectedAmount;
-const proofExpectedIntentHash = proofObj.payload.expectedIntentHash;
-
-if (
-  typeof proofExpectedRecipientScriptPubKey === "string" &&
-  typeof expectedRecipientScriptPubKey === "string" &&
-  normalizeCsdScriptHash(proofExpectedRecipientScriptPubKey) !==
-    normalizeCsdScriptHash(expectedRecipientScriptPubKey)
-) {
-  throw new Error("PROOF_CONDITION_RECIPIENT_MISMATCH");
-}
-
-if (
-  proofExpectedAmount !== undefined &&
-  String(proofExpectedAmount) !== String(expectedAmount)
-) {
-  throw new Error("PROOF_CONDITION_AMOUNT_MISMATCH");
-}
-
-if (
-  typeof proofExpectedIntentHash === "string" &&
-  typeof expectedIntentHash === "string" &&
-  proofExpectedIntentHash.toLowerCase() !== expectedIntentHash.toLowerCase()
-) {
-  throw new Error("PROOF_CONDITION_INTENT_HASH_MISMATCH");
-}
-
-
-
+  // H7: Null guards FIRST — before any cross-checks that silently skip on undefined
   if (typeof expectedRecipientScriptPubKey !== "string") {
     throw new Error("CSD_EXPECTED_RECIPIENT_SCRIPT_MISSING");
   }
-
   if (expectedAmount === undefined || expectedAmount === null) {
     throw new Error("CSD_EXPECTED_AMOUNT_MISSING");
+  }
+
+  // Cross-checks between proof and condition fields (now safe — fields are confirmed non-null)
+  const proofExpectedRecipientScriptPubKey = proofObj.payload.expectedRecipientScriptPubKey;
+  const proofExpectedAmount                = proofObj.payload.expectedAmount;
+  const proofExpectedIntentHash            = proofObj.payload.expectedIntentHash;
+
+  if (
+    typeof proofExpectedRecipientScriptPubKey === "string" &&
+    normalizeCsdScriptHash(proofExpectedRecipientScriptPubKey) !==
+      normalizeCsdScriptHash(expectedRecipientScriptPubKey)
+  ) {
+    throw new Error("PROOF_CONDITION_RECIPIENT_MISMATCH");
+  }
+
+  if (
+    proofExpectedAmount !== undefined &&
+    String(proofExpectedAmount) !== String(expectedAmount)
+  ) {
+    throw new Error("PROOF_CONDITION_AMOUNT_MISMATCH");
+  }
+
+  if (
+    typeof proofExpectedIntentHash === "string" &&
+    typeof expectedIntentHash === "string" &&
+    proofExpectedIntentHash.toLowerCase() !== expectedIntentHash.toLowerCase()
+  ) {
+    throw new Error("PROOF_CONDITION_INTENT_HASH_MISMATCH");
   }
 
   return verifyCsdPaymentProof({
