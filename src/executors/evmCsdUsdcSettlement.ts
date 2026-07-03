@@ -3,10 +3,10 @@ import {
   createPublicClient,
   http,
   getAddress,
+  defineChain,
   type Hex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { mainnet } from "viem/chains";
 
 // ── ABI ───────────────────────────────────────────────────────────────────────
 
@@ -144,10 +144,18 @@ function spvProofTuple(p: any) {
   };
 }
 
-function makeClients(rpcUrl: string, privateKey: Hex) {
+function makeClients(rpcUrl: string, privateKey: Hex, chainId: number) {
+  // Derive chain from the authorization's EIP-712 domain chainId.
+  // Ensures the executor submits to the same chain the parties signed for.
+  const chain = defineChain({
+    id:             chainId,
+    name:           `evm-${chainId}`,
+    nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+    rpcUrls:        { default: { http: [rpcUrl] } },
+  });
   const account = privateKeyToAccount(privateKey);
-  const wallet  = createWalletClient({ account, chain: mainnet, transport: http(rpcUrl) });
-  const pub     = createPublicClient({           chain: mainnet, transport: http(rpcUrl) });
+  const wallet  = createWalletClient({ account, chain, transport: http(rpcUrl) });
+  const pub     = createPublicClient({           chain, transport: http(rpcUrl) });
   return { account, wallet, pub };
 }
 
@@ -162,7 +170,11 @@ export async function executeCsdUsdcSettlementOnEvm(args: {
   const rpcUrl      = requireEnv("AON_EVM_RPC_URL");
   const privateKey  = asHex(requireEnv("AON_EXECUTOR_PRIVATE_KEY"), "INVALID_EXECUTOR_PRIVATE_KEY");
 
-  const { account, wallet, pub } = makeClients(rpcUrl, privateKey);
+  const domain  = args.authorization.signature?.domain;
+  if (!domain) throw new Error("MISSING_EIP712_DOMAIN");
+  const chainId = Number(domain.chainId);
+
+  const { account, wallet, pub } = makeClients(rpcUrl, privateKey, chainId);
 
   const auth       = args.authorization.payload.authorization;
   const sig        = args.authorization.signature?.signature;
@@ -201,7 +213,11 @@ export async function lockCsdUsdcOnEvm(args: { authorization: any }) {
   const rpcUrl     = requireEnv("AON_EVM_RPC_URL");
   const privateKey = asHex(requireEnv("AON_EXECUTOR_PRIVATE_KEY"), "INVALID_EXECUTOR_PRIVATE_KEY");
 
-  const { account, wallet, pub } = makeClients(rpcUrl, privateKey);
+  const domain  = args.authorization.signature?.domain;
+  if (!domain) throw new Error("MISSING_EIP712_DOMAIN");
+  const chainId = Number(domain.chainId);
+
+  const { account, wallet, pub } = makeClients(rpcUrl, privateKey, chainId);
 
   const auth = args.authorization.payload.authorization;
   const sig  = args.authorization.signature?.signature;
@@ -238,7 +254,11 @@ export async function refundExpiredCsdUsdcLockOnEvm(args: { authorization: any }
   const rpcUrl     = requireEnv("AON_EVM_RPC_URL");
   const privateKey = asHex(requireEnv("AON_EXECUTOR_PRIVATE_KEY"), "INVALID_EXECUTOR_PRIVATE_KEY");
 
-  const { account, wallet, pub } = makeClients(rpcUrl, privateKey);
+  const domain  = args.authorization.signature?.domain;
+  if (!domain) throw new Error("MISSING_EIP712_DOMAIN");
+  const chainId = Number(domain.chainId);
+
+  const { account, wallet, pub } = makeClients(rpcUrl, privateKey, chainId);
 
   const auth = args.authorization.payload.authorization;
 
