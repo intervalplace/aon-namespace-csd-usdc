@@ -238,6 +238,14 @@ single[0] = spvProof.header;
 csdHeaderOracle.submitHeaders(auth.csdGenesisHash, single);
 
 if (spvProof.confirmationChain.length > 0) {
+    // M25: Ensure the confirmation chain is anchored to the settlement block.
+    // Without this check, a chain starting from a different block would not
+    // actually confirm the settlement block.
+    bytes32 blockHash = _csdHeaderHash(spvProof.header);
+    bytes32 chainFirst = _csdHeaderHash(spvProof.confirmationChain[0]);
+    if (spvProof.confirmationChain[0].prev != blockHash) {
+        revert CsdInsufficientConfirmations();
+    }
     csdHeaderOracle.submitHeaders(auth.csdGenesisHash, spvProof.confirmationChain);
 }
 
@@ -455,10 +463,26 @@ function _readU64LE(bytes calldata data, uint256 off) internal pure returns (uin
         bytes memory dst, uint256 dstOff,
         uint256 n
     ) internal pure {
-        for (uint256 i = 0; i < n; i++) dst[dstOff + i] = src[srcOff + i];
+        // Copy in 32-byte word chunks for efficiency, byte-by-byte only for the tail
+        assembly {
+            let srcPtr := add(src.offset, srcOff)
+            let dstPtr := add(add(dst, 32), dstOff)
+            let end    := add(srcPtr, n)
+            for {} lt(add(srcPtr, 31), end) { srcPtr := add(srcPtr, 32) dstPtr := add(dstPtr, 32) } {
+                mstore(dstPtr, calldataload(srcPtr))
+            }
+            // Tail: remaining bytes < 32
+            for {} lt(srcPtr, end) { srcPtr := add(srcPtr, 1) dstPtr := add(dstPtr, 1) } {
+                mstore8(dstPtr, byte(0, calldataload(srcPtr)))
+            }
+        }
     }
 
     // ── ECDSA recovery ────────────────────────────────────────────────────────
+
+    // Secp256k1 half-order — s must be in the lower half to prevent malleability
+    uint256 private constant SECP256K1_HALF_ORDER =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
 
     function _recover(bytes32 digest, bytes calldata sig) internal pure returns (address) {
         if (sig.length != 65) revert BadSignature();
@@ -470,6 +494,8 @@ function _readU64LE(bytes calldata data, uint256 off) internal pure returns (uin
         }
         if (v < 27) v += 27;
         if (v != 27 && v != 28) revert BadSignature();
+        // L7: Reject upper-half s values (EIP-2 / OpenZeppelin ECDSA practice)
+        if (uint256(s) > SECP256K1_HALF_ORDER) revert BadSignature();
         address signer = ecrecover(digest, v, r, s);
         if (signer == address(0)) revert BadSignature();
         return signer;
