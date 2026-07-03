@@ -2,6 +2,7 @@ import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { findExecutableGraphs } from "@intervalplace/aon-sdk";
 import { getAddress } from "viem";
 import { verifyCsdPaymentProof } from "./verifiers/csd.js";
+import { verifyAuthorizationObject } from "./verifiers/authorization.js";
 import { executeCsdUsdcSettlementOnEvm } from "./executors/evmCsdUsdcSettlement.js";
 
 // ── Extended driver type ───────────────────────────────────────────────────────
@@ -111,6 +112,12 @@ export const csdUsdcNamespace: CsdUsdcDriver = {
       });
     } catch (err: any) {
       return { ok: false, reason: err?.message ?? "VERIFY_FAILED" };
+    }
+  },
+
+  async validateObject(obj: any) {
+    if (obj.objectType === "authorization") {
+      await verifyAuthorizationObject(obj);
     }
   },
 
