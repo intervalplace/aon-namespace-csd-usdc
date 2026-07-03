@@ -26,7 +26,6 @@ export async function makeCsdPaymentProofObject(args: {
     schemaVersion: "1",
     namespace: "aon:csd-usdc",
     createdAt: Date.now(),
-    creator: "aon-node-v0",
     references: [args.reserveHash],
     payload: {
       proofType: "csd_payment",
