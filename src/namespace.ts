@@ -95,19 +95,23 @@ export const csdUsdcNamespace: CsdUsdcDriver = {
     const authorization = graph.authorization;
     const proof = graph.proof;
 
-    if (!authorization?.objectHash) throw new Error("MISSING_AUTHORIZATION");
-    if (!graph.reserve?.objectHash) throw new Error("MISSING_RESERVE");
-    if (!proof?.objectHash) throw new Error("MISSING_PROOF");
+    if (!authorization?.objectHash) return { ok: false, reason: "MISSING_AUTHORIZATION" };
+    if (!graph.reserve?.objectHash) return { ok: false, reason: "MISSING_RESERVE" };
+    if (!proof?.objectHash)         return { ok: false, reason: "MISSING_PROOF" };
 
     const a = authorization.payload.authorization;
 
-    return verifyCsdPaymentProof({
-      proof: proof.payload.proof,
-      expectedRecipientScriptPubKey: a.sellerCsdScriptHash,
-      expectedAmount: BigInt(a.csdAmount),
-      minConfirmations: Number(a.minConfirmations ?? 1),
-      expectedGenesisHash: a.csdGenesisHash,
-    });
+    try {
+      return verifyCsdPaymentProof({
+        proof: proof.payload.proof,
+        expectedRecipientScriptPubKey: a.sellerCsdScriptHash,
+        expectedAmount: BigInt(a.csdAmount),
+        minConfirmations: Number(a.minConfirmations ?? 1),
+        expectedGenesisHash: a.csdGenesisHash,
+      });
+    } catch (err: any) {
+      return { ok: false, reason: err?.message ?? "VERIFY_FAILED" };
+    }
   },
 
   async execute(graph: any, args?: { mode?: "off" | "simulate" | "contract" }) {
