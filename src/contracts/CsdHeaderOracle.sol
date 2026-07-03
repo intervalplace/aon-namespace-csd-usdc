@@ -79,7 +79,18 @@ contract CsdHeaderOracle {
     }
 
     function transferOwnership(address nextOwner) external onlyOwner {
+        require(nextOwner != address(0), "ZERO_ADDRESS");
         owner = nextOwner;
+    }
+
+    // Allow owner to tighten the difficulty floor (decrease maxTarget only).
+    // Useful if the CSD chain increases its minimum difficulty.
+    // Can never loosen the target — only the registered chain can make mining easier.
+    function updateMaxTarget(bytes32 genesisHash, uint256 newMaxTarget) external onlyOwner {
+        Chain storage chain = chains[genesisHash];
+        require(chain.initialized, "CHAIN_NOT_REGISTERED");
+        require(newMaxTarget < chain.maxTarget, "CANNOT_LOOSEN_TARGET");
+        chain.maxTarget = newMaxTarget;
     }
 
     function registerChainCheckpoint(
