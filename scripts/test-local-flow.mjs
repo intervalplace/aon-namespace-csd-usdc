@@ -118,7 +118,6 @@ const reserveObj = await finalizeObject({
   schemaVersion: "1",
   namespace: "aon:csd-usdc",
   createdAt: Date.now(),
-  creator: buyer.address,
   references: [authObj.objectHash],
   payload: { reserveType: "csd_usdc_intent" },
 });
@@ -196,7 +195,6 @@ const proofObj = await finalizeObject({
   schemaVersion: "1",
   namespace: "aon:csd-usdc",
   createdAt: Date.now(),
-  creator: "aon-csd-usdc-test",
   references: [reserveObj.objectHash],
   payload: {
     proofType: "csd_payment",
@@ -243,7 +241,6 @@ const receiptObj = await finalizeObject({
   schemaVersion: "1",
   namespace: "aon:csd-usdc",
   createdAt: Date.now(),
-  creator: "aon-csd-usdc-test",
   references: [
     executable.authorization.objectHash,
     executable.reserve.objectHash,
