@@ -66,6 +66,10 @@ contract CsdUsdcSettlement {
 
     uint256 public constant SETTLEMENT_LOCK_SECONDS = 20 minutes;
 
+    // Per-trade USDC cap. Limits exposure to 1-confirmation reorg risk on
+    // low-hashrate chains. Raising this requires redeployment — intentional.
+    uint256 public constant MAX_USDC_PER_TRADE = 100_000_000; // 100 USDC (6 decimals)
+
     // ── Structs ───────────────────────────────────────────────────────────────
 
     struct CsdUsdcAuthorization {
@@ -115,6 +119,7 @@ contract CsdUsdcSettlement {
 
     error BadSignature();
     error AuthorizationExpired(bytes32 authHash);
+    error TradeLimitExceeded();
     error AuthorizationAlreadyFinalized(bytes32 authHash);
     error AuthorizationLocked(bytes32 authHash, uint256 lockedUntil);
     error AuthorizationNotLocked(bytes32 authHash);
@@ -178,6 +183,7 @@ constructor(address _csdHeaderOracle) {
         if (block.timestamp < auth.validAfter || block.timestamp > auth.validBefore)
             revert AuthorizationExpired(authHash);
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
+        if (auth.usdcAmount > MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
 
         // CEI: set state before external call to prevent reentrancy
         uint256 lockAmount = auth.usdcAmount + auth.executorFeeAmount;
