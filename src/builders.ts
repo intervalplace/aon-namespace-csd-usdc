@@ -1,6 +1,6 @@
 // builders.ts — object construction helpers for aon:csd-usdc
 
-import { getAddress, verifyTypedData, type Hex } from "viem";
+import { getAddress, verifyTypedData, type Hex, type Address } from "viem";
 import { finalizeObject } from "@intervalplace/aon-sdk";
 import type { AonObject } from "@intervalplace/aon-sdk";
 import { csdUsdcNamespace } from "./namespace.js";
@@ -148,6 +148,48 @@ export async function buildCsdUsdcRevocationObject(
         message: revocationMessage,
         signature: body.signature.signature,
       },
+    },
+  } as any);
+}
+
+// ── Sell offer ────────────────────────────────────────────────────────────────
+// A public advertisement that a seller wants to trade CSD for USDC.
+// Not signed — the seller's intent is implicit; settlement requires them to
+// actually lock and send CSD. Buyers reference the offer's objectHash as
+// the tradeIntentHash in their CsdUsdcAuthorization, cryptographically
+// binding their authorization to this specific offer.
+
+export type CsdSellOfferBody = {
+  seller:               Address;   // ethereum address of the seller
+  sellerUsdcRecipient:  Address;   // where USDC should land
+  csdGenesisHash:       Hex;       // identifies the CSD chain
+  csdAmount:            string;    // satoshis
+  usdcAmount:           string;    // 6-decimal USDC units
+  pricePerCsd?:         string;    // usdcAmount / csdAmount — informational
+  validBefore:          number;    // unix seconds when the offer expires
+  createdAt?:           number;
+};
+
+export function buildCsdSellOfferObject(body: CsdSellOfferBody): AonObject {
+  if (BigInt(body.csdAmount)  <= 0n) throw new Error("INVALID_CSD_AMOUNT");
+  if (BigInt(body.usdcAmount) <= 0n) throw new Error("INVALID_USDC_AMOUNT");
+  if (body.validBefore <= Math.floor(Date.now() / 1000)) throw new Error("OFFER_ALREADY_EXPIRED");
+
+  return finalizeObject({
+    objectType: "csd_sell_offer",
+    schemaVersion: "1",
+    namespace: "aon:csd-usdc",
+    createdAt: body.createdAt ?? Date.now(),
+    references: [],
+    payload: {
+      offerType: "csd_usdc_sell",
+      seller:              getAddress(body.seller),
+      sellerUsdcRecipient: getAddress(body.sellerUsdcRecipient),
+      csdGenesisHash:      body.csdGenesisHash,
+      csdAmount:           String(body.csdAmount),
+      usdcAmount:          String(body.usdcAmount),
+      pricePerCsd:         body.pricePerCsd ?? null,
+      validBefore:         body.validBefore,
     },
   } as any);
 }

@@ -15,6 +15,8 @@ export { csdUsdcNamespace } from "./namespace.js";
 export {
   buildCsdUsdcAuthorizationObject,
   buildCsdUsdcRevocationObject,
+  buildCsdSellOfferObject,
+  type CsdSellOfferBody,
 } from "./builders.js";
 
 export { makeCsdPaymentProofObject } from "./csdFromTxid.js";
