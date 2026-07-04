@@ -47,6 +47,17 @@ const SPV_PROOF_COMPONENTS = [
     ],
   },
   { name: "genesisHash", type: "bytes32" },
+  {
+    name: "confirmationChain", type: "tuple[]",
+    components: [
+      { name: "version", type: "uint32"  },
+      { name: "prev",    type: "bytes32" },
+      { name: "merkle",  type: "bytes32" },
+      { name: "time",    type: "uint64"  },
+      { name: "bits",    type: "uint32"  },
+      { name: "nonce",   type: "uint32"  },
+    ],
+  },
 ] as const;
 
 const abi = [
@@ -140,7 +151,16 @@ function spvProofTuple(p: any) {
       bits:    Number(p.header.bits),
       nonce:   Number(p.header.nonce),
     },
-    genesisHash: asHex(p.genesis_hash, "INVALID_GENESIS_HASH"),
+    genesisHash:       asHex(p.genesis_hash, "INVALID_GENESIS_HASH"),
+    // Confirmation headers beyond the settlement block (empty when minConfirmations=1)
+    confirmationChain: (p.confirmation_chain ?? []).map((h: any) => ({
+      version: Number(h.version),
+      prev:    asHex(h.prev,   "INVALID_CONF_PREV"),
+      merkle:  asHex(h.merkle, "INVALID_CONF_MERKLE"),
+      time:    BigInt(h.time),
+      bits:    Number(h.bits),
+      nonce:   Number(h.nonce),
+    })),
   };
 }
 
