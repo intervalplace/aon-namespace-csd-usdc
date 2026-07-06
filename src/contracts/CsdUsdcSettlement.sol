@@ -64,11 +64,25 @@ contract CsdUsdcSettlement {
     mapping(bytes32 => uint256) public lockedUntil;
     mapping(bytes32 => uint256) public lockedAmount;
 
-    uint256 public constant SETTLEMENT_LOCK_SECONDS = 20 minutes;
 
-    // Per-trade USDC cap. Limits exposure to 1-confirmation reorg risk on
-    // low-hashrate chains. Raising this requires redeployment — intentional.
-    uint256 public constant MAX_USDC_PER_TRADE = 100_000_000; // 100 USDC (6 decimals)
+    // Tiered USDC caps by confirmation depth.
+    // Higher confirmation counts allow larger trade sizes because each additional
+    // confirmation exponentially increases the cost of a reorg attack.
+    // Buyers sign minConfirmations in the EIP-712 authorization, so the cap
+    // they face is determined by what they committed to.
+    // Raising these requires redeployment — intentional.
+    uint256 public constant MAX_USDC_1_CONF = 100_000_000;     //    100 USDC (6 decimals)
+    uint256 public constant MAX_USDC_2_CONF = 500_000_000;     //    500 USDC
+    uint256 public constant MAX_USDC_3_CONF = 2_000_000_000;   //  2,000 USDC
+    uint256 public constant MAX_USDC_4_CONF = 5_000_000_000;   //  5,000 USDC
+    uint256 public constant MAX_USDC_5_CONF = 10_000_000_000;  // 10,000 USDC
+    uint256 public constant MAX_USDC_6_CONF = 25_000_000_000;  // 25,000 USDC
+
+    // Settlement window scales with confirmation depth.
+    // Formula: max(20 min, 10 min + 5 min × minConfirmations)
+    // Gives the seller time to wait for confirmations before the lock expires.
+    uint256 public constant SETTLEMENT_LOCK_BASE     = 20 minutes;
+    uint256 public constant SETTLEMENT_LOCK_PER_CONF = 5 minutes;
 
     // ── Structs ───────────────────────────────────────────────────────────────
 
@@ -183,11 +197,26 @@ constructor(address _csdHeaderOracle) {
         if (block.timestamp < auth.validAfter || block.timestamp > auth.validBefore)
             revert AuthorizationExpired(authHash);
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
-        if (auth.usdcAmount > MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
+        // Tiered cap: higher confirmation count allows larger trade size
+        {
+            uint256 maxUsdc = auth.minConfirmations >= 6 ? MAX_USDC_6_CONF
+                            : auth.minConfirmations >= 5 ? MAX_USDC_5_CONF
+                            : auth.minConfirmations >= 4 ? MAX_USDC_4_CONF
+                            : auth.minConfirmations >= 3 ? MAX_USDC_3_CONF
+                            : auth.minConfirmations >= 2 ? MAX_USDC_2_CONF
+                            :                              MAX_USDC_1_CONF;
+            if (auth.usdcAmount > maxUsdc) revert TradeLimitExceeded();
+        }
 
         // CEI: set state before external call to prevent reentrancy
         uint256 lockAmount = auth.usdcAmount + auth.executorFeeAmount;
-        uint256 until = block.timestamp + SETTLEMENT_LOCK_SECONDS;
+        // Dynamic settlement window: max(base, base + perConf × minConfirmations)
+        uint256 lockSeconds = SETTLEMENT_LOCK_BASE;
+        {
+            uint256 confWindow = SETTLEMENT_LOCK_PER_CONF * auth.minConfirmations;
+            if (confWindow > lockSeconds) lockSeconds = confWindow;
+        }
+        uint256 until = block.timestamp + lockSeconds;
         if (until > auth.validBefore) until = auth.validBefore;
 
         lockedAmount[authHash] = lockAmount;
