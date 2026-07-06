@@ -1,5 +1,5 @@
 import type { NamespaceDriver } from "@intervalplace/aon-sdk";
-import { findExecutableGraphs } from "@intervalplace/aon-sdk";
+import { findExecutableGraphs, finalizeObject } from "@intervalplace/aon-sdk";
 import { getAddress } from "viem";
 import { verifyCsdPaymentProof } from "./verifiers/csd.js";
 import { verifyAuthorizationObject } from "./verifiers/authorization.js";
@@ -145,11 +145,32 @@ export const csdUsdcNamespace: CsdUsdcDriver = {
     }
 
     if (mode === "contract") {
-      return await executeCsdUsdcSettlementOnEvm({
+      const result = await executeCsdUsdcSettlementOnEvm({
         authorization: graph.authorization,
         reserve: graph.reserve,
         proof: graph.proof,
       });
+
+      // Build receipt object for AON — the SDK will post it via client.putObject
+      const refs = [
+        graph.authorization?.objectHash,
+        graph.reserve?.objectHash,
+        graph.proof?.objectHash,
+      ].filter(Boolean);
+
+      const receiptObject = finalizeObject({
+        objectType:    "receipt",
+        schemaVersion: "1",
+        namespace:     "aon:csd-usdc",
+        createdAt:     Date.now(),
+        references:    refs,
+        payload: {
+          receiptType: "authorized_state_transition_completed",
+          executionTx: result.executionTx,
+        },
+      });
+
+      return { ...result, receiptObject };
     }
 
     throw new Error("UNKNOWN_EXECUTOR_MODE");
