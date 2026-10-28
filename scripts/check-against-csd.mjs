@@ -46,7 +46,7 @@ try {
     console.log(last.toLowerCase() === hs.at(-1).hash ? `✓ All ${hs.length} real CSD blocks pass the contract's checks (mainnet rules) at the suggested difficulty.` : `✗ Unexpected last hash ${last}`);
   } catch (e) {
     const r = e instanceof BaseError ? e.walk(x => x instanceof ContractFunctionRevertedError) : null;
-    console.error(`✗ Rejected: ${r?.data?.errorName ?? e.shortMessage}. If it's CsdBlockTooEasy, difficulty fell more than a quarter within the range; try a shorter range.`);
+    console.error(`✗ Rejected: ${r?.data?.errorName ?? e.shortMessage}. If it's CsdInsufficientWork, difficulty fell more than a quarter on average over the range; try a shorter range.`);
     process.exitCode = 1;
   }
 } finally { anvil.kill(); }

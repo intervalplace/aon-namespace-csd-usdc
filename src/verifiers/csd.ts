@@ -90,6 +90,36 @@ function csdTxidFromRaw(txRaw: Hex): Hex {
   return toHex(dsha(Buffer.concat(parts)));
 }
 
+// Strict parse of a raw CSD transaction (same rules as the settlement
+// contract's _verifyCsdTx): outputs are value u64 + a bare 20-byte address.
+export function parseCsdTxOutputs(txRaw: Hex): { value: bigint; script: Hex }[] {
+  const raw = hexToBuf(txRaw);
+  const need = (n: number) => { if (off + n > raw.length) throw new Error("CSD_TX_MALFORMED"); };
+  let off = 4;
+  need(8); const inputCount = readU64LE(raw, off); off += 8;
+  if (inputCount === 0) throw new Error("CSD_TX_MALFORMED");
+  for (let i = 0; i < inputCount; i++) {
+    need(44);
+    if (i === 0 && raw.subarray(off, off + 32).every(b => b === 0) && raw.readUInt32LE(off + 32) === 0xffffffff) throw new Error("CSD_COINBASE_NOT_SUPPORTED");
+    off += 36;
+    const sl = readU64LE(raw, off); off += 8; need(sl); off += sl;
+  }
+  need(8); const outputCount = readU64LE(raw, off); off += 8;
+  const outs: { value: bigint; script: Hex }[] = [];
+  for (let i = 0; i < outputCount; i++) {
+    need(28);
+    outs.push({ value: raw.readBigUInt64LE(off), script: ("0x" + raw.subarray(off + 8, off + 28).toString("hex")) as Hex });
+    off += 28;
+  }
+  need(8); off += 4; const variant = raw.readUInt32LE(off); off += 4;
+  const str = () => { need(8); const n = readU64LE(raw, off); off += 8; need(n); off += n; };
+  if (variant === 1) { str(); need(32); off += 32; str(); need(8); off += 8; }
+  else if (variant === 2) { need(40); off += 40; }
+  else if (variant !== 0) throw new Error("CSD_TX_MALFORMED");
+  if (off !== raw.length) throw new Error("CSD_TX_MALFORMED");
+  return outs;
+}
+
 function csdMerkleRoot(txid: Hex, branch: { hash: Hex; position: "left" | "right" }[]): Hex {
   let cur = hexToBuf(txid);
 
@@ -157,14 +187,9 @@ export function verifyCsdPaymentProof(args: {
 
   const expectedScript = normalizeCsdScriptHash(expectedRecipientScriptPubKey);
 
-  const paid = proof.tx.outputs.some((o: any) => {
-    if (typeof o.script_pubkey !== "string") return false;
-
-    return (
-      normalizeCsdScriptHash(o.script_pubkey) === expectedScript &&
-      BigInt(o.value) >= expectedAmount
-    );
-  });
+  // Read the outputs from the raw bytes (bound to the txid), not the JSON
+  const paid = parseCsdTxOutputs(proof.tx_raw).some(o =>
+    o.script.toLowerCase() === expectedScript.toLowerCase() && o.value >= expectedAmount);
 
   if (!paid) throw new Error("CSD_PAYMENT_OUTPUT_NOT_FOUND");
 

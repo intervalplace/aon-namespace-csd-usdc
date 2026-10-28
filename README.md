@@ -113,12 +113,15 @@ ETH/USDT market with nothing to keep running: no header oracle, no relayer.
   proof must be at least that hard. Interfaces and bots set it to about 3/4
   of CSD's current difficulty (`suggestedMaxTarget()` in
   `scripts/csd-headers.mjs`: current target × 4/3).
-- `settleCsdUsdc` gets the payment transaction, its merkle path, the payment
-  block and the next blocks (`minConfirmations` in total). It checks they link
-  up by hash, each has valid proof of work within CSD's PoW limit and at
-  least the signed difficulty, and CSD's 60-second spacing rule.
-- So faking k confirmations means mining k blocks at that difficulty,
-  however the fake chain is built. About 166k gas per settlement.
+- `settleCsdUsdc` gets the payment transaction (parsed strictly, every byte
+  accounted for), its merkle path, the payment block and the next blocks
+  (`minConfirmations` or more). It checks they link up by hash, each has
+  valid proof of work within CSD's PoW limit, none is more than 2 h in the
+  future, CSD's 60-second spacing rule, and that together they carry at
+  least `minConfirmations` blocks' worth of work at the signed difficulty.
+  If difficulty eases, the seller just includes more blocks.
+- So faking k confirmations means mining k blocks' worth of work at that
+  difficulty, however the fake chain is built. About 166k gas per settlement.
 - The seller checks the signed difficulty isn't above the real one before
   paying (otherwise real blocks wouldn't qualify); `checkHeaderChain` lets
   anyone pre-check a run of real headers.
@@ -128,7 +131,9 @@ ETH/USDT market with nothing to keep running: no header oracle, no relayer.
 | | |
 |---|---|
 | Confirmations | 3 to 60, chosen by the buyer |
-| Difficulty | every proof block at least as hard as the buyer's `csdMaxTarget` |
+| Difficulty | proof blocks carry ≥ confirmations × the work of one block at the buyer's `csdMaxTarget` |
+| CSD address | one open trade per receiving address (a payment can't say which trade it's for) |
+| Coinbase | payments inside a coinbase transaction can't be proven |
 | Max per trade | 30 USDC including the executor fee, whatever the confirmations |
 | Max locked in total | set at deployment (`maxTotalLocked`), across all open trades |
 | Token / chain | the stablecoin and the CSD genesis fixed at deployment |

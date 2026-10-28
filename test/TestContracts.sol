@@ -30,4 +30,8 @@ contract CsdConsensusHarness {
 contract TestCsdUsdcSettlement is CsdUsdcSettlement {
     constructor(address usdc, uint256 maxTotal, bytes32 genesis) CsdUsdcSettlement(usdc, maxTotal, genesis) {}
     function _powLimitBits() internal pure override returns (uint32) { return 0x207fffff; }
+    // Internals exposed for the encoding tests against CSD's own serializer
+    function txidOf(bytes calldata raw) external pure returns (bytes32) { return _csdTxidFromRaw(raw); }
+    function verifyTx(bytes calldata raw, bytes32 script, uint256 amount) external pure { _verifyCsdTx(raw, script, amount); }
+    function headerHashOf(CsdBlockHeader calldata h) external pure returns (bytes32) { return _csdHeaderHash(h); }
 }

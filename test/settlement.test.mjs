@@ -39,7 +39,7 @@ function csdTx({ inputs = [], outputs }) {
   const parts = [u32(1), u64(inputs.length)];
   for (const i of inputs) parts.push(i.txid, u32(i.vout), u64(i.script.length), i.script);
   parts.push(u64(outputs.length));
-  for (const o of outputs) parts.push(u64(o.value), u64(20), o.script);
+  for (const o of outputs) parts.push(u64(o.value), o.script); // CSD: value u64 + bare 20-byte address
   parts.push(u32(0), u32(0)); // locktime, AppPayload::None
   return Buffer.concat(parts);
 }
@@ -87,13 +87,15 @@ async function releaseMsg(a, over = {}) {
 const signRelease = (msg, who = buyer) => who.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: msg });
 const BUYER_CSD_ADDR = createHash("ripemd160").update(sha(Buffer.from("buyer-csd-pubkey"))).digest(); // hash160
 let nonceN = 0;
-async function makeAuth({ usdcAmount, conf = 3n, fee = 50_000n, csdAmount = 500_00000000n, maxTarget = TARGET }) {
+let addrN = 0;
+const freshAddr = () => createHash("ripemd160").update(sha(Buffer.from(`buyer-csd-${addrN++}`))).digest();
+async function makeAuth({ usdcAmount, conf = 3n, fee = 50_000n, csdAmount = 500_00000000n, maxTarget = TARGET, addr = freshAddr() }) {
   const t = await now();
-  const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([BUYER_CSD_ADDR, Buffer.alloc(12)])),
+  const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([addr, Buffer.alloc(12)])),
     csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount, usdc, usdcAmount, minConfirmations: conf, csdMaxTarget: maxTarget,
     executorFeeAmount: fee, validAfter: BigInt(t - 60), validBefore: BigInt(t + 6 * 3600), nonce: keccak256(toHex(`n${nonceN++}`)) };
   const sig = await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
-  return { auth, sig, hash: hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) };
+  return { auth, sig, addr, hash: hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) };
 }
 let payN = 0;
 // A CSD payment block plus `extra` confirmation headers on top of the current tip
@@ -143,7 +145,7 @@ console.log("\n[2b] Total locked across all trades is capped");
 { const capped = await deploy("TestCsdUsdcSettlement", [usdc, 60_000_000n, GENESIS]);
   await send(buyer, usdc, "MockUSDC", "approve", [capped, 10_000_000_000n]);
   const cdomain = { ...domain, verifyingContract: capped };
-  const mk = async (usdcAmount, n) => { const t = await now(); const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([BUYER_CSD_ADDR, Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, csdMaxTarget: TARGET, executorFeeAmount: 0n, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`cap${n}`)) };
+  const mk = async (usdcAmount, n) => { const t = await now(); const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([freshAddr(), Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, csdMaxTarget: TARGET, executorFeeAmount: 0n, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`cap${n}`)) };
     return { auth, sig: await buyer.signTypedData({ domain: cdomain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) }; };
   const x = await mk(30_000_000n, 1), y = await mk(30_000_000n, 2), z = await mk(1_000_000n, 3);
   await call(executor, capped, S, "lockCsdUsdcAuthorization", [x.auth, x.sig]);
@@ -168,7 +170,7 @@ console.log("\n[3] Normal settlement with a CSD proof still works");
 { const a = await makeAuth({ usdcAmount: 25_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   const s0 = await bal(seller.address), e0 = await bal(executor.address);
-  const proof = await payAndConfirm({ value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
+  const proof = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]);
   check(await bal(seller.address) - s0 === 25_000_000n, "seller received 25 USDC after 3 confirmations");
   check(await bal(executor.address) - e0 === 50_000n, "executor received its fee");
@@ -179,13 +181,20 @@ console.log("\n[3b] The proof's blocks: linked, enough work, at least the signed
   const hard = await makeAuth({ usdcAmount: 10_000_000n, maxTarget: TARGET / 4n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [hard.auth, hard.sig]);
   let before = tip;
-  const easy = await payAndConfirm({ value: hard.auth.csdAmount, extra: 2 });
-  await reverts(call(executor, settlement, S, "settleCsdUsdc", [hard.auth, hard.sig, easy]), "CsdBlockTooEasy", "blocks easier than the signed difficulty don't count");
+  const easy = await payAndConfirm({ to: hard.addr, value: hard.auth.csdAmount, extra: 2 });
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [hard.auth, hard.sig, easy]), "CsdInsufficientWork", "3 blocks at a quarter of the signed difficulty aren't enough work");
   tip = before;
+  // More blocks make up the work: at half the signed difficulty, 6 blocks count as 3
+  const half = await makeAuth({ usdcAmount: 10_000_000n, maxTarget: TARGET / 2n });
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [half.auth, half.sig]);
+  const six = await payAndConfirm({ to: half.addr, value: half.auth.csdAmount, extra: 5 });
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [half.auth, half.sig, { ...six, confirmationChain: six.confirmationChain.slice(0, 4) }]), "CsdInsufficientWork", "5 blocks at half the difficulty: not yet");
+  await call(executor, settlement, S, "settleCsdUsdc", [half.auth, half.sig, six]);
+  check(await read(settlement, S, "finalizedAuthorization", [half.hash]) === true, "6 blocks at half the difficulty settle (if difficulty eases, the seller just waits for more blocks)");
   const a = await makeAuth({ usdcAmount: 10_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   before = tip;
-  const p = await payAndConfirm({ value: a.auth.csdAmount, extra: 2 });
+  const p = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: p.confirmationChain.slice(0, 1) }]), "CsdBlockNotConfirmed", "too few confirming blocks");
   const broken = { ...p, confirmationChain: [p.confirmationChain[1], p.confirmationChain[0]] };
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, broken]), "CsdChainBroken", "confirming blocks must link up by hash");
@@ -194,6 +203,9 @@ console.log("\n[3b] The proof's blocks: linked, enough work, at least the signed
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: [toSol(fast), p.confirmationChain[1]] }]), "CsdBlockTooSoon", "a block less than 60 s after its parent doesn't count");
   let bad = { ...c0 }; for (let n = c0.nonce + 1; ; n++) { const h = { ...c0, nonce: n }; const b = headerBytes({ version: 1, prev: Buffer.from(h.prev.slice(2), "hex"), merkle: Buffer.from(h.merkle.slice(2), "hex"), time: Number(h.time), bits: h.bits, nonce: n }); if (BigInt(hx(dsha(b))) > TARGET) { bad = h; break; } }
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: [bad, p.confirmationChain[1]] }]), "CsdInsufficientPoW", "a block without enough proof of work doesn't count");
+  const future = { ...p, confirmationChain: [p.confirmationChain[0], toSol(mine({ version: 1, prev: Buffer.from(p.confirmationChain[0].prev.slice(2), "hex"), merkle: sha(Buffer.from("fut")), time: (await now()) + 2 * 3600 + 600, bits: BITS, nonce: 0 }))] };
+  future.confirmationChain[1] = toSol(mine({ version: 1, prev: dsha(headerBytes({ version: 1, prev: Buffer.from(c0.prev.slice(2), "hex"), merkle: Buffer.from(c0.merkle.slice(2), "hex"), time: Number(c0.time), bits: c0.bits, nonce: c0.nonce })), merkle: sha(Buffer.from("fut")), time: (await now()) + 2 * 3600 + 600, bits: BITS, nonce: 0 }));
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, future]), "CsdBlockInFuture", "a block more than 2 h in the future doesn't count");
   const rc = await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, p]);
   check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, `the valid proof settles (gas ${rc.gasUsed} with 3 confirmations)`);
   const g = { ...(await makeAuth({ usdcAmount: 1_000_000n })).auth, csdGenesisHash: hx(sha(Buffer.from("other-chain"))), nonce: keccak256(toHex("g")) };
@@ -205,10 +217,10 @@ console.log("\n[4] A CSD payment from before the lock doesn't count");
   const a = await makeAuth({ usdcAmount: 10_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   const before = tip;
-  const old = await payAndConfirm({ value: a.auth.csdAmount, time: await now() - 21 * 60, extra: 2 });
+  const old = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: await now() - 21 * 60, extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, old]), "CsdPaymentBeforeLock", "payment 21 minutes before the lock rejected");
   tip = before; // that branch was never submitted
-  const ok = await payAndConfirm({ value: a.auth.csdAmount, time: await now() - 19 * 60, extra: 2 });
+  const ok = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: await now() - 19 * 60, extra: 2 });
   await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, ok]);
   check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "payment within the 20-minute timestamp slack accepted"); }
 
@@ -236,7 +248,7 @@ console.log("\n[5] Early release: the buyer waives the wait");
   check(await read(settlement, S, "consumedCsdPayment", [await read(settlement, S, "csdPaymentKey", [m.csdTxid, a.auth.sellerCsdScriptHash])]) === true, "the accepted CSD payment is used up");
   await reverts(R(m, await signRelease(m)), "AuthorizationAlreadyFinalized", "can't be released twice");
   const before = tip;
-  const proof = await payAndConfirm({ value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
+  const proof = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]), "AuthorizationAlreadyFinalized", "can't also be settled with a proof");
   tip = before;
   await rpc("evm_increaseTime", [3600]); await rpc("evm_mine");
@@ -244,31 +256,34 @@ console.log("\n[5] Early release: the buyer waives the wait");
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "AuthorizationAlreadyFinalized", "can't be locked again"); }
 
 console.log("\n[6] A CSD payment accepted by an early release can't pay for another trade");
-{ const a = await makeAuth({ usdcAmount: 10_000_000n }), b = await makeAuth({ usdcAmount: 10_000_000n });
+{ const a = await makeAuth({ usdcAmount: 10_000_000n }), b = await makeAuth({ usdcAmount: 10_000_000n, addr: a.addr }); // same CSD address
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]), "CsdAddressBusy", "a second open trade to the same CSD address has to wait");
   const before = tip;
-  const proof = await payAndConfirm({ value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 }); // one payment to the (shared) address
+  const proof = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   const txid = hx(csdTxidFromRaw(proof.txRaw));
   const m = await releaseMsg(a, { csdTxid: txid });
   await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
-  await reverts(call(executor, settlement, S, "settleCsdUsdc", [b.auth, b.sig, proof]), "CsdTxAlreadyConsumed", "the same payment can't settle trade B");
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [b.auth, b.sig, proof]), "CsdTxAlreadyConsumed", "once A closes, B can open, but A's payment can't settle B");
   tip = before; }
 
 console.log("\n[6b] Nobody can block a seller by naming their payment in an unrelated trade");
 { const victim = await makeAuth({ usdcAmount: 10_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [victim.auth, victim.sig]);
   const before = tip;
-  const proof = await payAndConfirm({ value: victim.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
+  const proof = await payAndConfirm({ to: victim.addr, value: victim.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   const txid = hx(csdTxidFromRaw(proof.txRaw));
   // The attacker trades with themselves (own CSD address) and "accepts" the victim's payment
   await send(deployer, usdc, "MockUSDC", "mint", [executor.address, 5_000_000n]);
-  await send(executor, usdc, "MockUSDC", "approve", [settlement, 5_000_000n]);
+  await send(executor, usdc, "MockUSDC", "approve", [settlement, 10_000_000n]);
   const t = await now();
   const evil = { ...victim.auth, buyer: executor.address, sellerUsdcRecipient: executor.address, usdcAmount: 1_000_000n, executorFeeAmount: 0n,
     sellerCsdScriptHash: hx(Buffer.concat([Buffer.alloc(20, 0xee), Buffer.alloc(12)])), nonce: keccak256(toHex("evil")), validBefore: BigInt(t + 3600) };
   const evilSig = await executor.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: evil });
   const evilHash = hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: evil });
+  const squat = { ...evil, sellerCsdScriptHash: victim.auth.sellerCsdScriptHash, nonce: keccak256(toHex("squat")) };
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [squat, await executor.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: squat })]), "CsdAddressBusy", "nobody can open a second trade on the victim's busy CSD address");
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [evil, evilSig]);
   const em = { authHash: evilHash, sellerUsdcRecipient: executor.address, usdcAmount: 1_000_000n, csdTxid: txid, lockedAt: await read(settlement, S, "lockedAt", [evilHash]), deadline: BigInt((await now()) + 600) };
   await call(executor, settlement, S, "releaseEarly", [evil, em, await executor.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: em })]);

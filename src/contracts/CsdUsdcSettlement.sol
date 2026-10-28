@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-// CSD output serialization (little-endian):
-//   output_count : uint64le
-//   per output   : value(uint64le) + script_len(uint64le) + script(script_len bytes)
+// CSD transaction encoding (bincode, fixed-int, little-endian; compute-substrate
+// src/types/mod.rs, verified against CSD's own serializer in test/fixtures):
+//   version u32 | input_count u64 | inputs: prev_txid 32, vout u32, script_sig (u64 len + bytes)
+//   | output_count u64 | outputs: value u64, script_pubkey 20 bytes (no length prefix)
+//   | locktime u32 | app: u32 variant (0 None | 1 Propose{domain str, payload_hash 32, uri str, expires u64}
+//   | 2 Attest{proposal_id 32, score u32, confidence u32}); str = u64 len + bytes
 //
 // CSD txid   = dsha256( version(4le) + input_count(8le) + inputs_with_empty_scripts + outputs_tail )
 // Block hash = dsha256( version(4le) + prev(32) + merkle(32) + time(8le) + bits(4le) + nonce(4le) )
@@ -12,9 +15,11 @@ pragma solidity ^0.8.20;
 //   The settle call carries the payment transaction, its merkle path, the
 //   block it's in, and the blocks after it. The contract checks that they
 //   link up by hash, each has valid proof of work, each is at least as hard as
-//   the difficulty the buyer signed (csdMaxTarget), and CSD's 60-second
-//   spacing rule. Faking k confirmations therefore means mining k blocks at
-//   that difficulty, whatever else the fake chain does. The buyer (the party
+//   the difficulty the buyer signed (csdMaxTarget) on average (total work >=
+//   k x the work of one block at csdMaxTarget), CSD's 60-second spacing
+//   rule, and no block more than 2 h in the future. Faking k confirmations
+//   therefore means mining k blocks' worth of work at that difficulty,
+//   whatever else the fake chain does. The buyer (the party
 //   at risk) picks the difficulty, typically ~3/4 of CSD's current difficulty
 //   (target x 4/3), read from a CSD node; the seller checks it isn't above
 //   the real difficulty before paying.
@@ -67,6 +72,13 @@ contract CsdUsdcSettlement {
     // CSD consensus: PoW limit and minimum block spacing (compute-substrate src/params)
     uint32  public constant CSD_POW_LIMIT_BITS          = 0x1e00ffff;
     uint256 public constant CSD_MIN_BLOCK_SPACING_SECS  = 60;
+    uint256 public constant CSD_MAX_FUTURE_DRIFT_SECS   = 2 hours;
+
+    // One open lock per CSD receiving address. A CSD payment can't say which
+    // trade it's for, so two open trades paying the same address could be
+    // confused (one seller settling with the other's payment). The buyer uses
+    // another address for trades in parallel.
+    mapping(bytes32 => bytes32) public openLockForCsdAddress;   // sellerCsdScriptHash => authHash
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
     // A CSD payment is used up per (txid, recipient address): a trade can only
@@ -188,7 +200,11 @@ contract CsdUsdcSettlement {
     error AuthorizationRefunded(bytes32 authHash);
     error TotalLockedLimitExceeded();
     error WrongToken();
-    error CsdBlockTooEasy();
+    error CsdInsufficientWork(uint256 have, uint256 need);
+    error CsdBlockInFuture();
+    error CsdTxMalformed();
+    error CsdCoinbaseNotSupported();
+    error CsdAddressBusy(bytes32 openAuthHash);
     error CsdChainBroken();
     error CsdBlockTooSoon();
     error EarlyReleaseMismatch();
@@ -249,6 +265,8 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         if (auth.usdc != usdcToken)                     revert WrongToken();
         if (auth.csdGenesisHash != csdGenesisHash)      revert CsdGenesisHashMismatch();
         if (auth.csdMaxTarget == 0)                     revert CsdBitsInvalid();
+        if (openLockForCsdAddress[auth.sellerCsdScriptHash] != bytes32(0))
+            revert CsdAddressBusy(openLockForCsdAddress[auth.sellerCsdScriptHash]);
         // The cap covers everything locked for the trade, executor fee included
         if (auth.usdcAmount + auth.executorFeeAmount > MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
 
@@ -263,6 +281,7 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         usdcLocked[authHash]   = true;
         lockedUntil[authHash]  = until;
         lockedAt[authHash]     = block.timestamp;
+        openLockForCsdAddress[auth.sellerCsdScriptHash] = authHash;
 
         if (!IERC20(auth.usdc).transferFrom(auth.buyer, address(this), lockAmount))
             revert TransferFailed();
@@ -288,6 +307,7 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        delete openLockForCsdAddress[auth.sellerCsdScriptHash];
         refundedAuthorization[authHash] = true;
 
         if (!IERC20(auth.usdc).transfer(auth.buyer, amount)) revert TransferFailed();
@@ -346,6 +366,7 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        delete openLockForCsdAddress[auth.sellerCsdScriptHash];
 
         if (!IERC20(auth.usdc).transfer(auth.sellerUsdcRecipient, auth.usdcAmount))
             revert TransferFailed();
@@ -406,6 +427,7 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        delete openLockForCsdAddress[auth.sellerCsdScriptHash];
 
         if (!IERC20(auth.usdc).transfer(auth.sellerUsdcRecipient, auth.usdcAmount))
             revert TransferFailed();
@@ -429,49 +451,69 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         uint256 expectedAmount,
         uint256 minConfirmations,
         uint256 maxTarget
-    ) internal pure returns (bytes32 csdTxid) {
-        // 1. The transaction pays the buyer's CSD address at least csdAmount
+    ) internal view returns (bytes32 csdTxid) {
+        // 1. The transaction is well-formed and pays the buyer's CSD address at least csdAmount
+        _verifyCsdTx(proof.txRaw, expectedScriptHash, expectedAmount);
         csdTxid = _csdTxidFromRaw(proof.txRaw);
-        _verifyCsdPaymentOutput(proof.txRaw, expectedScriptHash, expectedAmount);
 
         // 2. It's in the payment block
         if (_csdMerkleRoot(csdTxid, proof.merkleBranch) != proof.header.merkle) revert CsdMerkleInvalid();
 
         // 3. The payment block and the blocks after it: linked, valid proof of
-        //    work, each at least as hard as the buyer signed, CSD's spacing rule
+        //    work, CSD's spacing rule, not in the future, and in total at least
+        //    minConfirmations blocks' worth of work at the signed difficulty
         if (1 + proof.confirmationChain.length < minConfirmations) revert CsdBlockNotConfirmed();
-        bytes32 prevHash = _checkBlock(proof.header, maxTarget);
+        (bytes32 prevHash, uint256 work) = _checkBlock(proof.header);
         uint64 prevTime = proof.header.time;
         for (uint256 i = 0; i < proof.confirmationChain.length; i++) {
             CsdBlockHeader calldata h = proof.confirmationChain[i];
             if (h.prev != prevHash) revert CsdChainBroken();
             if (uint256(h.time) < uint256(prevTime) + CSD_MIN_BLOCK_SPACING_SECS) revert CsdBlockTooSoon();
-            prevHash = _checkBlock(h, maxTarget);
+            uint256 w;
+            (prevHash, w) = _checkBlock(h);
+            work += w;
             prevTime = h.time;
         }
+        uint256 need = minConfirmations * _workFromTarget(maxTarget);
+        if (work < need) revert CsdInsufficientWork(work, need);
     }
 
     // The same block checks for any run of headers, for interfaces and
     // sellers to pre-check a proof, or to check real CSD blocks meet a
-    // difficulty before signing it. Returns the last block's hash.
-    function checkHeaderChain(CsdBlockHeader[] calldata chain, uint256 maxTarget) external pure returns (bytes32 lastHash) {
+    // difficulty before relying on it. Returns the last block's hash.
+    function checkHeaderChain(CsdBlockHeader[] calldata chain, uint256 maxTarget) external view returns (bytes32 lastHash) {
         if (chain.length == 0) revert CsdBlockNotConfirmed();
-        lastHash = _checkBlock(chain[0], maxTarget);
+        uint256 work;
+        (lastHash, work) = _checkBlock(chain[0]);
         for (uint256 i = 1; i < chain.length; i++) {
             if (chain[i].prev != lastHash) revert CsdChainBroken();
             if (uint256(chain[i].time) < uint256(chain[i - 1].time) + CSD_MIN_BLOCK_SPACING_SECS) revert CsdBlockTooSoon();
-            lastHash = _checkBlock(chain[i], maxTarget);
+            uint256 w;
+            (lastHash, w) = _checkBlock(chain[i]);
+            work += w;
         }
+        uint256 need = chain.length * _workFromTarget(maxTarget);
+        if (work < need) revert CsdInsufficientWork(work, need);
     }
 
-    // A header's hash, after checking its proof of work and that it's at
-    // least as hard as maxTarget (and within CSD's PoW limit)
-    function _checkBlock(CsdBlockHeader calldata h, uint256 maxTarget) internal pure returns (bytes32 blockHash) {
+    // A header's hash and work, after checking its proof of work, CSD's PoW
+    // limit, and that it isn't more than 2 h in the future (CSD's own rule)
+    function _checkBlock(CsdBlockHeader calldata h) internal view returns (bytes32 blockHash, uint256 work) {
         uint256 target = _bitsToTarget(h.bits);
         if (target > _bitsToTarget(_powLimitBits())) revert CsdBitsInvalid();
-        if (target > maxTarget) revert CsdBlockTooEasy();
+        if (uint256(h.time) > block.timestamp + CSD_MAX_FUTURE_DRIFT_SECS) revert CsdBlockInFuture();
         blockHash = _csdHeaderHash(h);
         if (uint256(blockHash) > target) revert CsdInsufficientPoW();
+        work = _workFromTarget(target);
+    }
+
+    // work_from_bits (compute-substrate src/chain/pow.rs): floor(2^256 / (target + 1))
+    function _workFromTarget(uint256 target) internal pure returns (uint256) {
+        if (target == type(uint256).max) return 1;
+        uint256 d = target + 1;
+        uint256 q = type(uint256).max / d;
+        if (type(uint256).max % d == d - 1) q += 1;
+        return q;
     }
 
     // CSD mainnet's PoW limit. Virtual only so the test suite can run the same
@@ -516,46 +558,68 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         return sha256(abi.encodePacked(sha256(buf)));
     }
 
-    // Verify at least one output pays >= expectedAmount to expectedScriptHash (20 bytes, left-aligned)
-    function _verifyCsdPaymentOutput(
-        bytes calldata txRaw,
-        bytes32 expectedScriptHash,
-        uint256 expectedAmount
-    ) internal pure {
-        uint256 off = 4; // skip version
+    // Parses the whole transaction strictly (every byte accounted for) and
+    // checks one output pays >= expectedAmount to expectedScriptHash (the
+    // 20-byte address, left-aligned in bytes32). Coinbase transactions are
+    // refused: CSD keeps their input script in the txid, which this
+    // contract's txid computation strips.
+    function _verifyCsdTx(bytes calldata txRaw, bytes32 expectedScriptHash, uint256 expectedAmount) internal pure {
         uint256 len = txRaw.length;
-
-        // skip inputs
-        uint64 inputCount = _readU64LE(txRaw, off); off += 8;
-        for (uint64 i = 0; i < inputCount; i++) {
-            require(off + 44 <= len, "CSD_OUT_INPUT_OVF");
+        uint256 off = 4; // version
+        if (len < off + 8) revert CsdTxMalformed();
+        uint256 inputCount = _readU64LE(txRaw, off); off += 8;
+        if (inputCount == 0) revert CsdTxMalformed();
+        for (uint256 i = 0; i < inputCount; i++) {
+            if (off + 44 > len) revert CsdTxMalformed();
+            if (i == 0 && bytes32(txRaw[off:off + 32]) == bytes32(0) && _readU32LE(txRaw, off + 32) == type(uint32).max)
+                revert CsdCoinbaseNotSupported();
             off += 36;
-            uint64 scriptLen = _readU64LE(txRaw, off); off += 8 + scriptLen;
-        }
-
-        require(off + 8 <= len, "CSD_NO_OUTPUT_COUNT");
-        uint64 outputCount = _readU64LE(txRaw, off); off += 8;
-
-        bytes20 expectedScript = bytes20(expectedScriptHash); // left-aligned 20 bytes
-        bool paid = false;
-
-        for (uint64 i = 0; i < outputCount && !paid; i++) {
-            require(off + 16 <= len, "CSD_OUTPUT_OVF");
-            uint64 value     = _readU64LE(txRaw, off); off += 8;
-            uint64 scriptLen = _readU64LE(txRaw, off); off += 8;
-            require(off + scriptLen <= len, "CSD_SCRIPT_OVF");
-
-            if (scriptLen == 20 && value >= expectedAmount) {
-                // calldataload reads 32 bytes; bytes20 takes the leftmost 20
-                bytes20 script;
-                uint256 soff = off;
-                assembly { script := calldataload(add(txRaw.offset, soff)) }
-                if (script == expectedScript) paid = true;
-            }
+            uint256 scriptLen = _readU64LE(txRaw, off); off += 8;
+            if (scriptLen > len - off) revert CsdTxMalformed();
             off += scriptLen;
         }
 
+        if (off + 8 > len) revert CsdTxMalformed();
+        uint256 outputCount = _readU64LE(txRaw, off); off += 8;
+        bytes20 expectedScript = bytes20(expectedScriptHash);
+        bool paid = false;
+        for (uint256 i = 0; i < outputCount; i++) {
+            if (off + 28 > len) revert CsdTxMalformed();
+            uint256 value = _readU64LE(txRaw, off); off += 8;
+            bytes20 script = bytes20(txRaw[off:off + 20]); off += 20;
+            if (!paid && script == expectedScript && value >= expectedAmount) paid = true;
+        }
+
+        if (off + 8 > len) revert CsdTxMalformed();
+        off += 4; // locktime
+        uint256 variant = _readU32LE(txRaw, off); off += 4;
+        if (variant == 1) {            // Propose { domain, payload_hash, uri, expires_epoch }
+            off = _skipString(txRaw, off);
+            if (off + 32 > len) revert CsdTxMalformed();
+            off += 32;
+            off = _skipString(txRaw, off);
+            if (off + 8 > len) revert CsdTxMalformed();
+            off += 8;
+        } else if (variant == 2) {     // Attest { proposal_id, score, confidence }
+            if (off + 40 > len) revert CsdTxMalformed();
+            off += 40;
+        } else if (variant != 0) {     // None
+            revert CsdTxMalformed();
+        }
+        if (off != len) revert CsdTxMalformed();
         if (!paid) revert CsdPaymentOutputNotFound();
+    }
+
+    function _skipString(bytes calldata data, uint256 off) internal pure returns (uint256) {
+        if (off + 8 > data.length) revert CsdTxMalformed();
+        uint256 n = _readU64LE(data, off); off += 8;
+        if (n > data.length - off) revert CsdTxMalformed();
+        return off + n;
+    }
+
+    function _readU32LE(bytes calldata data, uint256 off) internal pure returns (uint32 v) {
+        if (off + 4 > data.length) revert CsdTxMalformed();
+        for (uint256 i = 0; i < 4; i++) v |= uint32(uint8(data[off + i])) << uint32(i * 8);
     }
 
     // Walk merkle branch: dsha256(sibling || cur) or dsha256(cur || sibling)

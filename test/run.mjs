@@ -16,7 +16,7 @@ const anvil = spawn(anvilBin, ["--port", port, "--silent"], { stdio: "ignore" })
 await new Promise(r => setTimeout(r, 1500));
 let code = 1;
 try {
-  for (const t of ["consensus.test.mjs", "oracle.test.mjs", "mainnet.test.mjs", "check-script.test.mjs", "relay.test.mjs", "settlement.test.mjs"])
+  for (const t of ["consensus.test.mjs", "oracle.test.mjs", "mainnet.test.mjs", "encoding.test.mjs", "check-script.test.mjs", "relay.test.mjs", "settlement.test.mjs"])
     execFileSync(process.execPath, ["--import", "tsx", join(here, t)], { stdio: "inherit", env: { ...process.env, ANVIL_PORT: port } });
   code = 0;
 } catch { code = 1; } finally { anvil.kill(); }

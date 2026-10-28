@@ -43,6 +43,6 @@ check(await read("isConfirmed", [hs.at(-6).hash, G, 6n]) && !(await read("isConf
   const last = await pub.readContract({ address: st, abi: sart.abi, functionName: "checkHeaderChain", args: [hs.map(sol), maxT] });
   check(last === hs.at(-1).hash, `settlement accepts all ${hs.length} mainnet-difficulty blocks at the suggested difficulty`);
   try { await pub.readContract({ address: st, abi: sart.abi, functionName: "checkHeaderChain", args: [hs.map(sol), maxT / 2n] }); check(false, "accepted at double the difficulty"); }
-  catch (e) { const r = e instanceof BaseError ? e.walk(x => x instanceof ContractFunctionRevertedError) : null; check(r?.data?.errorName === "CsdBlockTooEasy", "and rejects them when the signed difficulty is higher than theirs"); } }
+  catch (e) { const r = e instanceof BaseError ? e.walk(x => x instanceof ContractFunctionRevertedError) : null; check(r?.data?.errorName === "CsdInsufficientWork", "and rejects them when the signed difficulty is higher than theirs"); } }
 
 console.log(`\nAll ${pass} mainnet-difficulty checks passed.`);
