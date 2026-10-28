@@ -89,6 +89,39 @@ await runExecutor({
 });
 ```
 
+## Waiting less: early release and market makers
+
+The confirmation wait only protects the buyer (who locked the USDC). The
+buyer can waive it for a single locked trade by signing a
+`CsdUsdcEarlyRelease { authHash }`: anyone can then submit it to
+`releaseEarly`, and the seller is paid immediately without a CSD proof. The
+buyer carries the risk of the CSD payment being reversed.
+
+That lets a market maker on the other side of every trade give users about
+one CSD block of waiting in both directions. See
+[docs/market-maker.md](docs/market-maker.md) and the bot sketch in
+`examples/market-maker.ts`.
+
+## Limits (CsdUsdcSettlement v3)
+
+| | |
+|---|---|
+| Confirmations | 3 to 60, chosen by the buyer |
+| Max per trade | 10 USDC × confirmations (3 → 30 USDC, 20 → 200 USDC) |
+| Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
+| Payment age | the CSD payment's block must be no more than 30 min older than the lock |
+
+The cap grows with confirmations because faking a payment means mining that
+many blocks at the oracle's difficulty floor. Changing these numbers means
+deploying a new contract.
+
+## Tests
+
+```bash
+npm install
+npm test     # compiles with solc 0.8.26, runs a local anvil, 34 checks
+```
+
 ## Exports
 
 ```ts
@@ -99,6 +132,15 @@ import {
   // Object builders
   buildCsdUsdcAuthorizationObject,
   buildCsdUsdcRevocationObject,
+  buildCsdUsdcEarlyReleaseObject,
+  EARLY_RELEASE_TYPES,
+  csdUsdcAuthHash,
+
+  // Executor calls
+  lockCsdUsdcOnEvm,
+  executeCsdUsdcSettlementOnEvm,
+  releaseEarlyOnEvm,
+  refundExpiredCsdUsdcLockOnEvm,
 
   // Proof construction
   makeCsdPaymentProofObject,
@@ -114,6 +156,7 @@ import {
 | `proof` | CSD payment txid with confirmation count. References the reserve. |
 | `receipt` | USDC released to seller. References the proof. |
 | `revocation` | Cancels an authorization before it is reserved. |
+| `release` | The buyer's signed early release for one locked trade. References the authorization. |
 
 ## Settlement contract
 

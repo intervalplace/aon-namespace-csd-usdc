@@ -2,7 +2,7 @@ import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { findExecutableGraphs, finalizeObject } from "@intervalplace/aon-sdk";
 import { getAddress } from "viem";
 import { verifyCsdPaymentProof } from "./verifiers/csd.js";
-import { verifyAuthorizationObject } from "./verifiers/authorization.js";
+import { verifyAuthorizationObject, verifyEarlyReleaseObject } from "./verifiers/authorization.js";
 import { executeCsdUsdcSettlementOnEvm } from "./executors/evmCsdUsdcSettlement.js";
 
 // ── Extended driver type ───────────────────────────────────────────────────────
@@ -12,6 +12,7 @@ type EIP712Types = Record<string, EIP712Field[]>;
 
 export type CsdUsdcDriver = NamespaceDriver & {
   types(): EIP712Types;
+  earlyReleaseTypes(): EIP712Types;
   revocationTypes(): EIP712Types;
   normalizeAuthorization(auth: any): any;
 };
@@ -37,6 +38,15 @@ const AUTH_TYPES: EIP712Types = {
   ],
 };
 
+// The buyer waives the confirmation wait for one locked trade
+// (CsdUsdcSettlement.releaseEarly). authHash is the EIP-712 hash of the
+// authorization, exactly as the contract computes it.
+export const EARLY_RELEASE_TYPES: EIP712Types = {
+  CsdUsdcEarlyRelease: [
+    { name: "authHash", type: "bytes32" },
+  ],
+};
+
 const REVOCATION_TYPES: EIP712Types = {
   AonRevocation: [
     { name: "targetHash",  type: "bytes32" },
@@ -52,6 +62,7 @@ export const csdUsdcNamespace: CsdUsdcDriver = {
   // ── EIP-712 schemas ──────────────────────────────────────────────────────────
 
   types() { return AUTH_TYPES; },
+  earlyReleaseTypes() { return EARLY_RELEASE_TYPES; },
   revocationTypes() { return REVOCATION_TYPES; },
 
   // ── Authorization normalization ───────────────────────────────────────────────
@@ -118,6 +129,9 @@ export const csdUsdcNamespace: CsdUsdcDriver = {
   async validateObject(obj: any) {
     if (obj.objectType === "authorization") {
       await verifyAuthorizationObject(obj);
+    }
+    if (obj.objectType === "release") {
+      await verifyEarlyReleaseObject(obj);
     }
   },
 

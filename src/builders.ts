@@ -3,7 +3,8 @@
 import { getAddress, verifyTypedData, type Hex, type Address } from "viem";
 import { finalizeObject } from "@intervalplace/aon-sdk";
 import type { AonObject } from "@intervalplace/aon-sdk";
-import { csdUsdcNamespace } from "./namespace.js";
+import { csdUsdcNamespace, EARLY_RELEASE_TYPES } from "./namespace.js";
+import { csdUsdcAuthHash } from "./verifiers/authorization.js";
 
 function requireHex(x: any, code: string): Hex {
   if (typeof x !== "string" || !x.startsWith("0x")) throw new Error(code);
@@ -190,6 +191,62 @@ export function buildCsdSellOfferObject(body: CsdSellOfferBody): AonObject {
       usdcAmount:          String(body.usdcAmount),
       pricePerCsd:         body.pricePerCsd ?? null,
       validBefore:         body.validBefore,
+    },
+  } as any);
+}
+
+// ── Early release ─────────────────────────────────────────────────────────────
+// The buyer waives the confirmation wait for one trade: once the USDC is
+// locked, anyone can submit this to CsdUsdcSettlement.releaseEarly and the
+// seller is paid immediately, without a CSD proof. The buyer carries the risk
+// that the CSD payment is reversed, so only sign after seeing the payment
+// (a market maker typically waits for 1 CSD confirmation).
+//
+// Sign with: signTypedData({ domain: <the authorization's domain>,
+//   types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease",
+//   message: { authHash: csdUsdcAuthHash(authorizationObject) } })
+
+export async function buildCsdUsdcEarlyReleaseObject(body: {
+  authorization: AonObject;   // the authorization object being released
+  signature: any;             // the buyer's EIP-712 signature
+  createdAt?: number;
+}): Promise<AonObject> {
+  const authObj = body.authorization as any;
+  const a = authObj?.payload?.authorization;
+  const domain = authObj?.signature?.domain;
+  if (!a || !domain || !authObj.objectHash) throw new Error("INVALID_AUTHORIZATION_OBJECT");
+
+  const authHash = csdUsdcAuthHash(authObj);
+  const message = { authHash };
+  await requireValidTypedSignature({
+    domain,
+    types: EARLY_RELEASE_TYPES,
+    primaryType: "CsdUsdcEarlyRelease",
+    message,
+    signature: body.signature,
+    expectedSigner: a.buyer,
+    code: "BAD_EARLY_RELEASE_SIGNATURE",
+  });
+
+  return finalizeObject({
+    objectType: "release",
+    schemaVersion: "1",
+    namespace: "aon:csd-usdc",
+    createdAt: body.createdAt ?? Date.now(),
+    references: [authObj.objectHash],
+    payload: {
+      releaseType: "csd_usdc_early_release",
+      authHash,
+      buyer: getAddress(a.buyer),
+      signature: {
+        scheme: "eip712",
+        signer: getAddress(a.buyer),
+        domain,
+        types: EARLY_RELEASE_TYPES,
+        primaryType: "CsdUsdcEarlyRelease",
+        message,
+        signature: body.signature,
+      },
     },
   } as any);
 }

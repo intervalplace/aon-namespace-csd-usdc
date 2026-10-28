@@ -10,13 +10,21 @@
 //   import { csdUsdcNamespace } from "@aon/namespace-csd-usdc";
 //   registerNamespace(csdUsdcNamespace);
 
-export { csdUsdcNamespace } from "./namespace.js";
+export { csdUsdcNamespace, EARLY_RELEASE_TYPES } from "./namespace.js";
 
 export {
   buildCsdUsdcAuthorizationObject,
   buildCsdUsdcRevocationObject,
   buildCsdSellOfferObject,
+  buildCsdUsdcEarlyReleaseObject,
   type CsdSellOfferBody,
 } from "./builders.js";
 
 export { makeCsdPaymentProofObject } from "./csdFromTxid.js";
+export { csdUsdcAuthHash, verifyEarlyReleaseObject, releaseMatchesAuthorization } from "./verifiers/authorization.js";
+export {
+  executeCsdUsdcSettlementOnEvm,
+  lockCsdUsdcOnEvm,
+  refundExpiredCsdUsdcLockOnEvm,
+  releaseEarlyOnEvm,
+} from "./executors/evmCsdUsdcSettlement.js";

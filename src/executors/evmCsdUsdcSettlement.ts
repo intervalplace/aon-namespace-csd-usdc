@@ -84,6 +84,16 @@ const abi = [
   },
   {
     type: "function",
+    name: "releaseEarly",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "auth",       type: "tuple", components: AUTH_COMPONENTS },
+      { name: "releaseSig", type: "bytes" },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
     name: "refundExpiredLock",
     stateMutability: "nonpayable",
     inputs: [
@@ -103,6 +113,9 @@ const abi = [
   { type: "error", name: "AuthorizationLocked",           inputs: [{ name: "authHash", type: "bytes32" }, { name: "lockedUntil", type: "uint256" }] },
   { type: "error", name: "AuthorizationNotLocked",        inputs: [{ name: "authHash", type: "bytes32" }] },
   { type: "error", name: "CsdTxAlreadyConsumed",          inputs: [{ name: "csdTxid",  type: "bytes32" }] },
+  { type: "error", name: "CsdPaymentBeforeLock",          inputs: [] },
+  { type: "error", name: "TradeLimitExceeded",            inputs: [] },
+  { type: "error", name: "CsdBlockNotConfirmed",          inputs: [] },
 ] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -304,5 +317,44 @@ export async function refundExpiredCsdUsdcLockOnEvm(args: { authorization: any }
     executor:           account.address,
     buyer:              auth.buyer,
     refundedAmount:     String(BigInt(auth.usdcAmount) + BigInt(auth.executorFeeAmount ?? 0)),
+  };
+}
+
+// Submits a buyer-signed early release (see buildCsdUsdcEarlyReleaseObject).
+// The seller is paid immediately; the executor earns the executor fee.
+export async function releaseEarlyOnEvm(args: { authorization: any; release: any }) {
+  const contract   = getAddress(requireEnv("AON_SETTLEMENT_CONTRACT"));
+  const rpcUrl     = requireEnv("AON_EVM_RPC_URL");
+  const privateKey = asHex(requireEnv("AON_EXECUTOR_PRIVATE_KEY"), "INVALID_EXECUTOR_PRIVATE_KEY");
+
+  const domain = args.authorization.signature?.domain;
+  if (!domain) throw new Error("MISSING_EIP712_DOMAIN");
+  if (getAddress(domain.verifyingContract) !== contract) throw new Error("AUTHORIZATION_FOR_ANOTHER_CONTRACT");
+  const { account, wallet, pub } = makeClients(rpcUrl, privateKey, Number(domain.chainId));
+
+  const auth       = args.authorization.payload.authorization;
+  const releaseSig = args.release?.payload?.signature?.signature;
+  if (!releaseSig) throw new Error("RELEASE_SIGNATURE_MISSING");
+
+  const tx = await wallet.writeContract({
+    address:      contract,
+    abi,
+    functionName: "releaseEarly",
+    args:         [authTuple(auth), asHex(releaseSig, "INVALID_RELEASE_SIG")],
+  });
+  const receipt = await pub.waitForTransactionReceipt({ hash: tx, confirmations: 1 });
+
+  return {
+    executed:    receipt.status === "success",
+    mode:        "contract",
+    executionTx: tx,
+    result:      "csd_usdc_released_early",
+    details: {
+      settlementContract: contract,
+      executor:           account.address,
+      status:             receipt.status,
+      blockNumber:        receipt.blockNumber.toString(),
+      gasUsed:            receipt.gasUsed.toString(),
+    },
   };
 }
