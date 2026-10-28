@@ -74,7 +74,10 @@ contract CsdUsdcSettlement {
 
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
-    mapping(bytes32 => bool)    public consumedCsdTx;
+    // A CSD payment is used up per (txid, recipient address): a trade can only
+    // use up payments to its own CSD address, so nobody can block someone
+    // else's settlement by naming their transaction in an unrelated trade.
+    mapping(bytes32 => bool)    public consumedCsdPayment;
     mapping(bytes32 => bool)    public usdcLocked;
     mapping(bytes32 => uint256) public lockedUntil;
     mapping(bytes32 => uint256) public lockedAmount;
@@ -153,6 +156,7 @@ contract CsdUsdcSettlement {
     event CsdUsdcAuthorizationFinalized(bytes32 indexed authHash, bytes32 indexed csdTxid);
     event CsdUsdcReleasedEarly(
         bytes32 indexed authHash,
+        bytes32 indexed csdTxid,      // as named by the buyer, not verified
         address indexed buyer,
         address sellerUsdcRecipient,
         address usdc,
@@ -317,10 +321,11 @@ constructor(address _csdHeaderOracle) {
             || release.csdTxid == bytes32(0)) revert EarlyReleaseMismatch();
         if (block.timestamp > release.deadline) revert EarlyReleaseExpired();
         if (_recover(hashCsdUsdcEarlyRelease(release), releaseSig) != auth.buyer) revert BadSignature();
-        if (consumedCsdTx[release.csdTxid]) revert CsdTxAlreadyConsumed(release.csdTxid);
+        bytes32 paymentKey = csdPaymentKey(release.csdTxid, auth.sellerCsdScriptHash);
+        if (consumedCsdPayment[paymentKey]) revert CsdTxAlreadyConsumed(release.csdTxid);
 
         // CEI: update all state before transfers
-        consumedCsdTx[release.csdTxid]   = true;
+        consumedCsdPayment[paymentKey]   = true;
         finalizedAuthorization[authHash] = true;
         lockedAmount[authHash] = 0;
         usdcLocked[authHash]   = false;
@@ -334,11 +339,16 @@ constructor(address _csdHeaderOracle) {
             if (!IERC20(auth.usdc).transfer(msg.sender, auth.executorFeeAmount))
                 revert TransferFailed();
 
-        emit CsdUsdcAuthorizationFinalized(authHash, release.csdTxid);
+        // Not CsdUsdcAuthorizationFinalized: that event means a verified CSD
+        // payment; here the payment is only the buyer's word.
         emit CsdUsdcReleasedEarly(
-            authHash, auth.buyer, auth.sellerUsdcRecipient,
+            authHash, release.csdTxid, auth.buyer, auth.sellerUsdcRecipient,
             auth.usdc, auth.usdcAmount, auth.csdAmount
         );
+    }
+
+    function csdPaymentKey(bytes32 csdTxid, bytes32 csdScriptHash) public pure returns (bytes32) {
+        return keccak256(abi.encode(csdTxid, csdScriptHash));
     }
 
     // ── Limits ────────────────────────────────────────────────────────────────
@@ -397,10 +407,11 @@ bytes32 csdTxid = _verifyCsdSpv(
     auth.minConfirmations
 );
 
-        if (consumedCsdTx[csdTxid]) revert CsdTxAlreadyConsumed(csdTxid);
+        bytes32 paymentKey = csdPaymentKey(csdTxid, auth.sellerCsdScriptHash);
+        if (consumedCsdPayment[paymentKey]) revert CsdTxAlreadyConsumed(csdTxid);
 
         // CEI: update all state before transfers
-        consumedCsdTx[csdTxid]          = true;
+        consumedCsdPayment[paymentKey]  = true;
         finalizedAuthorization[authHash] = true;
         lockedAmount[authHash] = 0;
         usdcLocked[authHash]   = false;

@@ -177,7 +177,7 @@ console.log("\n[5] Early release: the buyer waives the wait");
   check(await bal(seller.address) - s0 === 30_000_000n, "seller received 30 USDC immediately, no CSD proof");
   check(await bal(executor.address) - e0 === 50_000n, "executor received its fee");
   check(c0 - await bal(settlement) === 30_050_000n, "contract paid out exactly the locked amount");
-  check(await read(settlement, S, "consumedCsdTx", [m.csdTxid]) === true, "the accepted CSD payment is used up");
+  check(await read(settlement, S, "consumedCsdPayment", [await read(settlement, S, "csdPaymentKey", [m.csdTxid, a.auth.sellerCsdScriptHash])]) === true, "the accepted CSD payment is used up");
   await reverts(R(m, await signRelease(m)), "AuthorizationAlreadyFinalized", "can't be released twice");
   const before = tip;
   const proof = payAndConfirm({ value: a.auth.csdAmount, time: await now() + 60, extra: 2 });
@@ -198,6 +198,28 @@ console.log("\n[6] A CSD payment accepted by an early release can't pay for anot
   await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [b.auth, b.sig, proof]), "CsdTxAlreadyConsumed", "the same payment can't settle trade B");
   tip = before; }
+
+console.log("\n[6b] Nobody can block a seller by naming their payment in an unrelated trade");
+{ const victim = await makeAuth({ usdcAmount: 10_000_000n });
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [victim.auth, victim.sig]);
+  const before = tip;
+  const proof = payAndConfirm({ value: victim.auth.csdAmount, time: await now() + 60, extra: 2 });
+  const txid = hx(csdTxidFromRaw(proof.txRaw));
+  // The attacker trades with themselves (own CSD address) and "accepts" the victim's payment
+  await send(deployer, usdc, "MockUSDC", "mint", [executor.address, 5_000_000n]);
+  await send(executor, usdc, "MockUSDC", "approve", [settlement, 5_000_000n]);
+  const t = await now();
+  const evil = { ...victim.auth, buyer: executor.address, sellerUsdcRecipient: executor.address, usdcAmount: 1_000_000n, executorFeeAmount: 0n,
+    sellerCsdScriptHash: hx(Buffer.concat([Buffer.alloc(20, 0xee), Buffer.alloc(12)])), nonce: keccak256(toHex("evil")), validBefore: BigInt(t + 3600) };
+  const evilSig = await executor.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: evil });
+  const evilHash = hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: evil });
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [evil, evilSig]);
+  const em = { authHash: evilHash, sellerUsdcRecipient: executor.address, usdcAmount: 1_000_000n, csdTxid: txid, lockedAt: await read(settlement, S, "lockedAt", [evilHash]), deadline: BigInt((await now()) + 600) };
+  await call(executor, settlement, S, "releaseEarly", [evil, em, await executor.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: em })]);
+  const s0 = await bal(seller.address);
+  await call(executor, settlement, S, "settleCsdUsdc", [victim.auth, victim.sig, proof]);
+  check(await bal(seller.address) - s0 === 10_000_000n, "the victim's trade still settles with its own payment");
+  }
 
 console.log("\n[7] Release after the window, refunds, and no re-locking after a refund");
 { const a = await makeAuth({ usdcAmount: 5_000_000n });
