@@ -72,6 +72,13 @@ contract CsdUsdcSettlement {
 
     ICsdHeaderOracle public immutable csdHeaderOracle;
 
+    // Cap on USDC (incl. executor fees) locked across ALL open trades at once,
+    // fixed at deployment. One fake CSD header chain can carry fake payments
+    // for every open trade, so this bounds what such a chain could ever be
+    // worth, whatever it costs to mine.
+    uint256 public immutable maxTotalLocked;
+    uint256 public totalLocked;
+
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
     // A CSD payment is used up per (txid, recipient address): a trade can only
@@ -183,13 +190,16 @@ contract CsdUsdcSettlement {
     error InvalidHeaderOracle();
     error CsdPaymentBeforeLock();
     error AuthorizationRefunded(bytes32 authHash);
+    error TotalLockedLimitExceeded();
     error EarlyReleaseMismatch();
     error EarlyReleaseExpired();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-constructor(address _csdHeaderOracle) {
+constructor(address _csdHeaderOracle, uint256 _maxTotalLocked) {
     if (_csdHeaderOracle == address(0)) revert InvalidHeaderOracle();
+    if (_maxTotalLocked < MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
+    maxTotalLocked = _maxTotalLocked;
 
     csdHeaderOracle = ICsdHeaderOracle(_csdHeaderOracle);
 
@@ -243,6 +253,8 @@ constructor(address _csdHeaderOracle) {
 
         // CEI: set state before external call to prevent reentrancy
         uint256 lockAmount = auth.usdcAmount + auth.executorFeeAmount;
+        if (totalLocked + lockAmount > maxTotalLocked) revert TotalLockedLimitExceeded();
+        totalLocked += lockAmount;
         uint256 until = block.timestamp + lockSecondsForConfirmations(auth.minConfirmations);
         if (until > auth.validBefore) until = auth.validBefore;
 
@@ -270,6 +282,7 @@ constructor(address _csdHeaderOracle) {
 
         // CEI: clear state before transfer
         uint256 amount = lockedAmount[authHash];
+        totalLocked -= amount;
         lockedAmount[authHash] = 0;
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
@@ -327,6 +340,7 @@ constructor(address _csdHeaderOracle) {
         // CEI: update all state before transfers
         consumedCsdPayment[paymentKey]   = true;
         finalizedAuthorization[authHash] = true;
+        totalLocked -= lockedAmount[authHash];
         lockedAmount[authHash] = 0;
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
@@ -413,6 +427,7 @@ bytes32 csdTxid = _verifyCsdSpv(
         // CEI: update all state before transfers
         consumedCsdPayment[paymentKey]  = true;
         finalizedAuthorization[authHash] = true;
+        totalLocked -= lockedAmount[authHash];
         lockedAmount[authHash] = 0;
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;

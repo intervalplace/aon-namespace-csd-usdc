@@ -110,20 +110,60 @@ one CSD block of waiting in both directions. See
 |---|---|
 | Confirmations | 3 to 60, chosen by the buyer |
 | Max per trade | 30 USDC, whatever the confirmations |
+| Max locked in total | set at deployment (`maxTotalLocked`), across all open trades |
 | Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
 | Payment age | the CSD payment's block may be at most 20 min older than the lock |
 | Refunds | a refunded authorization can't be locked again |
 
-The per-trade cap doesn't grow with confirmations: one fake header chain at
-the oracle's difficulty floor can carry fake payments for every open trade at
-once, so a bigger cap would make such a chain worth more. Changing these
-numbers means deploying a new contract.
+The per-trade cap doesn't grow with confirmations, and the total cap exists,
+because one fake header chain could carry fake payments for every open trade
+at once. Changing these numbers means deploying a new contract.
+
+## Header oracle (v2)
+
+`src/contracts/CsdHeaderOracle.sol` is a light client for Compute Substrate.
+It checks every header against the same rules a CSD node applies:
+
+- proof of work at the header's difficulty, within CSD's PoW limit;
+- difficulty: `bits` must equal the LWMA retarget computed from the 45
+  headers before it (a straight port of `expected_bits_strict`);
+- timestamps: at least 60 s after the parent, after the median of the last
+  11, at most 2 h in the future.
+
+So confirmations can only be faked by mining real CSD blocks at the real
+difficulty. There is **no owner**: the starting point is 45 consecutive real
+headers fixed at deployment (printed by the deploy script, checkable against
+any CSD node), and anyone can submit headers.
+
+Keep it current with the relayer, so a fake chain would have to out-mine the
+real network from the current tip:
+
+```bash
+node scripts/relay-headers.mjs   # see the header of the file for settings
+```
+
+Deploy on an L2 (Base, Arbitrum, ...): checking a header costs roughly
+150–450k gas, which is cheap there and expensive on Ethereum mainnet.
+
+## Deploying
+
+```bash
+npm install
+# 1. Prove the oracle accepts your real chain (local throwaway EVM, no cost):
+node scripts/check-oracle-against-csd.mjs http://127.0.0.1:8887 300
+# 2. Deploy oracle + settlement:
+CSD_API_URL=http://127.0.0.1:8887 AON_EVM_RPC_URL=https://... \
+DEPLOYER_PRIVATE_KEY=0x... MAX_TOTAL_LOCKED_USDC=300 node scripts/deploy.mjs
+# 3. Keep the oracle current:
+CSD_API_URL=... AON_EVM_RPC_URL=... RELAYER_PRIVATE_KEY=0x... ORACLE_ADDRESS=0x... \
+node scripts/relay-headers.mjs
+```
 
 ## Tests
 
 ```bash
 npm install
-npm test     # compiles with solc 0.8.26, runs a local anvil, 43 checks
+npm test     # solc 0.8.26 + a local anvil: consensus vectors from CSD's own code, oracle, relayer, settlement
 ```
 
 ## Exports

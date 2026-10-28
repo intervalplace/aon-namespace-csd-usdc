@@ -15,6 +15,7 @@ const sources = {
   "CsdUsdcSettlement.sol": { content: fs.readFileSync(dir + "CsdUsdcSettlement.sol", "utf8") },
   "CsdHeaderOracle.sol":   { content: fs.readFileSync(dir + "CsdHeaderOracle.sol", "utf8") },
   "MockUSDC.sol": { content: mock },
+  "TestContracts.sol": { content: fs.readFileSync(path.join(__dirname, "TestContracts.sol"), "utf8") },
 };
 const out = JSON.parse(solc.compile(JSON.stringify({ language: "Solidity", sources,
   settings: { optimizer: { enabled: true, runs: 200 }, evmVersion: "cancun", outputSelection: { "*": { "*": ["abi", "evm.bytecode.object"] } } } })));

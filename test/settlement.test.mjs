@@ -51,22 +51,24 @@ function csdTxidFromRaw(rawHex) { // strip input script_sigs, dsha256 — as the
   parts.push(raw.subarray(off)); return dsha(Buffer.concat(parts));
 }
 function headerBytes(h) { return Buffer.concat([u32(h.version), h.prev, h.merkle, u64(h.time), u32(h.bits), u32(h.nonce)]); }
-const BITS = 0x207fffff; // very easy target, accepted because the oracle's maxTarget is set to match
+const BITS = 0x207fffff; // TestCsdHeaderOracle runs CSD's real rules at this easy PoW limit
 const TARGET = BigInt(0x7fffff) << BigInt(8 * (0x20 - 3));
 function mine(h) { for (let n = 0; ; n++) { const hash = dsha(headerBytes({ ...h, nonce: n })); if (BigInt(hx(hash)) <= TARGET) return { ...h, nonce: n, hash }; } }
 const toSol = (h) => ({ version: h.version, prev: hx(h.prev), merkle: hx(h.merkle), time: BigInt(h.time), bits: h.bits, nonce: h.nonce });
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 const usdc = await deploy("MockUSDC");
-const oracle = await deploy("CsdHeaderOracle", [256n]);
-const settlement = await deploy("CsdUsdcSettlement", [oracle]);
 const GENESIS = hx(sha(Buffer.from("csd-test-genesis")));
-const CHECKPOINT = sha(Buffer.from("csd-test-checkpoint"));
-await send(deployer, oracle, "CsdHeaderOracle", "registerChainCheckpoint", [GENESIS, hx(CHECKPOINT), 1000n, 1n, TARGET]);
+// 45 starting headers (the LWMA window), two-minute spacing, 30 days ago
+const startTime = Number((await pub.getBlock()).timestamp) - 30 * 86400;
+const checkpoint = []; { let prev = sha(Buffer.from("csd-test-before-checkpoint"));
+  for (let i = 0; i < 45; i++) { const h = mine({ version: 1, prev, merkle: sha(Buffer.from(`cp${i}`)), time: startTime + 120 * i, bits: BITS, nonce: 0 }); checkpoint.push(h); prev = h.hash; } }
+const oracle = await deploy("TestCsdHeaderOracle", [GENESIS, checkpoint.map(toSol), 1000n, 256n]);
+const settlement = await deploy("CsdUsdcSettlement", [oracle, 10_000_000_000n]);
 await send(deployer, usdc, "MockUSDC", "mint", [buyer.address, 10_000_000_000n]);
 await send(buyer, usdc, "MockUSDC", "approve", [settlement, 10_000_000_000n]);
 const bal = (who) => read(usdc, "MockUSDC", "balanceOf", [who]);
-let tip = CHECKPOINT;
+let tip = { hash: checkpoint[44].hash, time: checkpoint[44].time };
 const now = async () => Number((await pub.getBlock()).timestamp);
 
 const domain = { name: "AON CSD/USDC", version: "3", chainId: 31337, verifyingContract: settlement };
@@ -104,10 +106,12 @@ function payAndConfirm({ to = BUYER_CSD_ADDR, value, time, extra }) {
   const pay = { inputs: [{ txid: sha(Buffer.from(`prevout-${payN++}`)), vout: 0, script: Buffer.alloc(99, 1) }], outputs: [{ value, script: to }, { value: 1n, script: Buffer.alloc(20, 3) }] };
   const pid = csdTxid(pay);
   const merkle = dsha(Buffer.concat([cbid, pid]));
-  const block = mine({ version: 1, prev: tip, merkle, time, bits: BITS, nonce: 0 });
+  if (time === undefined) time = tip.time + 120;
+  if (time < tip.time + 120) throw new Error(`test bug: payment time ${time} not after tip ${tip.time}`);
+  const block = mine({ version: 1, prev: tip.hash, merkle, time, bits: BITS, nonce: 0 });
   const conf = []; let prev = block.hash;
   for (let i = 0; i < extra; i++) { const h = mine({ version: 1, prev, merkle: sha(Buffer.from(`m${Math.random()}`)), time: time + 120 * (i + 1), bits: BITS, nonce: 0 }); conf.push(h); prev = h.hash; }
-  tip = prev;
+  tip = { hash: prev, time: time + 120 * extra };
   return { txRaw: hx(csdTx(pay)), merkleBranch: [{ hash: hx(cbid), isLeft: true }], header: toSol(block), genesisHash: GENESIS, confirmationChain: conf.map(toSol) };
 }
 const S = "CsdUsdcSettlement";
@@ -135,18 +139,35 @@ console.log("\n[2] Lock windows scale with confirmations; the cap stays 30 USDC"
   a = await makeAuth({ usdcAmount: 1_000_000n, conf: 2n });
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "2 confirmations rejected"); }
 
+console.log("\n[2b] Total locked across all trades is capped");
+{ const capped = await deploy("CsdUsdcSettlement", [oracle, 60_000_000n]);
+  await send(buyer, usdc, "MockUSDC", "approve", [capped, 10_000_000_000n]);
+  const cdomain = { ...domain, verifyingContract: capped };
+  const mk = async (usdcAmount, n) => { const t = await now(); const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([BUYER_CSD_ADDR, Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, executorFeeAmount: 0n, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`cap${n}`)) };
+    return { auth, sig: await buyer.signTypedData({ domain: cdomain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) }; };
+  const x = await mk(30_000_000n, 1), y = await mk(30_000_000n, 2), z = await mk(1_000_000n, 3);
+  await call(executor, capped, S, "lockCsdUsdcAuthorization", [x.auth, x.sig]);
+  await call(executor, capped, S, "lockCsdUsdcAuthorization", [y.auth, y.sig]);
+  check(await read(capped, S, "totalLocked") === 60_000_000n, "two 30 USDC trades fill a 60 USDC cap");
+  await reverts(call(executor, capped, S, "lockCsdUsdcAuthorization", [z.auth, z.sig]), "TotalLockedLimitExceeded", "a third trade has to wait");
+  await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
+  await call(executor, capped, S, "refundExpiredLock", [x.auth]);
+  await call(executor, capped, S, "lockCsdUsdcAuthorization", [z.auth, z.sig]);
+  check(await read(capped, S, "totalLocked") === 31_000_000n, "room frees up when a trade closes"); }
+
 console.log("\n[3] Normal settlement with a CSD proof still works");
 { const a = await makeAuth({ usdcAmount: 25_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   const s0 = await bal(seller.address), e0 = await bal(executor.address);
-  const proof = payAndConfirm({ value: a.auth.csdAmount, time: await now() + 60, extra: 2 });
+  const proof = payAndConfirm({ value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]);
   check(await bal(seller.address) - s0 === 25_000_000n, "seller received 25 USDC after 3 confirmations");
   check(await bal(executor.address) - e0 === 50_000n, "executor received its fee");
   check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "authorization finalized"); }
 
 console.log("\n[4] A CSD payment from before the lock doesn't count");
-{ const a = await makeAuth({ usdcAmount: 10_000_000n });
+{ const gap = tip.time + 3600 - await now(); if (gap > 0) { await rpc("evm_increaseTime", [gap]); await rpc("evm_mine"); }
+  const a = await makeAuth({ usdcAmount: 10_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   const before = tip;
   const old = payAndConfirm({ value: a.auth.csdAmount, time: await now() - 21 * 60, extra: 2 });
@@ -180,7 +201,7 @@ console.log("\n[5] Early release: the buyer waives the wait");
   check(await read(settlement, S, "consumedCsdPayment", [await read(settlement, S, "csdPaymentKey", [m.csdTxid, a.auth.sellerCsdScriptHash])]) === true, "the accepted CSD payment is used up");
   await reverts(R(m, await signRelease(m)), "AuthorizationAlreadyFinalized", "can't be released twice");
   const before = tip;
-  const proof = payAndConfirm({ value: a.auth.csdAmount, time: await now() + 60, extra: 2 });
+  const proof = payAndConfirm({ value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]), "AuthorizationAlreadyFinalized", "can't also be settled with a proof");
   tip = before;
   await rpc("evm_increaseTime", [3600]); await rpc("evm_mine");
@@ -192,7 +213,7 @@ console.log("\n[6] A CSD payment accepted by an early release can't pay for anot
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
   const before = tip;
-  const proof = payAndConfirm({ value: a.auth.csdAmount, time: await now() + 60, extra: 2 }); // one payment to the (shared) address
+  const proof = payAndConfirm({ value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 }); // one payment to the (shared) address
   const txid = hx(csdTxidFromRaw(proof.txRaw));
   const m = await releaseMsg(a, { csdTxid: txid });
   await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
@@ -203,7 +224,7 @@ console.log("\n[6b] Nobody can block a seller by naming their payment in an unre
 { const victim = await makeAuth({ usdcAmount: 10_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [victim.auth, victim.sig]);
   const before = tip;
-  const proof = payAndConfirm({ value: victim.auth.csdAmount, time: await now() + 60, extra: 2 });
+  const proof = payAndConfirm({ value: victim.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   const txid = hx(csdTxidFromRaw(proof.txRaw));
   // The attacker trades with themselves (own CSD address) and "accepts" the victim's payment
   await send(deployer, usdc, "MockUSDC", "mint", [executor.address, 5_000_000n]);
