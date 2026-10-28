@@ -229,7 +229,58 @@ fn mtp(walk: &[(u64, u32)]) -> u64 {
 struct Rng(u64);
 impl Rng { fn next(&mut self) -> u64 { self.0 ^= self.0 << 13; self.0 ^= self.0 >> 7; self.0 ^= self.0 << 17; self.0 } fn below(&mut self, n: u64) -> u64 { self.next() % n } }
 
+// Mines a chain of headers that follows CSD's rules at the mainnet PoW limit
+// (spacing >= 60 s, LWMA bits), oldest first, for the oracle's end-to-end test.
+fn mine_chain(count: usize) {
+    use sha2::{Digest, Sha256};
+    use std::sync::{Arc, atomic::{AtomicBool, AtomicU32, Ordering}};
+    unsafe { POW_LIMIT = 0x1e00ffff; }
+    let mut rng = Rng(0x1234_5678_9abc_def1);
+    let mut prev = [0x42u8; 32];
+    let mut walk_old_first: Vec<(u64, u32)> = Vec::new();
+    let mut t: u64 = 1_780_000_000;
+    let mut out = String::from("[");
+    for i in 0..count {
+        let height = 1000 + i as u64;
+        let bits = if walk_old_first.is_empty() { 0x1e00ffff } else {
+            let walk: Vec<(u64, u32)> = walk_old_first.iter().rev().cloned().collect();
+            expected_bits(height, walk[0].1, &walk).unwrap()
+        };
+        t += if rng.below(10) < 3 { 60 + rng.below(50) } else { 120 + rng.below(280) };
+        let mut merkle = [0u8; 32];
+        for (j, b) in merkle.iter_mut().enumerate() { *b = (rng.next() >> (j % 8)) as u8; }
+        let mut base = Vec::with_capacity(84);
+        base.extend_from_slice(&1u32.to_le_bytes()); base.extend_from_slice(&prev); base.extend_from_slice(&merkle);
+        base.extend_from_slice(&t.to_le_bytes()); base.extend_from_slice(&bits.to_le_bytes());
+        let target = bits_to_target_bytes(bits);
+        let found = Arc::new(AtomicBool::new(false)); let nonce_out = Arc::new(AtomicU32::new(0));
+        let threads: Vec<_> = (0..2u32).map(|k| { let base = base.clone(); let found = found.clone(); let nonce_out = nonce_out.clone(); std::thread::spawn(move || {
+            let mut n: u32 = k;
+            loop {
+                if found.load(Ordering::Relaxed) { return; }
+                let mut buf = base.clone(); buf.extend_from_slice(&n.to_le_bytes());
+                let h: [u8; 32] = Sha256::digest(Sha256::digest(&buf)).into();
+                if h <= target { found.store(true, Ordering::Relaxed); nonce_out.store(n, Ordering::Relaxed); return; }
+                n = n.wrapping_add(2);
+            }
+        }) }).collect();
+        for th in threads { th.join().unwrap(); }
+        let nonce = nonce_out.load(Ordering::Relaxed);
+        let mut buf = base.clone(); buf.extend_from_slice(&nonce.to_le_bytes());
+        let hash: [u8; 32] = Sha256::digest(Sha256::digest(&buf)).into();
+        let hx = |b: &[u8]| b.iter().map(|x| format!("{:02x}", x)).collect::<String>();
+        if i > 0 { out.push(','); }
+        out.push_str(&format!("{{\"height\":{},\"hash\":\"0x{}\",\"version\":1,\"prev\":\"0x{}\",\"merkle\":\"0x{}\",\"time\":{},\"bits\":{},\"nonce\":{}}}", height, hx(&hash), hx(&prev), hx(&merkle), t, bits, nonce));
+        eprintln!("mined {} bits {:08x}", height, bits);
+        walk_old_first.push((t, bits));
+        prev = hash;
+    }
+    out.push(']');
+    println!("{}", out);
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("chain") { mine_chain(std::env::args().nth(2).map(|x| x.parse().unwrap()).unwrap_or(90)); return; }
     let mut rng = Rng(0x9e3779b97f4a7c15);
     let mut out = String::from("[");
     let limits = [0x1e00ffffu32, 0x207fffffu32];

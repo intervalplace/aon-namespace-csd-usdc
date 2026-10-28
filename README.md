@@ -137,8 +137,16 @@ difficulty. There is **no owner**: the starting point is 45 consecutive real
 headers fixed at deployment (printed by the deploy script, checkable against
 any CSD node), and anyone can submit headers.
 
-Keep it current with the relayer, so a fake chain would have to out-mine the
-real network from the current tip:
+Settlement adds a **work floor**: the blocks confirming a payment must carry
+at least ¾ × confirmations × the work of one block at the hardest difficulty
+in the oracle's last 45 blocks at lock time. Timestamps that make CSD's LWMA
+ease difficulty then only mean mining more blocks: faking k confirmations
+costs at least 0.75·k real blocks.
+
+Keep it current with the relayer (an hour or less behind the real tip). A
+stale oracle lets a fake run of blocks ease difficulty before a lock, which
+makes high confirmation counts (above ~6) worth less; 3–6 confirmations stay
+at the 0.75·k bound either way.
 
 ```bash
 node scripts/relay-headers.mjs   # see the header of the file for settings

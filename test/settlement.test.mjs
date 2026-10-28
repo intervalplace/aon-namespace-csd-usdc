@@ -188,7 +188,7 @@ console.log("\n[3b] Work floor: confirmations must carry real work, not just cou
   const O2 = "TestCsdHeaderOracle";
   let t2 = { hash: cp2[44].hash, time: cp2[44].time };
   const next = async (dt) => { const want = await read(o2, O2, "expectedBitsAfter", [hx(t2.hash)]); const h = mine({ version: 1, prev: t2.hash, merkle: sha(Buffer.from(`wfn${Math.random()}`)), time: t2.time + dt, bits: want, nonce: 0 }); await call(executor, o2, O2, "submitHeaders", [GENESIS, [toSol(h)]]); t2 = { hash: h.hash, time: h.time }; return h; };
-  for (let i = 0; i < 30; i++) await next(60);                       // blocks come fast: difficulty rises
+  for (let i = 0; i < 50; i++) await next(60);                       // blocks come fast: difficulty rises
   const hardWork = await read(o2, O2, "blockWork", [hx(t2.hash)]);
   const d2 = { ...domain, verifyingContract: s2 };
   const t = await now();
@@ -197,7 +197,11 @@ console.log("\n[3b] Work floor: confirmations must carry real work, not just cou
   const ah = hashTypedData({ domain: d2, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
   await call(executor, s2, S, "lockCsdUsdcAuthorization", [auth, sig]);
   check(await read(s2, S, "lockReferenceWork", [ah]) === hardWork, "the lock records the work of a block at the current difficulty");
-  for (let i = 0; i < 45; i++) await next(1440);                     // then blocks look slow: difficulty falls to the limit
+  // poisoning: a few slow (easier) blocks right before a lock don't lower the reference
+  const ref0 = await read(o2, O2, "referenceWork", [GENESIS]);
+  for (let i = 0; i < 8; i++) await next(1440);
+  check(await read(o2, O2, "blockWork", [hx(t2.hash)]) < ref0 && await read(o2, O2, "referenceWork", [GENESIS]) === ref0, "a few easier blocks at the tip don't lower the reference work for new locks");
+  for (let i = 0; i < 37; i++) await next(1440);                     // then blocks look slow: difficulty falls to the limit
   const easyWork = await read(o2, O2, "blockWork", [hx(t2.hash)]);
   check(easyWork * 4n < hardWork * 3n, `difficulty has fallen by more than a quarter (work per block ${easyWork} vs ${hardWork})`);
   // the payment with 3 easy confirmations: enough by count, not by work

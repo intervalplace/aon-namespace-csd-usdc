@@ -47,6 +47,7 @@ interface ICsdHeaderOracle {
     function blockChainWork(bytes32 blockHash) external view returns (uint256);
     function blockWork(bytes32 blockHash) external view returns (uint256);
     function parentOf(bytes32 blockHash) external view returns (bytes32);
+    function referenceWork(bytes32 genesisHash) external view returns (uint256);
 }
 
 contract CsdUsdcSettlement {
@@ -92,7 +93,8 @@ contract CsdUsdcSettlement {
     // timestamps that make CSD's LWMA lower its difficulty, so k fake blocks
     // can cost less than k real ones. So at settlement the blocks from the
     // payment block to the tip must also carry at least 3/4 of
-    // k x (the work of one block at the difficulty when the USDC was locked).
+    // k x (the work of one block at the difficulty when the USDC was locked,
+    // see CsdHeaderOracle.referenceWork).
     // Lowering difficulty then just means mining more blocks. The 1/4 slack
     // covers real drops in hashrate; beyond that, settlement waits for more
     // blocks (the lock window is 2.5x the expected time per confirmation).
@@ -290,10 +292,12 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         lockedUntil[authHash]  = until;
         lockedAt[authHash]     = block.timestamp;
 
-        // Reference difficulty for the work floor: the oracle's current best tip
-        bytes32 refTip = csdHeaderOracle.bestTip(auth.csdGenesisHash);
-        if (refTip == bytes32(0)) revert CsdGenesisHashMismatch();
-        lockReferenceWork[authHash] = csdHeaderOracle.blockWork(refTip);
+        // Reference difficulty for the work floor: the hardest of the oracle's
+        // last 45 blocks (so a few fake low-difficulty blocks pushed onto the
+        // tip just before the lock can't lower it)
+        uint256 refWork = csdHeaderOracle.referenceWork(auth.csdGenesisHash);
+        if (refWork == 0) revert CsdGenesisHashMismatch();
+        lockReferenceWork[authHash] = refWork;
 
         if (!IERC20(auth.usdc).transferFrom(auth.buyer, address(this), lockAmount))
             revert TransferFailed();

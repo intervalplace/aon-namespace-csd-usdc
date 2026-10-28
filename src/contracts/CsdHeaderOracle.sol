@@ -292,6 +292,23 @@ contract CsdHeaderOracle {
         return h.exists ? CsdConsensus.workFromTarget(CsdConsensus.bitsToTarget(h.bits)) : 0;
     }
     function parentOf(bytes32 blockHash) external view returns (bytes32) { return headers[blockHash].parent; }
+
+    // Work of one block at "current" difficulty, for the settlement's work
+    // floor: the largest per-block work among the best tip and the 44 blocks
+    // before it (the LWMA window). A few fake blocks at the tip that pull
+    // difficulty down can't lower this; that would take a fake run longer
+    // than the whole window.
+    function referenceWork(bytes32 _genesisHash) external view returns (uint256 w) {
+        if (_genesisHash != genesisHash) return 0;
+        bytes32 cur = _bestTip;
+        for (uint256 i = 0; i < LWMA_WINDOW; i++) {
+            StoredHeader storage h = headers[cur];
+            if (!h.exists) break;
+            uint256 wi = CsdConsensus.workFromTarget(CsdConsensus.bitsToTarget(h.bits));
+            if (wi > w) w = wi;
+            cur = h.parent;
+        }
+    }
     function bestChainWork(bytes32 _genesisHash) external view returns (uint256) { return _genesisHash == genesisHash ? _bestChainWork : 0; }
     function blockHeight(bytes32 blockHash) external view returns (uint256) { return headers[blockHash].height; }
     function blockChainWork(bytes32 blockHash) external view returns (uint256) { return headers[blockHash].chainWork; }
