@@ -163,6 +163,8 @@ console.log("\n[2c] Only the deployment's USDC; fees count toward the cap");
   const auth = { ...(await makeAuth({ usdcAmount: 1_000_000n })).auth, usdc: other, nonce: keccak256(toHex("wrongtoken")), validBefore: BigInt(t + 3600) };
   const sig = await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [auth, sig]), "WrongToken", "an authorization for another token can't be locked");
+  const tiny = await makeAuth({ usdcAmount: 999_999n });
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [tiny.auth, tiny.sig]), "TradeLimitExceeded", "a trade under 1 USDC can't be locked (so an address can't be reserved for free)");
   const big = await makeAuth({ usdcAmount: 1_000_000n, fee: 100_000_000n });
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [big.auth, big.sig]), "TradeLimitExceeded", "a huge executor fee can't get around the cap"); }
 

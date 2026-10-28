@@ -77,7 +77,10 @@ contract CsdUsdcSettlement {
     // One open lock per CSD receiving address. A CSD payment can't say which
     // trade it's for, so two open trades paying the same address could be
     // confused (one seller settling with the other's payment). The buyer uses
-    // another address for trades in parallel.
+    // another address for trades in parallel. To keep anyone from reserving a
+    // buyer's address first, buyers lock (or have their executor lock,
+    // privately) before publishing the authorization, and use a fresh CSD
+    // address per trade.
     mapping(bytes32 => bytes32) public openLockForCsdAddress;   // sellerCsdScriptHash => authHash
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
@@ -102,6 +105,9 @@ contract CsdUsdcSettlement {
     uint256 public constant MIN_CONFIRMATIONS   = 3;
     uint256 public constant MAX_CONFIRMATIONS   = 60;
     uint256 public constant MAX_USDC_PER_TRADE  = 30_000_000;  // 30 USDC (6 decimals)
+    // A trade must be worth something: an empty lock would reserve a CSD
+    // address (see openLockForCsdAddress) for nothing but gas.
+    uint256 public constant MIN_USDC_PER_TRADE  = 1_000_000;   // 1 USDC
 
     // Settlement window grows with the confirmations asked for: 10 minutes
     // plus 5 minutes per confirmation (2.5x CSD's 2-minute block time), so
@@ -269,6 +275,7 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
             revert CsdAddressBusy(openLockForCsdAddress[auth.sellerCsdScriptHash]);
         // The cap covers everything locked for the trade, executor fee included
         if (auth.usdcAmount + auth.executorFeeAmount > MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
+        if (auth.usdcAmount < MIN_USDC_PER_TRADE || auth.csdAmount == 0) revert TradeLimitExceeded();
 
         // CEI: set state before external call to prevent reentrancy
         uint256 lockAmount = auth.usdcAmount + auth.executorFeeAmount;

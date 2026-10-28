@@ -13,8 +13,12 @@ USDC who runs a bot.
 1. The market maker publishes a `csd_sell_offer` (price, size, its USDC
    address).
 2. The user signs a `CsdUsdcAuthorization` against it: their USDC for
-   `csdAmount` CSD paid to *their own* CSD address (`sellerCsdScriptHash` is
-   the address the CSD must be paid **to**). An executor locks the USDC.
+   `csdAmount` CSD paid to a *fresh* CSD address of their own
+   (`sellerCsdScriptHash` is the address the CSD must be paid **to**). The
+   user's interface locks the USDC (the user's own transaction, or an
+   executor submitting it privately) and only then publishes the
+   authorization. The contract allows one open trade per CSD address, so
+   publishing first would let someone reserve the address before the lock.
 3. The bot sees the lock, checks the difficulty the user signed
    (`csdMaxTarget`) is comfortably below the real one (otherwise real blocks
    might not qualify and the payment could never be proven), and

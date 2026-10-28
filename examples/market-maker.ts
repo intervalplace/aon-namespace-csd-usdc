@@ -189,8 +189,10 @@ async function handleSellers(objects: any[]) {
     };
     const signature = await me.signTypedData({ domain, types: csdUsdcNamespace.types() as any, primaryType: "CsdUsdcAuthorization", message: authorization as any });
     const authObj = await buildCsdUsdcAuthorizationObject({ authorization, signature, domain, references: [r.objectHash] });
-    await aon.putObject(authObj);
+    // Lock first, then publish, so nobody can see our fresh CSD address and
+    // reserve it before our lock (one open trade per CSD address)
     await lockCsdUsdcOnEvm({ authorization: authObj });               // we act as our own executor
+    await aon.putObject(authObj);
     state.trades[authObj.objectHash!] = { dir: "B", authObjHash: authObj.objectHash!, authHash: csdUsdcAuthHash(authObj), usdcAmount: String(usdcAmount), csdAmount: String(csdAmount), csdKey: key, csdAddr20: addr20 };
     save();
     console.log(`B: locked ${usdcAmount} USDC units; waiting for ${csdAmount} CSD units at ${addr20}`);

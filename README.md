@@ -132,9 +132,9 @@ ETH/USDT market with nothing to keep running: no header oracle, no relayer.
 |---|---|
 | Confirmations | 3 to 60, chosen by the buyer |
 | Difficulty | proof blocks carry ≥ confirmations × the work of one block at the buyer's `csdMaxTarget` |
-| CSD address | one open trade per receiving address (a payment can't say which trade it's for) |
+| CSD address | one open trade per receiving address (a payment can't say which trade it's for); use a fresh address per trade and lock before publishing the authorization |
 | Coinbase | payments inside a coinbase transaction can't be proven |
-| Max per trade | 30 USDC including the executor fee, whatever the confirmations |
+| Per trade | 1 to 30 USDC (fee included), whatever the confirmations |
 | Max locked in total | set at deployment (`maxTotalLocked`), across all open trades |
 | Token / chain | the stablecoin and the CSD genesis fixed at deployment |
 | Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
