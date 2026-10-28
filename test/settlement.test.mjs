@@ -53,7 +53,8 @@ function csdTxidFromRaw(rawHex) { // strip input script_sigs, dsha256 — as the
 function headerBytes(h) { return Buffer.concat([u32(h.version), h.prev, h.merkle, u64(h.time), u32(h.bits), u32(h.nonce)]); }
 const BITS = 0x207fffff; // TestCsdHeaderOracle runs CSD's real rules at this easy PoW limit
 const TARGET = BigInt(0x7fffff) << BigInt(8 * (0x20 - 3));
-function mine(h) { for (let n = 0; ; n++) { const hash = dsha(headerBytes({ ...h, nonce: n })); if (BigInt(hx(hash)) <= TARGET) return { ...h, nonce: n, hash }; } }
+const targetOf = (bits) => { const e = BigInt(bits >>> 24), m = BigInt(bits & 0xffffff); return e <= 3n ? m >> (8n * (3n - e)) : m << (8n * (e - 3n)); };
+function mine(h) { const t = targetOf(h.bits); for (let n = 0; ; n++) { const hash = dsha(headerBytes({ ...h, nonce: n })); if (BigInt(hx(hash)) <= t) return { ...h, nonce: n, hash }; } }
 const toSol = (h) => ({ version: h.version, prev: hx(h.prev), merkle: hx(h.merkle), time: BigInt(h.time), bits: h.bits, nonce: h.nonce });
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -177,17 +178,41 @@ console.log("\n[3] Normal settlement with a CSD proof still works");
   check(await bal(executor.address) - e0 === 50_000n, "executor received its fee");
   check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "authorization finalized"); }
 
-console.log("\n[3b] A confirming chain that runs ahead of real time has to wait");
-{ const a = await makeAuth({ usdcAmount: 10_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
-  const t0 = await now();
-  const proof = await payAndConfirm({ value: a.auth.csdAmount, time: Math.max(t0 + 900, tip.time + 120), extra: 2, keepClock: true }); // tip ~19 min ahead
-  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]), "CsdTipTooFarAhead", "settling against a tip 19 minutes in the future is refused");
-  // the headers themselves are valid CSD headers; submit them, wait, then settle
-  await send(executor, oracle, "TestCsdHeaderOracle", "submitHeaders", [GENESIS, [proof.header, ...proof.confirmationChain]]);
-  await rpc("evm_increaseTime", [600]); await rpc("evm_mine");
-  await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]);
-  check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "once real time catches up, the same proof settles"); }
+console.log("\n[3b] Work floor: confirmations must carry real work, not just count");
+{ // Separate oracle + settlement whose chain starts 30 days ago, so headers can be placed freely in the past
+  const st = (await now()) - 30 * 86400;
+  const cp2 = []; { let prev = sha(Buffer.from("wf-before")); for (let i = 0; i < 45; i++) { const h = mine({ version: 1, prev, merkle: sha(Buffer.from(`wf${i}`)), time: st + 120 * i, bits: BITS, nonce: 0 }); cp2.push(h); prev = h.hash; } }
+  const o2 = await deploy("TestCsdHeaderOracle", [GENESIS, cp2.map(toSol), 1000n, 256n]);
+  const s2 = await deploy("CsdUsdcSettlement", [o2, usdc, 10_000_000_000n]);
+  await send(buyer, usdc, "MockUSDC", "approve", [s2, 10_000_000_000n]);
+  const O2 = "TestCsdHeaderOracle";
+  let t2 = { hash: cp2[44].hash, time: cp2[44].time };
+  const next = async (dt) => { const want = await read(o2, O2, "expectedBitsAfter", [hx(t2.hash)]); const h = mine({ version: 1, prev: t2.hash, merkle: sha(Buffer.from(`wfn${Math.random()}`)), time: t2.time + dt, bits: want, nonce: 0 }); await call(executor, o2, O2, "submitHeaders", [GENESIS, [toSol(h)]]); t2 = { hash: h.hash, time: h.time }; return h; };
+  for (let i = 0; i < 30; i++) await next(60);                       // blocks come fast: difficulty rises
+  const hardWork = await read(o2, O2, "blockWork", [hx(t2.hash)]);
+  const d2 = { ...domain, verifyingContract: s2 };
+  const t = await now();
+  const auth = { ...(await makeAuth({ usdcAmount: 10_000_000n })).auth, nonce: keccak256(toHex("wf")), validBefore: BigInt(t + 3600) };
+  const sig = await buyer.signTypedData({ domain: d2, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
+  const ah = hashTypedData({ domain: d2, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
+  await call(executor, s2, S, "lockCsdUsdcAuthorization", [auth, sig]);
+  check(await read(s2, S, "lockReferenceWork", [ah]) === hardWork, "the lock records the work of a block at the current difficulty");
+  for (let i = 0; i < 45; i++) await next(1440);                     // then blocks look slow: difficulty falls to the limit
+  const easyWork = await read(o2, O2, "blockWork", [hx(t2.hash)]);
+  check(easyWork * 4n < hardWork * 3n, `difficulty has fallen by more than a quarter (work per block ${easyWork} vs ${hardWork})`);
+  // the payment with 3 easy confirmations: enough by count, not by work
+  const coinbase = csdTx({ inputs: [{ txid: Buffer.alloc(32), vout: 0xffffffff, script: u64(7) }], outputs: [{ value: 1n, script: Buffer.alloc(20, 7) }] });
+  const pay = { inputs: [{ txid: sha(Buffer.from("wf-pay")), vout: 0, script: Buffer.alloc(99, 1) }], outputs: [{ value: auth.csdAmount, script: BUYER_CSD_ADDR }] };
+  const cbid = dsha(coinbase), pid = csdTxid(pay);
+  const merkle = dsha(Buffer.concat([cbid, pid]));
+  const want = await read(o2, O2, "expectedBitsAfter", [hx(t2.hash)]);
+  const pblock = mine({ version: 1, prev: t2.hash, merkle, time: Math.max(await now() - 60, t2.time + 60), bits: want, nonce: 0 });
+  await send(executor, o2, O2, "submitHeaders", [GENESIS, [toSol(pblock)]]); t2 = { hash: pblock.hash, time: pblock.time };
+  const proof = { txRaw: hx(csdTx(pay)), merkleBranch: [{ hash: hx(cbid), isLeft: true }], header: toSol(pblock), genesisHash: GENESIS, confirmationChain: [] };
+  await next(120); await next(120);
+  await reverts(call(executor, s2, S, "settleCsdUsdc", [auth, sig, proof]), "InsufficientConfirmationWork", "3 confirmations at a quarter-lower difficulty don't settle");
+  let extra = 0; for (;;) { await next(120); extra++; try { await call(executor, s2, S, "settleCsdUsdc", [auth, sig, proof]); break; } catch (e) { if (extra > 10) throw e; } }
+  check(await read(s2, S, "finalizedAuthorization", [ah]) === true, `after ${extra} more block(s) the work is there and it settles`); }
 
 console.log("\n[4] A CSD payment from before the lock doesn't count");
 { const gap = tip.time + 3600 - await now(); if (gap > 0) { await rpc("evm_increaseTime", [gap]); await rpc("evm_mine"); }

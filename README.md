@@ -111,7 +111,7 @@ one CSD block of waiting in both directions. See
 | Confirmations | 3 to 60, chosen by the buyer |
 | Max per trade | 30 USDC including the executor fee, whatever the confirmations |
 | Token | only the USDC address fixed at deployment |
-| Confirming tip | at most 10 min ahead of the EVM clock when settling (else wait) |
+| Confirmation work | the confirming blocks must carry ≥ 3/4 × confirmations × the work of one block at the difficulty when the USDC was locked (else wait for more blocks) |
 | Max locked in total | set at deployment (`maxTotalLocked`), across all open trades |
 | Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
 | Payment age | the CSD payment's block may be at most 20 min older than the lock |

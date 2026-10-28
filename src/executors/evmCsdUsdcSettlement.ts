@@ -131,7 +131,7 @@ const abi = [
   { type: "error", name: "EarlyReleaseExpired",           inputs: [] },
   { type: "error", name: "TotalLockedLimitExceeded",      inputs: [] },
   { type: "error", name: "WrongToken",                    inputs: [] },
-  { type: "error", name: "CsdTipTooFarAhead",             inputs: [] },
+  { type: "error", name: "InsufficientConfirmationWork",  inputs: [{ name: "have", type: "uint256" }, { name: "need", type: "uint256" }] },
 ] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

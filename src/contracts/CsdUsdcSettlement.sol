@@ -42,7 +42,11 @@ interface ICsdHeaderOracle {
         uint256 minConfirmations
     ) external view returns (bool);
 
-    function bestTipTime(bytes32 genesisHash) external view returns (uint256);
+    function bestTip(bytes32 genesisHash) external view returns (bytes32);
+    function bestChainWork(bytes32 genesisHash) external view returns (uint256);
+    function blockChainWork(bytes32 blockHash) external view returns (uint256);
+    function blockWork(bytes32 blockHash) external view returns (uint256);
+    function parentOf(bytes32 blockHash) external view returns (bytes32);
 }
 
 contract CsdUsdcSettlement {
@@ -84,12 +88,17 @@ contract CsdUsdcSettlement {
     // The one token this contract escrows (USDC), fixed at deployment.
     address public immutable usdcToken;
 
-    // When settling, the oracle's best CSD tip may be at most this far ahead
-    // of the EVM clock. Honest CSD timestamps are within minutes of real time;
-    // a fake chain would want timestamps far in the future, because LWMA
-    // lowers difficulty when blocks look slow. If an honest tip is briefly
-    // ahead, settlement just waits a few minutes.
-    uint256 public constant MAX_TIP_AHEAD_SECONDS = 10 minutes;
+    // Work floor. Counting confirmations isn't enough: a fake chain can use
+    // timestamps that make CSD's LWMA lower its difficulty, so k fake blocks
+    // can cost less than k real ones. So at settlement the blocks from the
+    // payment block to the tip must also carry at least 3/4 of
+    // k x (the work of one block at the difficulty when the USDC was locked).
+    // Lowering difficulty then just means mining more blocks. The 1/4 slack
+    // covers real drops in hashrate; beyond that, settlement waits for more
+    // blocks (the lock window is 2.5x the expected time per confirmation).
+    uint256 public constant WORK_FLOOR_NUMERATOR   = 3;
+    uint256 public constant WORK_FLOOR_DENOMINATOR = 4;
+    mapping(bytes32 => uint256) public lockReferenceWork;   // per authHash, set at lock
 
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
@@ -204,7 +213,7 @@ contract CsdUsdcSettlement {
     error AuthorizationRefunded(bytes32 authHash);
     error TotalLockedLimitExceeded();
     error WrongToken();
-    error CsdTipTooFarAhead();
+    error InsufficientConfirmationWork(uint256 have, uint256 need);
     error EarlyReleaseMismatch();
     error EarlyReleaseExpired();
 
@@ -281,6 +290,11 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         lockedUntil[authHash]  = until;
         lockedAt[authHash]     = block.timestamp;
 
+        // Reference difficulty for the work floor: the oracle's current best tip
+        bytes32 refTip = csdHeaderOracle.bestTip(auth.csdGenesisHash);
+        if (refTip == bytes32(0)) revert CsdGenesisHashMismatch();
+        lockReferenceWork[authHash] = csdHeaderOracle.blockWork(refTip);
+
         if (!IERC20(auth.usdc).transferFrom(auth.buyer, address(this), lockAmount))
             revert TransferFailed();
 
@@ -305,6 +319,7 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        lockReferenceWork[authHash] = 0;
         refundedAuthorization[authHash] = true;
 
         if (!IERC20(auth.usdc).transfer(auth.buyer, amount)) revert TransferFailed();
@@ -363,6 +378,7 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        lockReferenceWork[authHash] = 0;
 
         if (!IERC20(auth.usdc).transfer(auth.sellerUsdcRecipient, auth.usdcAmount))
             revert TransferFailed();
@@ -430,10 +446,6 @@ if (spvProof.confirmationChain.length > 0) {
     csdHeaderOracle.submitHeaders(auth.csdGenesisHash, spvProof.confirmationChain);
 }
 
-// The chain that confirms the payment must not run ahead of real time
-if (csdHeaderOracle.bestTipTime(auth.csdGenesisHash) > block.timestamp + MAX_TIP_AHEAD_SECONDS)
-    revert CsdTipTooFarAhead();
-
 // Verifies tx inclusion and confirms the containing block via CSD header oracle
 bytes32 csdTxid = _verifyCsdSpv(
     spvProof,
@@ -446,6 +458,17 @@ bytes32 csdTxid = _verifyCsdSpv(
         bytes32 paymentKey = csdPaymentKey(csdTxid, auth.sellerCsdScriptHash);
         if (consumedCsdPayment[paymentKey]) revert CsdTxAlreadyConsumed(csdTxid);
 
+        // Work floor (see WORK_FLOOR_NUMERATOR). _verifyCsdSpv has checked the
+        // payment block is on the best chain, so the best chain's work minus
+        // the work up to its parent is the work confirming the payment.
+        {
+            bytes32 paymentBlock = _csdHeaderHash(spvProof.header);
+            uint256 have = csdHeaderOracle.bestChainWork(auth.csdGenesisHash)
+                         - csdHeaderOracle.blockChainWork(csdHeaderOracle.parentOf(paymentBlock));
+            uint256 need = auth.minConfirmations * lockReferenceWork[authHash] * WORK_FLOOR_NUMERATOR / WORK_FLOOR_DENOMINATOR;
+            if (have < need) revert InsufficientConfirmationWork(have, need);
+        }
+
         // CEI: update all state before transfers
         consumedCsdPayment[paymentKey]  = true;
         finalizedAuthorization[authHash] = true;
@@ -454,6 +477,7 @@ bytes32 csdTxid = _verifyCsdSpv(
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        lockReferenceWork[authHash] = 0;
 
         if (!IERC20(auth.usdc).transfer(auth.sellerUsdcRecipient, auth.usdcAmount))
             revert TransferFailed();

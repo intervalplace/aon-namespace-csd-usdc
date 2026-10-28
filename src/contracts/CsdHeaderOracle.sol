@@ -287,7 +287,11 @@ contract CsdHeaderOracle {
 
     function bestTip(bytes32 _genesisHash) external view returns (bytes32) { return _genesisHash == genesisHash ? _bestTip : bytes32(0); }
     function bestHeight(bytes32 _genesisHash) external view returns (uint256) { return _genesisHash == genesisHash ? _bestHeight : 0; }
-    function bestTipTime(bytes32 _genesisHash) external view returns (uint256) { return _genesisHash == genesisHash ? headers[_bestTip].time : 0; }
+    function blockWork(bytes32 blockHash) external view returns (uint256) {
+        StoredHeader storage h = headers[blockHash];
+        return h.exists ? CsdConsensus.workFromTarget(CsdConsensus.bitsToTarget(h.bits)) : 0;
+    }
+    function parentOf(bytes32 blockHash) external view returns (bytes32) { return headers[blockHash].parent; }
     function bestChainWork(bytes32 _genesisHash) external view returns (uint256) { return _genesisHash == genesisHash ? _bestChainWork : 0; }
     function blockHeight(bytes32 blockHash) external view returns (uint256) { return headers[blockHash].height; }
     function blockChainWork(bytes32 blockHash) external view returns (uint256) { return headers[blockHash].chainWork; }
