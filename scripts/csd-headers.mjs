@@ -9,6 +9,19 @@ const sha = (b) => createHash("sha256").update(b).digest();
 const u32 = (n) => { const b = Buffer.alloc(4); b.writeUInt32LE(n >>> 0); return b; };
 const u64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; };
 
+export function bitsToTarget(bits) {
+  const e = BigInt(bits >>> 24), m = BigInt(bits & 0xffffff);
+  return e <= 3n ? m >> (8n * (3n - e)) : m << (8n * (e - 3n));
+}
+const POW_LIMIT_TARGET = bitsToTarget(0x1e00ffff);
+
+// The csdMaxTarget an interface or bot should sign: blocks must have at least
+// 3/4 of the current difficulty (target x 4/3), never easier than CSD's limit.
+export function suggestedMaxTarget(currentBits) {
+  const t = bitsToTarget(currentBits) * 4n / 3n;
+  return t > POW_LIMIT_TARGET ? POW_LIMIT_TARGET : t;
+}
+
 export function headerHash(h) {
   const bytes = Buffer.concat([u32(h.version), Buffer.from(h.prev.slice(2), "hex"), Buffer.from(h.merkle.slice(2), "hex"), u64(h.time), u32(h.bits), u32(h.nonce)]);
   return "0x" + sha(sha(bytes)).toString("hex");

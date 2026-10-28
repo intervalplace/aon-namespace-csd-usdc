@@ -60,7 +60,7 @@ const CFG = {
 const me = privateKeyToAccount(CFG.key);
 const aon = new AonNodeClient(CFG.aon);
 const pub = createPublicClient({ transport: http(CFG.rpc) });
-const domain = { name: "AON CSD/USDC", version: "3", chainId: CFG.chainId, verifyingContract: CFG.settlement };
+const domain = { name: "AON CSD/USDC", version: "4", chainId: CFG.chainId, verifyingContract: CFG.settlement };
 const settlementAbi = [
   { type: "function", name: "usdcLocked", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "bool" }] },
   { type: "function", name: "finalizedAuthorization", stateMutability: "view", inputs: [{ type: "bytes32" }], outputs: [{ type: "bool" }] },
@@ -88,6 +88,9 @@ const sha256 = (b: Buffer) => createHash("sha256").update(b).digest();
 const hash160 = (b: Buffer) => createHash("ripemd160").update(sha256(b)).digest();
 const csd = async (path: string) => (await fetch(`${CFG.csdApi}${path}`)).json() as Promise<any>;
 const csdTipHeight = async () => Number((await csd("/tip")).height);
+const bitsToTarget = (bits: number) => { const e = BigInt(bits >>> 24), m = BigInt(bits & 0xffffff); return e <= 3n ? m >> (8n * (3n - e)) : m << (8n * (e - 3n)); };
+// Current CSD difficulty as a target, from the tip block
+const currentTarget = async () => bitsToTarget(Number((await csd(`/block/height/${await csdTipHeight()}`)).header.bits));
 
 // A fresh CSD key + address (addr20 = hash160 of the compressed pubkey) per trade
 function freshCsdAddress() {
@@ -154,6 +157,9 @@ async function handleBuyers(objects: any[]) {
     // Only pay a fresh lock, so there's plenty of time to settle before it expires
     if (BigInt(Math.floor(Date.now() / 1000)) - (await lockedAt(authHash)) > 300n) { state.handled.push(o.objectHash); continue; }
     if (BigInt(a.usdcAmount) * 10n ** 8n < BigInt(a.csdAmount) * CFG.askUsdcPerCsd) { state.handled.push(o.objectHash); continue; } // below our price
+    // The proof needs blocks at least as hard as the user signed; don't pay if
+    // real blocks are close to (or easier than) that
+    if (BigInt(a.csdMaxTarget) * 10n < (await currentTarget()) * 11n) { state.handled.push(o.objectHash); continue; }
     const addr20 = String(a.sellerCsdScriptHash).slice(2, 42);       // the user's CSD address (20 bytes, left-aligned)
     const txid = await sendCsd(addr20, BigInt(a.csdAmount));
     state.trades[o.objectHash] = { dir: "A", authObjHash: o.objectHash, authHash, usdcAmount: a.usdcAmount, csdAmount: a.csdAmount, csdTxid: txid };
@@ -178,7 +184,7 @@ async function handleSellers(objects: any[]) {
       buyer: me.address, sellerUsdcRecipient: getAddress(r.payload.sellerUsdcRecipient),
       sellerCsdScriptHash: ("0x" + addr20 + "00".repeat(12)) as Hex, csdGenesisHash: CFG.csdGenesis,
       tradeIntentHash: r.objectHash as Hex, csdAmount, usdc: CFG.usdc, usdcAmount,
-      minConfirmations: 3n, executorFeeAmount: 0n, validAfter: BigInt(now - 60), validBefore: BigInt(now + 3600),
+      minConfirmations: 3n, csdMaxTarget: (await currentTarget()) * 4n / 3n, executorFeeAmount: 0n, validAfter: BigInt(now - 60), validBefore: BigInt(now + 3600),
       nonce: keccak256(toHex(randomBytes(32))),
     };
     const signature = await me.signTypedData({ domain, types: csdUsdcNamespace.types() as any, primaryType: "CsdUsdcAuthorization", message: authorization as any });

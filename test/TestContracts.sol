@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "./CsdHeaderOracle.sol";
+import "./CsdUsdcSettlement.sol";
 
 // The real oracle's rules at an easy PoW limit, so tests can mine headers.
 contract TestCsdHeaderOracle is CsdHeaderOracle {
@@ -23,4 +24,10 @@ contract CsdConsensusHarness {
     }
     function targetToBits(uint256 x) external pure returns (uint32) { return CsdConsensus.targetToBits(x); }
     function workFromTarget(uint256 x) external pure returns (uint256) { return CsdConsensus.workFromTarget(x); }
+}
+
+// The real settlement's rules at an easy PoW limit, so tests can mine headers.
+contract TestCsdUsdcSettlement is CsdUsdcSettlement {
+    constructor(address usdc, uint256 maxTotal, bytes32 genesis) CsdUsdcSettlement(usdc, maxTotal, genesis) {}
+    function _powLimitBits() internal pure override returns (uint32) { return 0x207fffff; }
 }

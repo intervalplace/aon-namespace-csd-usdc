@@ -8,46 +8,20 @@ pragma solidity ^0.8.20;
 // CSD txid   = dsha256( version(4le) + input_count(8le) + inputs_with_empty_scripts + outputs_tail )
 // Block hash = dsha256( version(4le) + prev(32) + merkle(32) + time(8le) + bits(4le) + nonce(4le) )
 //
-// Difficulty ratchet:
-//   minimumTarget tracks the hardest difficulty target seen in a settled block.
-//   It is stored as a uint256 target (decoded from bits), not as the raw block hash.
-//   This ensures consecutive blocks at the same difficulty can all settle —
-//   a lucky block (hash << target) does not artificially inflate the floor.
-//   The PoW check requires blockHash <= minimumTarget.
-//   minimumTarget can only decrease (floor can only get harder).
+// How a CSD payment is proven (self-contained; no header oracle):
+//   The settle call carries the payment transaction, its merkle path, the
+//   block it's in, and the blocks after it. The contract checks that they
+//   link up by hash, each has valid proof of work, each is at least as hard as
+//   the difficulty the buyer signed (csdMaxTarget), and CSD's 60-second
+//   spacing rule. Faking k confirmations therefore means mining k blocks at
+//   that difficulty, whatever else the fake chain does. The buyer (the party
+//   at risk) picks the difficulty, typically ~3/4 of CSD's current difficulty
+//   (target x 4/3), read from a CSD node; the seller checks it isn't above
+//   the real difficulty before paying.
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
     function transfer(address to, uint256 amount) external returns (bool);
-}
-
-interface ICsdHeaderOracle {
-    struct CsdBlockHeader {
-        uint32  version;
-        bytes32 prev;
-        bytes32 merkle;
-        uint64  time;
-        uint32  bits;
-        uint32  nonce;
-    }
-
-    function submitHeaders(
-        bytes32 genesisHash,
-        CsdBlockHeader[] calldata newHeaders
-    ) external;
-
-    function isConfirmed(
-        bytes32 blockHash,
-        bytes32 genesisHash,
-        uint256 minConfirmations
-    ) external view returns (bool);
-
-    function bestTip(bytes32 genesisHash) external view returns (bytes32);
-    function bestChainWork(bytes32 genesisHash) external view returns (uint256);
-    function blockChainWork(bytes32 blockHash) external view returns (uint256);
-    function blockWork(bytes32 blockHash) external view returns (uint256);
-    function parentOf(bytes32 blockHash) external view returns (bytes32);
-    function referenceWork(bytes32 genesisHash) external view returns (uint256);
 }
 
 contract CsdUsdcSettlement {
@@ -55,7 +29,7 @@ contract CsdUsdcSettlement {
     bytes32 public constant CSD_USDC_AUTH_TYPEHASH = keccak256(
         "CsdUsdcAuthorization(address buyer,address sellerUsdcRecipient,bytes32 sellerCsdScriptHash,"
         "bytes32 csdGenesisHash,bytes32 tradeIntentHash,uint256 csdAmount,address usdc,"
-        "uint256 usdcAmount,uint256 minConfirmations,uint256 executorFeeAmount,"
+        "uint256 usdcAmount,uint256 minConfirmations,uint256 csdMaxTarget,uint256 executorFeeAmount,"
         "uint64 validAfter,uint64 validBefore,bytes32 nonce)"
     );
 
@@ -77,8 +51,6 @@ contract CsdUsdcSettlement {
     bytes32 private immutable DOMAIN_SEPARATOR;
 
 
-    ICsdHeaderOracle public immutable csdHeaderOracle;
-
     // Cap on USDC (incl. executor fees) locked across ALL open trades at once,
     // fixed at deployment. One fake CSD header chain can carry fake payments
     // for every open trade, so this bounds what such a chain could ever be
@@ -89,19 +61,12 @@ contract CsdUsdcSettlement {
     // The one token this contract escrows (USDC), fixed at deployment.
     address public immutable usdcToken;
 
-    // Work floor. Counting confirmations isn't enough: a fake chain can use
-    // timestamps that make CSD's LWMA lower its difficulty, so k fake blocks
-    // can cost less than k real ones. So at settlement the blocks from the
-    // payment block to the tip must also carry at least 3/4 of
-    // k x (the work of one block at the difficulty when the USDC was locked,
-    // see CsdHeaderOracle.referenceWork).
-    // Lowering difficulty then just means mining more blocks. The 1/4 slack
-    // covers real drops in hashrate; beyond that, settlement waits for more
-    // blocks (the lock window is 2.5x the expected time per confirmation).
-    uint256 public constant WORK_FLOOR_NUMERATOR   = 3;
-    uint256 public constant WORK_FLOOR_DENOMINATOR = 4;
-    mapping(bytes32 => uint256) public lockReferenceWork;   // per authHash, set at lock
+    // The CSD chain this contract settles against (its genesis block hash)
+    bytes32 public immutable csdGenesisHash;
 
+    // CSD consensus: PoW limit and minimum block spacing (compute-substrate src/params)
+    uint32  public constant CSD_POW_LIMIT_BITS          = 0x1e00ffff;
+    uint256 public constant CSD_MIN_BLOCK_SPACING_SECS  = 60;
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
     // A CSD payment is used up per (txid, recipient address): a trade can only
@@ -152,6 +117,7 @@ contract CsdUsdcSettlement {
         address usdc;
         uint256 usdcAmount;
         uint256 minConfirmations;
+        uint256 csdMaxTarget;          // every confirming block must have target <= this
         uint256 executorFeeAmount;
         uint64  validAfter;
         uint64  validBefore;
@@ -163,12 +129,20 @@ contract CsdUsdcSettlement {
         bool    isLeft;               // true = sibling is on the left
     }
 
+    struct CsdBlockHeader {
+        uint32  version;
+        bytes32 prev;
+        bytes32 merkle;
+        uint64  time;
+        uint32  bits;
+        uint32  nonce;
+    }
+
     struct CsdSpvProof {
-        bytes                             txRaw;              // Full raw transaction bytes
-        CsdMerkleStep[]                   merkleBranch;       // Merkle inclusion proof
-        ICsdHeaderOracle.CsdBlockHeader   header;             // Block header containing the tx
-        bytes32                           genesisHash;        // CSD chain identifier
-        ICsdHeaderOracle.CsdBlockHeader[] confirmationChain;  // Headers from settlement block+1 to current tip
+        bytes            txRaw;              // Full raw transaction bytes
+        CsdMerkleStep[]  merkleBranch;       // Merkle inclusion proof
+        CsdBlockHeader   header;             // Block header containing the tx
+        CsdBlockHeader[] confirmationChain;  // The blocks after it, in order (minConfirmations - 1 or more)
     }
 
     // ── Events ────────────────────────────────────────────────────────────────
@@ -210,30 +184,30 @@ contract CsdUsdcSettlement {
     error TransferFailed();
     error CsdBitsInvalid();
     error CsdBlockNotConfirmed();
-    error InvalidHeaderOracle();
     error CsdPaymentBeforeLock();
     error AuthorizationRefunded(bytes32 authHash);
     error TotalLockedLimitExceeded();
     error WrongToken();
-    error InsufficientConfirmationWork(uint256 have, uint256 need);
+    error CsdBlockTooEasy();
+    error CsdChainBroken();
+    error CsdBlockTooSoon();
     error EarlyReleaseMismatch();
     error EarlyReleaseExpired();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocked) {
-    if (_csdHeaderOracle == address(0)) revert InvalidHeaderOracle();
+constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash) {
     if (_usdcToken == address(0)) revert WrongToken();
-    usdcToken = _usdcToken;
+    if (_csdGenesisHash == bytes32(0)) revert CsdGenesisHashMismatch();
     if (_maxTotalLocked < MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
+    usdcToken = _usdcToken;
     maxTotalLocked = _maxTotalLocked;
-
-    csdHeaderOracle = ICsdHeaderOracle(_csdHeaderOracle);
+    csdGenesisHash = _csdGenesisHash;
 
     DOMAIN_SEPARATOR = keccak256(abi.encode(
         keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
         keccak256(bytes("AON CSD/USDC")),
-        keccak256(bytes("3")),
+        keccak256(bytes("4")),
         block.chainid,
         address(this)
     ));
@@ -249,13 +223,9 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         return keccak256(abi.encodePacked(
             "\x19\x01",
             DOMAIN_SEPARATOR,
-            keccak256(abi.encode(
-                CSD_USDC_AUTH_TYPEHASH,
-                auth.buyer, auth.sellerUsdcRecipient, auth.sellerCsdScriptHash,
-                auth.csdGenesisHash, auth.tradeIntentHash, auth.csdAmount, auth.usdc,
-                auth.usdcAmount, auth.minConfirmations, auth.executorFeeAmount,
-                auth.validAfter, auth.validBefore, auth.nonce
-            ))
+            // All fields are static, so abi.encode(struct) is exactly the
+            // EIP-712 encoding of its fields in order
+            keccak256(abi.encode(CSD_USDC_AUTH_TYPEHASH, auth))
         ));
     }
 
@@ -277,6 +247,8 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         if (auth.minConfirmations < MIN_CONFIRMATIONS)  revert TradeLimitExceeded();
         if (auth.minConfirmations > MAX_CONFIRMATIONS)  revert TradeLimitExceeded();
         if (auth.usdc != usdcToken)                     revert WrongToken();
+        if (auth.csdGenesisHash != csdGenesisHash)      revert CsdGenesisHashMismatch();
+        if (auth.csdMaxTarget == 0)                     revert CsdBitsInvalid();
         // The cap covers everything locked for the trade, executor fee included
         if (auth.usdcAmount + auth.executorFeeAmount > MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
 
@@ -291,13 +263,6 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         usdcLocked[authHash]   = true;
         lockedUntil[authHash]  = until;
         lockedAt[authHash]     = block.timestamp;
-
-        // Reference difficulty for the work floor: the hardest of the oracle's
-        // last 45 blocks (so a few fake low-difficulty blocks pushed onto the
-        // tip just before the lock can't lower it)
-        uint256 refWork = csdHeaderOracle.referenceWork(auth.csdGenesisHash);
-        if (refWork == 0) revert CsdGenesisHashMismatch();
-        lockReferenceWork[authHash] = refWork;
 
         if (!IERC20(auth.usdc).transferFrom(auth.buyer, address(this), lockAmount))
             revert TransferFailed();
@@ -323,7 +288,6 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
-        lockReferenceWork[authHash] = 0;
         refundedAuthorization[authHash] = true;
 
         if (!IERC20(auth.usdc).transfer(auth.buyer, amount)) revert TransferFailed();
@@ -382,7 +346,6 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
-        lockReferenceWork[authHash] = 0;
 
         if (!IERC20(auth.usdc).transfer(auth.sellerUsdcRecipient, auth.usdcAmount))
             revert TransferFailed();
@@ -430,48 +393,10 @@ constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocke
         if (uint256(spvProof.header.time) + PAYMENT_TIME_TOLERANCE < lockedAt[authHash])
             revert CsdPaymentBeforeLock();
 
-// Fold header submission into settlement — no separate operational step needed.
-// submitHeaders skips already-known headers so this is safe to call repeatedly.
-ICsdHeaderOracle.CsdBlockHeader[] memory single = new ICsdHeaderOracle.CsdBlockHeader[](1);
-single[0] = spvProof.header;
-csdHeaderOracle.submitHeaders(auth.csdGenesisHash, single);
-
-if (spvProof.confirmationChain.length > 0) {
-    // M25: Ensure the confirmation chain is anchored to the settlement block.
-    // Without this check, a chain starting from a different block would not
-    // actually confirm the settlement block.
-    // NEW-4: chainFirst removed (was dead variable).
-    // NEW-5: compute blockHash once here; _verifyCsdSpv will recompute internally
-    //        but that is unavoidable without a larger refactor.
-    bytes32 settlementBlockHash = _csdHeaderHash(spvProof.header);
-    if (spvProof.confirmationChain[0].prev != settlementBlockHash) {
-        revert CsdBlockNotConfirmed();   // NEW-1: reuse existing error, matches semantics
-    }
-    csdHeaderOracle.submitHeaders(auth.csdGenesisHash, spvProof.confirmationChain);
-}
-
-// Verifies tx inclusion and confirms the containing block via CSD header oracle
-bytes32 csdTxid = _verifyCsdSpv(
-    spvProof,
-    auth.sellerCsdScriptHash,
-    auth.csdAmount,
-    auth.csdGenesisHash,
-    auth.minConfirmations
-);
+        bytes32 csdTxid = _verifyCsdSpv(spvProof, auth.sellerCsdScriptHash, auth.csdAmount, auth.minConfirmations, auth.csdMaxTarget);
 
         bytes32 paymentKey = csdPaymentKey(csdTxid, auth.sellerCsdScriptHash);
         if (consumedCsdPayment[paymentKey]) revert CsdTxAlreadyConsumed(csdTxid);
-
-        // Work floor (see WORK_FLOOR_NUMERATOR). _verifyCsdSpv has checked the
-        // payment block is on the best chain, so the best chain's work minus
-        // the work up to its parent is the work confirming the payment.
-        {
-            bytes32 paymentBlock = _csdHeaderHash(spvProof.header);
-            uint256 have = csdHeaderOracle.bestChainWork(auth.csdGenesisHash)
-                         - csdHeaderOracle.blockChainWork(csdHeaderOracle.parentOf(paymentBlock));
-            uint256 need = auth.minConfirmations * lockReferenceWork[authHash] * WORK_FLOOR_NUMERATOR / WORK_FLOOR_DENOMINATOR;
-            if (have < need) revert InsufficientConfirmationWork(have, need);
-        }
 
         // CEI: update all state before transfers
         consumedCsdPayment[paymentKey]  = true;
@@ -481,7 +406,6 @@ bytes32 csdTxid = _verifyCsdSpv(
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
-        lockReferenceWork[authHash] = 0;
 
         if (!IERC20(auth.usdc).transfer(auth.sellerUsdcRecipient, auth.usdcAmount))
             revert TransferFailed();
@@ -499,40 +423,60 @@ bytes32 csdTxid = _verifyCsdSpv(
 
     // ── SPV verification ──────────────────────────────────────────────────────
 
-function _verifyCsdSpv(
-    CsdSpvProof calldata proof,
-    bytes32 expectedScriptHash,
-    uint256 expectedAmount,
-    bytes32 expectedGenesisHash,
-    uint256 expectedConfirmations
-) internal view returns (bytes32 csdTxid) {
-        if (proof.genesisHash != expectedGenesisHash) revert CsdGenesisHashMismatch();
-
-        // 1. Compute txid from raw bytes (strips input script_sigs, dsha256)
+    function _verifyCsdSpv(
+        CsdSpvProof calldata proof,
+        bytes32 expectedScriptHash,
+        uint256 expectedAmount,
+        uint256 minConfirmations,
+        uint256 maxTarget
+    ) internal pure returns (bytes32 csdTxid) {
+        // 1. The transaction pays the buyer's CSD address at least csdAmount
         csdTxid = _csdTxidFromRaw(proof.txRaw);
-
-        // 2. Verify an output in the tx pays expectedScriptHash >= expectedAmount
         _verifyCsdPaymentOutput(proof.txRaw, expectedScriptHash, expectedAmount);
 
-        // 3. Verify txid is included in the block via merkle branch
-        bytes32 computedMerkle = _csdMerkleRoot(csdTxid, proof.merkleBranch);
-        if (computedMerkle != proof.header.merkle) revert CsdMerkleInvalid();
+        // 2. It's in the payment block
+        if (_csdMerkleRoot(csdTxid, proof.merkleBranch) != proof.header.merkle) revert CsdMerkleInvalid();
 
-bytes32 blockHash = _csdHeaderHash(proof.header);
-uint256 blockDifficultyTarget = _bitsToTarget(proof.header.bits);
-
-if (uint256(blockHash) > blockDifficultyTarget) revert CsdInsufficientPoW();
-
-if (
-    !csdHeaderOracle.isConfirmed(
-        blockHash,
-        expectedGenesisHash,
-        expectedConfirmations
-    )
-) {
-    revert CsdBlockNotConfirmed();
-}
+        // 3. The payment block and the blocks after it: linked, valid proof of
+        //    work, each at least as hard as the buyer signed, CSD's spacing rule
+        if (1 + proof.confirmationChain.length < minConfirmations) revert CsdBlockNotConfirmed();
+        bytes32 prevHash = _checkBlock(proof.header, maxTarget);
+        uint64 prevTime = proof.header.time;
+        for (uint256 i = 0; i < proof.confirmationChain.length; i++) {
+            CsdBlockHeader calldata h = proof.confirmationChain[i];
+            if (h.prev != prevHash) revert CsdChainBroken();
+            if (uint256(h.time) < uint256(prevTime) + CSD_MIN_BLOCK_SPACING_SECS) revert CsdBlockTooSoon();
+            prevHash = _checkBlock(h, maxTarget);
+            prevTime = h.time;
+        }
     }
+
+    // The same block checks for any run of headers, for interfaces and
+    // sellers to pre-check a proof, or to check real CSD blocks meet a
+    // difficulty before signing it. Returns the last block's hash.
+    function checkHeaderChain(CsdBlockHeader[] calldata chain, uint256 maxTarget) external pure returns (bytes32 lastHash) {
+        if (chain.length == 0) revert CsdBlockNotConfirmed();
+        lastHash = _checkBlock(chain[0], maxTarget);
+        for (uint256 i = 1; i < chain.length; i++) {
+            if (chain[i].prev != lastHash) revert CsdChainBroken();
+            if (uint256(chain[i].time) < uint256(chain[i - 1].time) + CSD_MIN_BLOCK_SPACING_SECS) revert CsdBlockTooSoon();
+            lastHash = _checkBlock(chain[i], maxTarget);
+        }
+    }
+
+    // A header's hash, after checking its proof of work and that it's at
+    // least as hard as maxTarget (and within CSD's PoW limit)
+    function _checkBlock(CsdBlockHeader calldata h, uint256 maxTarget) internal pure returns (bytes32 blockHash) {
+        uint256 target = _bitsToTarget(h.bits);
+        if (target > _bitsToTarget(_powLimitBits())) revert CsdBitsInvalid();
+        if (target > maxTarget) revert CsdBlockTooEasy();
+        blockHash = _csdHeaderHash(h);
+        if (uint256(blockHash) > target) revert CsdInsufficientPoW();
+    }
+
+    // CSD mainnet's PoW limit. Virtual only so the test suite can run the same
+    // rules at an easy difficulty (test/TestContracts.sol).
+    function _powLimitBits() internal pure virtual returns (uint32) { return CSD_POW_LIMIT_BITS; }
 
     // ── SPV primitives ────────────────────────────────────────────────────────
 
@@ -630,7 +574,7 @@ if (
     }
 
     // dsha256 of: version(4le) + prev(32) + merkle(32) + time(8le) + bits(4le) + nonce(4le)
-    function _csdHeaderHash(ICsdHeaderOracle.CsdBlockHeader calldata h) internal pure returns (bytes32) {
+    function _csdHeaderHash(CsdBlockHeader calldata h) internal pure returns (bytes32) {
         return sha256(abi.encodePacked(sha256(abi.encodePacked(
             _u32LE(h.version),
             h.prev,
@@ -641,20 +585,15 @@ if (
         ))));
     }
 
-function _bitsToTarget(uint32 bits) internal pure returns (uint256) {
-    uint256 exp  = bits >> 24;
-    uint256 mant = bits & 0xFFFFFF;
-
-    if (exp == 0 || exp > 32 || mant == 0) revert CsdBitsInvalid();
-
-    uint256 target = exp > 3
-        ? mant << (8 * (exp - 3))
-        : mant >> (8 * (3 - exp));
-
-    if (target == 0 || target == type(uint256).max) revert CsdBitsInvalid();
-
-    return target;
-}
+    // bits_to_target_bytes (compute-substrate src/chain/pow.rs); invalid encodings revert
+    function _bitsToTarget(uint32 bits) internal pure returns (uint256) {
+        uint256 exp  = bits >> 24;
+        uint256 mant = bits & 0xFFFFFF;
+        if (exp == 0 || exp > 32 || mant == 0 || (mant & 0x800000) != 0) revert CsdBitsInvalid();
+        uint256 target = exp > 3 ? mant << (8 * (exp - 3)) : mant >> (8 * (3 - exp));
+        if (target == 0) revert CsdBitsInvalid();
+        return target;
+    }
 
     // ── Byte helpers ──────────────────────────────────────────────────────────
 

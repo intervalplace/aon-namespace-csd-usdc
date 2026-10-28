@@ -104,76 +104,67 @@ one CSD block of waiting in both directions. See
 [docs/market-maker.md](docs/market-maker.md) and the bot sketch in
 `examples/market-maker.ts`.
 
-## Limits (CsdUsdcSettlement v3)
+## How a CSD payment is proven (CsdUsdcSettlement v4)
+
+Settlement is self-contained, so it runs on Ethereum mainnet next to the
+ETH/USDT market with nothing to keep running: no header oracle, no relayer.
+
+- The buyer signs `csdMaxTarget` in the authorization: every block in the
+  proof must be at least that hard. Interfaces and bots set it to about 3/4
+  of CSD's current difficulty (`suggestedMaxTarget()` in
+  `scripts/csd-headers.mjs`: current target × 4/3).
+- `settleCsdUsdc` gets the payment transaction, its merkle path, the payment
+  block and the next blocks (`minConfirmations` in total). It checks they link
+  up by hash, each has valid proof of work within CSD's PoW limit and at
+  least the signed difficulty, and CSD's 60-second spacing rule.
+- So faking k confirmations means mining k blocks at that difficulty,
+  however the fake chain is built. About 166k gas per settlement.
+- The seller checks the signed difficulty isn't above the real one before
+  paying (otherwise real blocks wouldn't qualify); `checkHeaderChain` lets
+  anyone pre-check a run of real headers.
+
+## Limits
 
 | | |
 |---|---|
 | Confirmations | 3 to 60, chosen by the buyer |
+| Difficulty | every proof block at least as hard as the buyer's `csdMaxTarget` |
 | Max per trade | 30 USDC including the executor fee, whatever the confirmations |
-| Token | only the USDC address fixed at deployment |
-| Confirmation work | the confirming blocks must carry ≥ 3/4 × confirmations × the work of one block at the difficulty when the USDC was locked (else wait for more blocks) |
 | Max locked in total | set at deployment (`maxTotalLocked`), across all open trades |
+| Token / chain | the stablecoin and the CSD genesis fixed at deployment |
 | Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
 | Payment age | the CSD payment's block may be at most 20 min older than the lock |
 | Refunds | a refunded authorization can't be locked again |
 
 The per-trade cap doesn't grow with confirmations, and the total cap exists,
-because one fake header chain could carry fake payments for every open trade
-at once. Changing these numbers means deploying a new contract.
-
-## Header oracle (v2)
-
-`src/contracts/CsdHeaderOracle.sol` is a light client for Compute Substrate.
-It checks every header against the same rules a CSD node applies:
-
-- proof of work at the header's difficulty, within CSD's PoW limit;
-- difficulty: `bits` must equal the LWMA retarget computed from the 45
-  headers before it (a straight port of `expected_bits_strict`);
-- timestamps: at least 60 s after the parent, after the median of the last
-  11, at most 2 h in the future.
-
-So confirmations can only be faked by mining real CSD blocks at the real
-difficulty. There is **no owner**: the starting point is 45 consecutive real
-headers fixed at deployment (printed by the deploy script, checkable against
-any CSD node), and anyone can submit headers.
-
-Settlement adds a **work floor**: the blocks confirming a payment must carry
-at least ¾ × confirmations × the work of one block at the hardest difficulty
-in the oracle's last 45 blocks at lock time. Timestamps that make CSD's LWMA
-ease difficulty then only mean mining more blocks: faking k confirmations
-costs at least 0.75·k real blocks.
-
-Keep it current with the relayer (an hour or less behind the real tip). A
-stale oracle lets a fake run of blocks ease difficulty before a lock, which
-makes high confirmation counts (above ~6) worth less; 3–6 confirmations stay
-at the 0.75·k bound either way.
-
-```bash
-node scripts/relay-headers.mjs   # see the header of the file for settings
-```
-
-Deploy on an L2 (Base, Arbitrum, ...): checking a header costs roughly
-150–450k gas, which is cheap there and expensive on Ethereum mainnet.
+because one fake chain of blocks could carry fake payments for every open
+trade at once. Changing these numbers means deploying a new contract.
 
 ## Deploying
 
 ```bash
 npm install
-# 1. Prove the oracle accepts your real chain (local throwaway EVM, no cost):
-node scripts/check-oracle-against-csd.mjs http://127.0.0.1:8887 300
-# 2. Deploy oracle + settlement:
-CSD_API_URL=http://127.0.0.1:8887 AON_EVM_RPC_URL=https://... \
-DEPLOYER_PRIVATE_KEY=0x... USDC_ADDRESS=0x... MAX_TOTAL_LOCKED_USDC=300 node scripts/deploy.mjs
-# 3. Keep the oracle current:
-CSD_API_URL=... AON_EVM_RPC_URL=... RELAYER_PRIVATE_KEY=0x... ORACLE_ADDRESS=0x... \
-node scripts/relay-headers.mjs
+# 1. Check real CSD blocks pass the contract's checks (local throwaway EVM, no cost):
+node scripts/check-against-csd.mjs http://127.0.0.1:8887 200
+# 2. Deploy (one contract per stablecoin):
+AON_EVM_RPC_URL=https://... DEPLOYER_PRIVATE_KEY=0x... \
+USDC_ADDRESS=0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 MAX_TOTAL_LOCKED_USDC=300 \
+node scripts/deploy.mjs
 ```
+
+## Header oracle (optional, for L2s)
+
+`src/contracts/CsdHeaderOracle.sol` is a full CSD light client with no owner:
+it checks every header against CSD's consensus rules (LWMA difficulty,
+timestamps, PoW), from a fixed 45-header checkpoint, with a relayer
+(`scripts/relay-headers.mjs`). It costs ~250k gas per CSD header, so it's only
+practical on an L2; the mainnet settlement doesn't use it.
 
 ## Tests
 
 ```bash
 npm install
-npm test     # solc 0.8.26 + a local anvil: consensus vectors from CSD's own code, oracle, relayer, settlement
+npm test     # solc 0.8.26 + a local anvil: settlement, mainnet-difficulty blocks, oracle, consensus vectors from CSD's own code
 ```
 
 ## Exports

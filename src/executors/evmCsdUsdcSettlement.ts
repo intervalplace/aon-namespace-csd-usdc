@@ -20,6 +20,7 @@ const AUTH_COMPONENTS = [
   { name: "usdc",                type: "address"  },
   { name: "usdcAmount",          type: "uint256"  },
   { name: "minConfirmations",    type: "uint256"  },
+  { name: "csdMaxTarget",        type: "uint256"  },
   { name: "executorFeeAmount",   type: "uint256"  },
   { name: "validAfter",          type: "uint64"   },
   { name: "validBefore",         type: "uint64"   },
@@ -55,7 +56,6 @@ const SPV_PROOF_COMPONENTS = [
       { name: "nonce",   type: "uint32"  },
     ],
   },
-  { name: "genesisHash", type: "bytes32" },
   {
     name: "confirmationChain", type: "tuple[]",
     components: [
@@ -131,7 +131,10 @@ const abi = [
   { type: "error", name: "EarlyReleaseExpired",           inputs: [] },
   { type: "error", name: "TotalLockedLimitExceeded",      inputs: [] },
   { type: "error", name: "WrongToken",                    inputs: [] },
-  { type: "error", name: "InsufficientConfirmationWork",  inputs: [{ name: "have", type: "uint256" }, { name: "need", type: "uint256" }] },
+  { type: "error", name: "CsdBlockTooEasy",               inputs: [] },
+  { type: "error", name: "CsdChainBroken",                inputs: [] },
+  { type: "error", name: "CsdBlockTooSoon",               inputs: [] },
+  { type: "error", name: "CsdBitsInvalid",                inputs: [] },
 ] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -158,6 +161,7 @@ function authTuple(a: any) {
     usdc:                getAddress(a.usdc),
     usdcAmount:          BigInt(a.usdcAmount),
     minConfirmations:    BigInt(a.minConfirmations),
+    csdMaxTarget:        BigInt(a.csdMaxTarget),
     executorFeeAmount:   BigInt(a.executorFeeAmount ?? 0),
     validAfter:          BigInt(a.validAfter),
     validBefore:         BigInt(a.validBefore),
@@ -180,7 +184,6 @@ function spvProofTuple(p: any) {
       bits:    Number(p.header.bits),
       nonce:   Number(p.header.nonce),
     },
-    genesisHash:       asHex(p.genesis_hash, "INVALID_GENESIS_HASH"),
     // Confirmation headers beyond the settlement block (empty when minConfirmations=1)
     confirmationChain: (p.confirmation_chain ?? []).map((h: any) => ({
       version: Number(h.version),

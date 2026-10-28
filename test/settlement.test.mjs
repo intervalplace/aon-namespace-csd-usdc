@@ -1,4 +1,4 @@
-// Tests for CsdUsdcSettlement v3: scaled caps/lock windows, payment-freshness
+// Tests for CsdUsdcSettlement v4: scaled caps/lock windows, payment-freshness
 // check, and buyer-signed early release. Runs against a local anvil.
 import { createHash } from "node:crypto";
 import { createPublicClient, createWalletClient, http, defineChain, hashTypedData, keccak256, toHex, BaseError, ContractFunctionRevertedError } from "viem";
@@ -51,7 +51,7 @@ function csdTxidFromRaw(rawHex) { // strip input script_sigs, dsha256 — as the
   parts.push(raw.subarray(off)); return dsha(Buffer.concat(parts));
 }
 function headerBytes(h) { return Buffer.concat([u32(h.version), h.prev, h.merkle, u64(h.time), u32(h.bits), u32(h.nonce)]); }
-const BITS = 0x207fffff; // TestCsdHeaderOracle runs CSD's real rules at this easy PoW limit
+const BITS = 0x207fffff; // TestCsdUsdcSettlement runs the real rules at this easy PoW limit
 const TARGET = BigInt(0x7fffff) << BigInt(8 * (0x20 - 3));
 const targetOf = (bits) => { const e = BigInt(bits >>> 24), m = BigInt(bits & 0xffffff); return e <= 3n ? m >> (8n * (3n - e)) : m << (8n * (e - 3n)); };
 function mine(h) { const t = targetOf(h.bits); for (let n = 0; ; n++) { const hash = dsha(headerBytes({ ...h, nonce: n })); if (BigInt(hx(hash)) <= t) return { ...h, nonce: n, hash }; } }
@@ -60,23 +60,19 @@ const toSol = (h) => ({ version: h.version, prev: hx(h.prev), merkle: hx(h.merkl
 // ── Setup ─────────────────────────────────────────────────────────────────────
 const usdc = await deploy("MockUSDC");
 const GENESIS = hx(sha(Buffer.from("csd-test-genesis")));
-// 45 starting headers (the LWMA window), two-minute spacing, 30 days ago
-const startTime = Number((await pub.getBlock()).timestamp) - 30 * 86400;
-const checkpoint = []; { let prev = sha(Buffer.from("csd-test-before-checkpoint"));
-  for (let i = 0; i < 45; i++) { const h = mine({ version: 1, prev, merkle: sha(Buffer.from(`cp${i}`)), time: startTime + 120 * i, bits: BITS, nonce: 0 }); checkpoint.push(h); prev = h.hash; } }
-const oracle = await deploy("TestCsdHeaderOracle", [GENESIS, checkpoint.map(toSol), 1000n, 256n]);
-const settlement = await deploy("CsdUsdcSettlement", [oracle, usdc, 10_000_000_000n]);
+// Self-contained proofs: no oracle. The chain here is just the test's own blocks.
+const settlement = await deploy("TestCsdUsdcSettlement", [usdc, 10_000_000_000n, GENESIS]);
 await send(deployer, usdc, "MockUSDC", "mint", [buyer.address, 10_000_000_000n]);
 await send(buyer, usdc, "MockUSDC", "approve", [settlement, 10_000_000_000n]);
 const bal = (who) => read(usdc, "MockUSDC", "balanceOf", [who]);
-let tip = { hash: checkpoint[44].hash, time: checkpoint[44].time };
+let tip = { hash: sha(Buffer.from("csd-test-start")), time: Number((await pub.getBlock()).timestamp) - 30 * 86400 };
 const now = async () => Number((await pub.getBlock()).timestamp);
 
-const domain = { name: "AON CSD/USDC", version: "3", chainId: 31337, verifyingContract: settlement };
+const domain = { name: "AON CSD/USDC", version: "4", chainId: 31337, verifyingContract: settlement };
 const AUTH_TYPES = { CsdUsdcAuthorization: [
   { name: "buyer", type: "address" }, { name: "sellerUsdcRecipient", type: "address" }, { name: "sellerCsdScriptHash", type: "bytes32" },
   { name: "csdGenesisHash", type: "bytes32" }, { name: "tradeIntentHash", type: "bytes32" }, { name: "csdAmount", type: "uint256" },
-  { name: "usdc", type: "address" }, { name: "usdcAmount", type: "uint256" }, { name: "minConfirmations", type: "uint256" },
+  { name: "usdc", type: "address" }, { name: "usdcAmount", type: "uint256" }, { name: "minConfirmations", type: "uint256" }, { name: "csdMaxTarget", type: "uint256" },
   { name: "executorFeeAmount", type: "uint256" }, { name: "validAfter", type: "uint64" }, { name: "validBefore", type: "uint64" }, { name: "nonce", type: "bytes32" } ] };
 const RELEASE_TYPES = { CsdUsdcEarlyRelease: [
   { name: "authHash", type: "bytes32" }, { name: "sellerUsdcRecipient", type: "address" }, { name: "usdcAmount", type: "uint256" },
@@ -91,10 +87,10 @@ async function releaseMsg(a, over = {}) {
 const signRelease = (msg, who = buyer) => who.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: msg });
 const BUYER_CSD_ADDR = createHash("ripemd160").update(sha(Buffer.from("buyer-csd-pubkey"))).digest(); // hash160
 let nonceN = 0;
-async function makeAuth({ usdcAmount, conf = 3n, fee = 50_000n, csdAmount = 500_00000000n }) {
+async function makeAuth({ usdcAmount, conf = 3n, fee = 50_000n, csdAmount = 500_00000000n, maxTarget = TARGET }) {
   const t = await now();
   const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([BUYER_CSD_ADDR, Buffer.alloc(12)])),
-    csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount, usdc, usdcAmount, minConfirmations: conf,
+    csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount, usdc, usdcAmount, minConfirmations: conf, csdMaxTarget: maxTarget,
     executorFeeAmount: fee, validAfter: BigInt(t - 60), validBefore: BigInt(t + 6 * 3600), nonce: keccak256(toHex(`n${nonceN++}`)) };
   const sig = await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
   return { auth, sig, hash: hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) };
@@ -116,9 +112,9 @@ async function payAndConfirm({ to = BUYER_CSD_ADDR, value, time, extra, keepCloc
   const conf = []; let prev = block.hash;
   for (let i = 0; i < extra; i++) { const h = mine({ version: 1, prev, merkle: sha(Buffer.from(`m${Math.random()}`)), time: time + 120 * (i + 1), bits: BITS, nonce: 0 }); conf.push(h); prev = h.hash; }
   tip = { hash: prev, time: time + 120 * extra };
-  return { txRaw: hx(csdTx(pay)), merkleBranch: [{ hash: hx(cbid), isLeft: true }], header: toSol(block), genesisHash: GENESIS, confirmationChain: conf.map(toSol) };
+  return { txRaw: hx(csdTx(pay)), merkleBranch: [{ hash: hx(cbid), isLeft: true }], header: toSol(block), confirmationChain: conf.map(toSol) };
 }
-const S = "CsdUsdcSettlement";
+const S = "TestCsdUsdcSettlement";
 
 console.log("\n[1] Hashing matches between contract and off-chain signing");
 { const a = await makeAuth({ usdcAmount: 10_000_000n });
@@ -144,10 +140,10 @@ console.log("\n[2] Lock windows scale with confirmations; the cap stays 30 USDC"
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "2 confirmations rejected"); }
 
 console.log("\n[2b] Total locked across all trades is capped");
-{ const capped = await deploy("CsdUsdcSettlement", [oracle, usdc, 60_000_000n]);
+{ const capped = await deploy("TestCsdUsdcSettlement", [usdc, 60_000_000n, GENESIS]);
   await send(buyer, usdc, "MockUSDC", "approve", [capped, 10_000_000_000n]);
   const cdomain = { ...domain, verifyingContract: capped };
-  const mk = async (usdcAmount, n) => { const t = await now(); const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([BUYER_CSD_ADDR, Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, executorFeeAmount: 0n, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`cap${n}`)) };
+  const mk = async (usdcAmount, n) => { const t = await now(); const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([BUYER_CSD_ADDR, Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, csdMaxTarget: TARGET, executorFeeAmount: 0n, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`cap${n}`)) };
     return { auth, sig: await buyer.signTypedData({ domain: cdomain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) }; };
   const x = await mk(30_000_000n, 1), y = await mk(30_000_000n, 2), z = await mk(1_000_000n, 3);
   await call(executor, capped, S, "lockCsdUsdcAuthorization", [x.auth, x.sig]);
@@ -178,45 +174,31 @@ console.log("\n[3] Normal settlement with a CSD proof still works");
   check(await bal(executor.address) - e0 === 50_000n, "executor received its fee");
   check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "authorization finalized"); }
 
-console.log("\n[3b] Work floor: confirmations must carry real work, not just count");
-{ // Separate oracle + settlement whose chain starts 30 days ago, so headers can be placed freely in the past
-  const st = (await now()) - 30 * 86400;
-  const cp2 = []; { let prev = sha(Buffer.from("wf-before")); for (let i = 0; i < 45; i++) { const h = mine({ version: 1, prev, merkle: sha(Buffer.from(`wf${i}`)), time: st + 120 * i, bits: BITS, nonce: 0 }); cp2.push(h); prev = h.hash; } }
-  const o2 = await deploy("TestCsdHeaderOracle", [GENESIS, cp2.map(toSol), 1000n, 256n]);
-  const s2 = await deploy("CsdUsdcSettlement", [o2, usdc, 10_000_000_000n]);
-  await send(buyer, usdc, "MockUSDC", "approve", [s2, 10_000_000_000n]);
-  const O2 = "TestCsdHeaderOracle";
-  let t2 = { hash: cp2[44].hash, time: cp2[44].time };
-  const next = async (dt) => { const want = await read(o2, O2, "expectedBitsAfter", [hx(t2.hash)]); const h = mine({ version: 1, prev: t2.hash, merkle: sha(Buffer.from(`wfn${Math.random()}`)), time: t2.time + dt, bits: want, nonce: 0 }); await call(executor, o2, O2, "submitHeaders", [GENESIS, [toSol(h)]]); t2 = { hash: h.hash, time: h.time }; return h; };
-  for (let i = 0; i < 50; i++) await next(60);                       // blocks come fast: difficulty rises
-  const hardWork = await read(o2, O2, "blockWork", [hx(t2.hash)]);
-  const d2 = { ...domain, verifyingContract: s2 };
-  const t = await now();
-  const auth = { ...(await makeAuth({ usdcAmount: 10_000_000n })).auth, nonce: keccak256(toHex("wf")), validBefore: BigInt(t + 3600) };
-  const sig = await buyer.signTypedData({ domain: d2, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
-  const ah = hashTypedData({ domain: d2, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
-  await call(executor, s2, S, "lockCsdUsdcAuthorization", [auth, sig]);
-  check(await read(s2, S, "lockReferenceWork", [ah]) === hardWork, "the lock records the work of a block at the current difficulty");
-  // poisoning: a few slow (easier) blocks right before a lock don't lower the reference
-  const ref0 = await read(o2, O2, "referenceWork", [GENESIS]);
-  for (let i = 0; i < 8; i++) await next(1440);
-  check(await read(o2, O2, "blockWork", [hx(t2.hash)]) < ref0 && await read(o2, O2, "referenceWork", [GENESIS]) === ref0, "a few easier blocks at the tip don't lower the reference work for new locks");
-  for (let i = 0; i < 37; i++) await next(1440);                     // then blocks look slow: difficulty falls to the limit
-  const easyWork = await read(o2, O2, "blockWork", [hx(t2.hash)]);
-  check(easyWork * 4n < hardWork * 3n, `difficulty has fallen by more than a quarter (work per block ${easyWork} vs ${hardWork})`);
-  // the payment with 3 easy confirmations: enough by count, not by work
-  const coinbase = csdTx({ inputs: [{ txid: Buffer.alloc(32), vout: 0xffffffff, script: u64(7) }], outputs: [{ value: 1n, script: Buffer.alloc(20, 7) }] });
-  const pay = { inputs: [{ txid: sha(Buffer.from("wf-pay")), vout: 0, script: Buffer.alloc(99, 1) }], outputs: [{ value: auth.csdAmount, script: BUYER_CSD_ADDR }] };
-  const cbid = dsha(coinbase), pid = csdTxid(pay);
-  const merkle = dsha(Buffer.concat([cbid, pid]));
-  const want = await read(o2, O2, "expectedBitsAfter", [hx(t2.hash)]);
-  const pblock = mine({ version: 1, prev: t2.hash, merkle, time: Math.max(await now() - 60, t2.time + 60), bits: want, nonce: 0 });
-  await send(executor, o2, O2, "submitHeaders", [GENESIS, [toSol(pblock)]]); t2 = { hash: pblock.hash, time: pblock.time };
-  const proof = { txRaw: hx(csdTx(pay)), merkleBranch: [{ hash: hx(cbid), isLeft: true }], header: toSol(pblock), genesisHash: GENESIS, confirmationChain: [] };
-  await next(120); await next(120);
-  await reverts(call(executor, s2, S, "settleCsdUsdc", [auth, sig, proof]), "InsufficientConfirmationWork", "3 confirmations at a quarter-lower difficulty don't settle");
-  let extra = 0; for (;;) { await next(120); extra++; try { await call(executor, s2, S, "settleCsdUsdc", [auth, sig, proof]); break; } catch (e) { if (extra > 10) throw e; } }
-  check(await read(s2, S, "finalizedAuthorization", [ah]) === true, `after ${extra} more block(s) the work is there and it settles`); }
+console.log("\n[3b] The proof's blocks: linked, enough work, at least the signed difficulty, CSD's spacing");
+{ // A buyer who asks for a harder minimum difficulty than these blocks have
+  const hard = await makeAuth({ usdcAmount: 10_000_000n, maxTarget: TARGET / 4n });
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [hard.auth, hard.sig]);
+  let before = tip;
+  const easy = await payAndConfirm({ value: hard.auth.csdAmount, extra: 2 });
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [hard.auth, hard.sig, easy]), "CsdBlockTooEasy", "blocks easier than the signed difficulty don't count");
+  tip = before;
+  const a = await makeAuth({ usdcAmount: 10_000_000n });
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  before = tip;
+  const p = await payAndConfirm({ value: a.auth.csdAmount, extra: 2 });
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: p.confirmationChain.slice(0, 1) }]), "CsdBlockNotConfirmed", "too few confirming blocks");
+  const broken = { ...p, confirmationChain: [p.confirmationChain[1], p.confirmationChain[0]] };
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, broken]), "CsdChainBroken", "confirming blocks must link up by hash");
+  const c0 = p.confirmationChain[0];
+  const fast = mine({ version: 1, prev: Buffer.from(c0.prev.slice(2), "hex"), merkle: Buffer.from(c0.merkle.slice(2), "hex"), time: Number(p.header.time) + 59, bits: BITS, nonce: 0 });
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: [toSol(fast), p.confirmationChain[1]] }]), "CsdBlockTooSoon", "a block less than 60 s after its parent doesn't count");
+  let bad = { ...c0 }; for (let n = c0.nonce + 1; ; n++) { const h = { ...c0, nonce: n }; const b = headerBytes({ version: 1, prev: Buffer.from(h.prev.slice(2), "hex"), merkle: Buffer.from(h.merkle.slice(2), "hex"), time: Number(h.time), bits: h.bits, nonce: n }); if (BigInt(hx(dsha(b))) > TARGET) { bad = h; break; } }
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: [bad, p.confirmationChain[1]] }]), "CsdInsufficientPoW", "a block without enough proof of work doesn't count");
+  const rc = await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, p]);
+  check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, `the valid proof settles (gas ${rc.gasUsed} with 3 confirmations)`);
+  const g = { ...(await makeAuth({ usdcAmount: 1_000_000n })).auth, csdGenesisHash: hx(sha(Buffer.from("other-chain"))), nonce: keccak256(toHex("g")) };
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [g, await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: g })]), "CsdGenesisHashMismatch", "an authorization for another CSD chain can't be locked");
+}
 
 console.log("\n[4] A CSD payment from before the lock doesn't count");
 { const gap = tip.time + 3600 - await now(); if (gap > 0) { await rpc("evm_increaseTime", [gap]); await rpc("evm_mine"); }

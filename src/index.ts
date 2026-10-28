@@ -21,7 +21,7 @@ export {
   type CsdSellOfferBody,
 } from "./builders.js";
 
-export { makeCsdPaymentProofObject } from "./csdFromTxid.js";
+export { makeCsdPaymentProofObject, addConfirmationChain } from "./csdFromTxid.js";
 export { csdUsdcAuthHash, verifyEarlyReleaseObject, releaseMatchesAuthorization } from "./verifiers/authorization.js";
 export {
   executeCsdUsdcSettlementOnEvm,

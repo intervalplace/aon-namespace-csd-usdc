@@ -15,8 +15,10 @@ USDC who runs a bot.
 2. The user signs a `CsdUsdcAuthorization` against it: their USDC for
    `csdAmount` CSD paid to *their own* CSD address (`sellerCsdScriptHash` is
    the address the CSD must be paid **to**). An executor locks the USDC.
-3. The bot sees the lock and **immediately** sends the CSD to the user's
-   address. The user has CSD in their wallet after one CSD block (~2 min).
+3. The bot sees the lock, checks the difficulty the user signed
+   (`csdMaxTarget`) is comfortably below the real one (otherwise real blocks
+   might not qualify and the payment could never be proven), and
+   **immediately** sends the CSD to the user's address. The user has CSD in their wallet after one CSD block (~2 min).
 4. The bot waits for `minConfirmations`, publishes the proof, and settles
    (`settleCsdUsdc`). Only the market maker waits here.
 
@@ -34,7 +36,8 @@ not "waiting for 3 confirmations".
 2. The user publishes a `csd_sell_request` against it: amount, and the
    address their USDC should go to.
 3. The bot signs a `CsdUsdcAuthorization` as the **buyer**, with a **fresh
-   CSD address of its own** as the payment address, and locks its USDC.
+   CSD address of its own** as the payment address and `csdMaxTarget` at
+   3/4 of the current CSD difficulty, and locks its USDC.
 4. The user sends the CSD to that address.
 5. When the payment has `EARLY_RELEASE_CONFIRMATIONS` (default 1), the bot
    signs a `CsdUsdcEarlyRelease` naming that payment's txid, the current lock
