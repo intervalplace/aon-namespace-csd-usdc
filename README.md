@@ -109,7 +109,9 @@ one CSD block of waiting in both directions. See
 | | |
 |---|---|
 | Confirmations | 3 to 60, chosen by the buyer |
-| Max per trade | 30 USDC, whatever the confirmations |
+| Max per trade | 30 USDC including the executor fee, whatever the confirmations |
+| Token | only the USDC address fixed at deployment |
+| Confirming tip | at most 10 min ahead of the EVM clock when settling (else wait) |
 | Max locked in total | set at deployment (`maxTotalLocked`), across all open trades |
 | Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
 | Payment age | the CSD payment's block may be at most 20 min older than the lock |
@@ -153,7 +155,7 @@ npm install
 node scripts/check-oracle-against-csd.mjs http://127.0.0.1:8887 300
 # 2. Deploy oracle + settlement:
 CSD_API_URL=http://127.0.0.1:8887 AON_EVM_RPC_URL=https://... \
-DEPLOYER_PRIVATE_KEY=0x... MAX_TOTAL_LOCKED_USDC=300 node scripts/deploy.mjs
+DEPLOYER_PRIVATE_KEY=0x... USDC_ADDRESS=0x... MAX_TOTAL_LOCKED_USDC=300 node scripts/deploy.mjs
 # 3. Keep the oracle current:
 CSD_API_URL=... AON_EVM_RPC_URL=... RELAYER_PRIVATE_KEY=0x... ORACLE_ADDRESS=0x... \
 node scripts/relay-headers.mjs

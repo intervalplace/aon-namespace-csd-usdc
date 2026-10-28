@@ -129,6 +129,9 @@ const abi = [
   { type: "error", name: "AuthorizationRefunded",         inputs: [{ name: "authHash", type: "bytes32" }] },
   { type: "error", name: "EarlyReleaseMismatch",          inputs: [] },
   { type: "error", name: "EarlyReleaseExpired",           inputs: [] },
+  { type: "error", name: "TotalLockedLimitExceeded",      inputs: [] },
+  { type: "error", name: "WrongToken",                    inputs: [] },
+  { type: "error", name: "CsdTipTooFarAhead",             inputs: [] },
 ] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

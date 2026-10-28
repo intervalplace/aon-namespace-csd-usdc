@@ -2,7 +2,7 @@
 // from your CSD node) and the settlement contract.
 //
 //   CSD_API_URL=http://127.0.0.1:8887 AON_EVM_RPC_URL=https://... \
-//   DEPLOYER_PRIVATE_KEY=0x... MAX_TOTAL_LOCKED_USDC=300 node scripts/deploy.mjs
+//   DEPLOYER_PRIVATE_KEY=0x... USDC_ADDRESS=0x... MAX_TOTAL_LOCKED_USDC=300 node scripts/deploy.mjs
 //
 // The checkpoint ends 6 blocks below the CSD tip so it's settled. Anyone can
 // check it: every header is printed and can be compared against any CSD node.
@@ -41,5 +41,5 @@ const deploy = async (name, args) => {
   return rc.contractAddress;
 };
 const oracle = await deploy("CsdHeaderOracle", [CSD_GENESIS_HASH, cp.map(h => h.header), BigInt(first), 256n]);
-const settlement = await deploy("CsdUsdcSettlement", [oracle, maxTotalLocked]);
+const settlement = await deploy("CsdUsdcSettlement", [oracle, env("USDC_ADDRESS"), maxTotalLocked]);
 console.log(`\nDone on chain ${chainId}.\n  ORACLE_ADDRESS=${oracle}\n  AON_SETTLEMENT_CONTRACT=${settlement}\nNext: run scripts/relay-headers.mjs to keep the oracle current.`);

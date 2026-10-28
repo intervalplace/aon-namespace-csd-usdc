@@ -41,6 +41,8 @@ interface ICsdHeaderOracle {
         bytes32 genesisHash,
         uint256 minConfirmations
     ) external view returns (bool);
+
+    function bestTipTime(bytes32 genesisHash) external view returns (uint256);
 }
 
 contract CsdUsdcSettlement {
@@ -78,6 +80,16 @@ contract CsdUsdcSettlement {
     // worth, whatever it costs to mine.
     uint256 public immutable maxTotalLocked;
     uint256 public totalLocked;
+
+    // The one token this contract escrows (USDC), fixed at deployment.
+    address public immutable usdcToken;
+
+    // When settling, the oracle's best CSD tip may be at most this far ahead
+    // of the EVM clock. Honest CSD timestamps are within minutes of real time;
+    // a fake chain would want timestamps far in the future, because LWMA
+    // lowers difficulty when blocks look slow. If an honest tip is briefly
+    // ahead, settlement just waits a few minutes.
+    uint256 public constant MAX_TIP_AHEAD_SECONDS = 10 minutes;
 
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
@@ -191,13 +203,17 @@ contract CsdUsdcSettlement {
     error CsdPaymentBeforeLock();
     error AuthorizationRefunded(bytes32 authHash);
     error TotalLockedLimitExceeded();
+    error WrongToken();
+    error CsdTipTooFarAhead();
     error EarlyReleaseMismatch();
     error EarlyReleaseExpired();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
-constructor(address _csdHeaderOracle, uint256 _maxTotalLocked) {
+constructor(address _csdHeaderOracle, address _usdcToken, uint256 _maxTotalLocked) {
     if (_csdHeaderOracle == address(0)) revert InvalidHeaderOracle();
+    if (_usdcToken == address(0)) revert WrongToken();
+    usdcToken = _usdcToken;
     if (_maxTotalLocked < MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
     maxTotalLocked = _maxTotalLocked;
 
@@ -249,7 +265,9 @@ constructor(address _csdHeaderOracle, uint256 _maxTotalLocked) {
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
         if (auth.minConfirmations < MIN_CONFIRMATIONS)  revert TradeLimitExceeded();
         if (auth.minConfirmations > MAX_CONFIRMATIONS)  revert TradeLimitExceeded();
-        if (auth.usdcAmount > MAX_USDC_PER_TRADE)       revert TradeLimitExceeded();
+        if (auth.usdc != usdcToken)                     revert WrongToken();
+        // The cap covers everything locked for the trade, executor fee included
+        if (auth.usdcAmount + auth.executorFeeAmount > MAX_USDC_PER_TRADE) revert TradeLimitExceeded();
 
         // CEI: set state before external call to prevent reentrancy
         uint256 lockAmount = auth.usdcAmount + auth.executorFeeAmount;
@@ -411,6 +429,10 @@ if (spvProof.confirmationChain.length > 0) {
     }
     csdHeaderOracle.submitHeaders(auth.csdGenesisHash, spvProof.confirmationChain);
 }
+
+// The chain that confirms the payment must not run ahead of real time
+if (csdHeaderOracle.bestTipTime(auth.csdGenesisHash) > block.timestamp + MAX_TIP_AHEAD_SECONDS)
+    revert CsdTipTooFarAhead();
 
 // Verifies tx inclusion and confirms the containing block via CSD header oracle
 bytes32 csdTxid = _verifyCsdSpv(
