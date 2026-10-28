@@ -26,6 +26,15 @@ const AUTH_COMPONENTS = [
   { name: "nonce",               type: "bytes32"  },
 ] as const;
 
+const RELEASE_COMPONENTS = [
+  { name: "authHash",            type: "bytes32" },
+  { name: "sellerUsdcRecipient", type: "address" },
+  { name: "usdcAmount",          type: "uint256" },
+  { name: "csdTxid",             type: "bytes32" },
+  { name: "lockedAt",            type: "uint256" },
+  { name: "deadline",            type: "uint64"  },
+] as const;
+
 const SPV_PROOF_COMPONENTS = [
   { name: "txRaw",       type: "bytes" },
   {
@@ -88,6 +97,7 @@ const abi = [
     stateMutability: "nonpayable",
     inputs: [
       { name: "auth",       type: "tuple", components: AUTH_COMPONENTS },
+      { name: "release",    type: "tuple", components: RELEASE_COMPONENTS },
       { name: "releaseSig", type: "bytes" },
     ],
     outputs: [],
@@ -116,6 +126,9 @@ const abi = [
   { type: "error", name: "CsdPaymentBeforeLock",          inputs: [] },
   { type: "error", name: "TradeLimitExceeded",            inputs: [] },
   { type: "error", name: "CsdBlockNotConfirmed",          inputs: [] },
+  { type: "error", name: "AuthorizationRefunded",         inputs: [{ name: "authHash", type: "bytes32" }] },
+  { type: "error", name: "EarlyReleaseMismatch",          inputs: [] },
+  { type: "error", name: "EarlyReleaseExpired",           inputs: [] },
 ] as const;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -334,13 +347,22 @@ export async function releaseEarlyOnEvm(args: { authorization: any; release: any
 
   const auth       = args.authorization.payload.authorization;
   const releaseSig = args.release?.payload?.signature?.signature;
-  if (!releaseSig) throw new Error("RELEASE_SIGNATURE_MISSING");
+  const r          = args.release?.payload?.release;
+  if (!releaseSig || !r) throw new Error("RELEASE_SIGNATURE_MISSING");
+  const release = {
+    authHash:            asHex(r.authHash, "INVALID_RELEASE_AUTH_HASH"),
+    sellerUsdcRecipient: getAddress(r.sellerUsdcRecipient),
+    usdcAmount:          BigInt(r.usdcAmount),
+    csdTxid:             asHex(r.csdTxid, "INVALID_RELEASE_CSD_TXID"),
+    lockedAt:            BigInt(r.lockedAt),
+    deadline:            BigInt(r.deadline),
+  };
 
   const tx = await wallet.writeContract({
     address:      contract,
     abi,
     functionName: "releaseEarly",
-    args:         [authTuple(auth), asHex(releaseSig, "INVALID_RELEASE_SIG")],
+    args:         [authTuple(auth), release, asHex(releaseSig, "INVALID_RELEASE_SIG")],
   });
   const receipt = await pub.waitForTransactionReceipt({ hash: tx, confirmations: 1 });
 

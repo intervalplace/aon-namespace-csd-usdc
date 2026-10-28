@@ -27,6 +27,7 @@ import {
   buildCsdSellOfferObject,
   buildCsdUsdcAuthorizationObject,
   buildCsdUsdcEarlyReleaseObject,
+  earlyReleaseMessage,
   csdUsdcAuthHash,
   makeCsdPaymentProofObject,
   lockCsdUsdcOnEvm,
@@ -204,8 +205,9 @@ async function followUp() {
       if (!pay) continue;
       if (!(await isLocked(t.authHash)) || await isFinal(t.authHash)) continue;
       if (unconfirmed + BigInt(t.usdcAmount) > CFG.maxUnconfirmedUsdc) continue;  // too exposed: let the proof settle it
-      const sig = await me.signTypedData({ domain, types: EARLY_RELEASE_TYPES as any, primaryType: "CsdUsdcEarlyRelease", message: { authHash: t.authHash } });
-      const rel = await buildCsdUsdcEarlyReleaseObject({ authorization: authObj, signature: sig });
+      const relArgs = { csdTxid: pay.txid as Hex, lockedAt: await lockedAt(t.authHash), deadline: BigInt(Math.floor(Date.now() / 1000) + 600) };
+      const sig = await me.signTypedData({ domain, types: EARLY_RELEASE_TYPES as any, primaryType: "CsdUsdcEarlyRelease", message: earlyReleaseMessage(authObj, relArgs) as any });
+      const rel = await buildCsdUsdcEarlyReleaseObject({ authorization: authObj, ...relArgs, signature: sig });
       await aon.putObject(rel);
       const r = await releaseEarlyOnEvm({ authorization: authObj, release: rel });
       t.released = r.executed; t.csdTxid = pay.txid; save();

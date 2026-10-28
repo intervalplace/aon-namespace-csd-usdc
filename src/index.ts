@@ -17,6 +17,7 @@ export {
   buildCsdUsdcRevocationObject,
   buildCsdSellOfferObject,
   buildCsdUsdcEarlyReleaseObject,
+  earlyReleaseMessage,
   type CsdSellOfferBody,
 } from "./builders.js";
 

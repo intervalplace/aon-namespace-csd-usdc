@@ -44,6 +44,12 @@ function csdTx({ inputs = [], outputs }) {
   return Buffer.concat(parts);
 }
 function csdTxid({ inputs = [], outputs }) { return dsha(csdTx({ inputs: inputs.map(i => ({ ...i, script: Buffer.alloc(0) })), outputs })); }
+function csdTxidFromRaw(rawHex) { // strip input script_sigs, dsha256 — as the contract does
+  const raw = Buffer.from(rawHex.slice(2), "hex"); const parts = [raw.subarray(0, 4)]; let off = 4;
+  const n = Number(raw.readBigUInt64LE(off)); parts.push(raw.subarray(off, off + 8)); off += 8;
+  for (let i = 0; i < n; i++) { parts.push(raw.subarray(off, off + 36), Buffer.alloc(8)); off += 36; const l = Number(raw.readBigUInt64LE(off)); off += 8 + l; }
+  parts.push(raw.subarray(off)); return dsha(Buffer.concat(parts));
+}
 function headerBytes(h) { return Buffer.concat([u32(h.version), h.prev, h.merkle, u64(h.time), u32(h.bits), u32(h.nonce)]); }
 const BITS = 0x207fffff; // very easy target, accepted because the oracle's maxTarget is set to match
 const TARGET = BigInt(0x7fffff) << BigInt(8 * (0x20 - 3));
@@ -69,7 +75,17 @@ const AUTH_TYPES = { CsdUsdcAuthorization: [
   { name: "csdGenesisHash", type: "bytes32" }, { name: "tradeIntentHash", type: "bytes32" }, { name: "csdAmount", type: "uint256" },
   { name: "usdc", type: "address" }, { name: "usdcAmount", type: "uint256" }, { name: "minConfirmations", type: "uint256" },
   { name: "executorFeeAmount", type: "uint256" }, { name: "validAfter", type: "uint64" }, { name: "validBefore", type: "uint64" }, { name: "nonce", type: "bytes32" } ] };
-const RELEASE_TYPES = { CsdUsdcEarlyRelease: [{ name: "authHash", type: "bytes32" }] };
+const RELEASE_TYPES = { CsdUsdcEarlyRelease: [
+  { name: "authHash", type: "bytes32" }, { name: "sellerUsdcRecipient", type: "address" }, { name: "usdcAmount", type: "uint256" },
+  { name: "csdTxid", type: "bytes32" }, { name: "lockedAt", type: "uint256" }, { name: "deadline", type: "uint64" } ] };
+let txN = 0;
+const fakeTxid = () => hx(sha(Buffer.from(`csd-tx-${txN++}`)));
+// The release message for a locked trade (reads lockedAt from the contract)
+async function releaseMsg(a, over = {}) {
+  return { authHash: a.hash, sellerUsdcRecipient: a.auth.sellerUsdcRecipient, usdcAmount: a.auth.usdcAmount, csdTxid: fakeTxid(),
+    lockedAt: await read(settlement, "CsdUsdcSettlement", "lockedAt", [a.hash]), deadline: BigInt((await now()) + 600), ...over };
+}
+const signRelease = (msg, who = buyer) => who.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: msg });
 const BUYER_CSD_ADDR = createHash("ripemd160").update(sha(Buffer.from("buyer-csd-pubkey"))).digest(); // hash160
 let nonceN = 0;
 async function makeAuth({ usdcAmount, conf = 3n, fee = 50_000n, csdAmount = 500_00000000n }) {
@@ -99,18 +115,21 @@ const S = "CsdUsdcSettlement";
 console.log("\n[1] Hashing matches between contract and off-chain signing");
 { const a = await makeAuth({ usdcAmount: 10_000_000n });
   check(await read(settlement, S, "hashCsdUsdcAuthorization", [a.auth]) === a.hash, "authorization hash (domain version 3)");
-  check(await read(settlement, S, "hashCsdUsdcEarlyRelease", [a.hash]) === hashTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: { authHash: a.hash } }), "early-release hash"); }
+  const m = { authHash: a.hash, sellerUsdcRecipient: seller.address, usdcAmount: 10_000_000n, csdTxid: fakeTxid(), lockedAt: 123n, deadline: 456n };
+  check(await read(settlement, S, "hashCsdUsdcEarlyRelease", [m]) === hashTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: m }), "early-release hash"); }
 
-console.log("\n[2] Caps and lock windows scale with confirmations");
+console.log("\n[2] Lock windows scale with confirmations; the cap stays 30 USDC");
 { let a = await makeAuth({ usdcAmount: 30_000_000n, conf: 3n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   const t = await now();
   check(Number(await read(settlement, S, "lockedUntil", [a.hash])) === t + 25 * 60, "3 confirmations: 30 USDC allowed, locked for 25 minutes (unchanged)");
   a = await makeAuth({ usdcAmount: 30_000_001n, conf: 3n });
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "3 confirmations: 30.000001 USDC rejected");
-  a = await makeAuth({ usdcAmount: 200_000_000n, conf: 20n });
+  a = await makeAuth({ usdcAmount: 30_000_000n, conf: 20n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
-  check(Number(await read(settlement, S, "lockedUntil", [a.hash])) === (await now()) + 110 * 60, "20 confirmations: 200 USDC allowed, locked for 110 minutes");
+  check(Number(await read(settlement, S, "lockedUntil", [a.hash])) === (await now()) + 110 * 60, "20 confirmations: locked for 110 minutes");
+  a = await makeAuth({ usdcAmount: 30_000_001n, conf: 20n });
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "20 confirmations: still max 30 USDC");
   a = await makeAuth({ usdcAmount: 1_000_000n, conf: 61n });
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "61 confirmations rejected");
   a = await makeAuth({ usdcAmount: 1_000_000n, conf: 2n });
@@ -130,28 +149,36 @@ console.log("\n[4] A CSD payment from before the lock doesn't count");
 { const a = await makeAuth({ usdcAmount: 10_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
   const before = tip;
-  const old = payAndConfirm({ value: a.auth.csdAmount, time: await now() - 31 * 60, extra: 2 });
-  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, old]), "CsdPaymentBeforeLock", "payment 31 minutes before the lock rejected");
+  const old = payAndConfirm({ value: a.auth.csdAmount, time: await now() - 21 * 60, extra: 2 });
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, old]), "CsdPaymentBeforeLock", "payment 21 minutes before the lock rejected");
   tip = before; // that branch was never submitted
-  const ok = payAndConfirm({ value: a.auth.csdAmount, time: await now() - 20 * 60, extra: 2 });
+  const ok = payAndConfirm({ value: a.auth.csdAmount, time: await now() - 19 * 60, extra: 2 });
   await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, ok]);
-  check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "payment within the 30-minute timestamp slack accepted"); }
+  check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, "payment within the 20-minute timestamp slack accepted"); }
 
 console.log("\n[5] Early release: the buyer waives the wait");
 { const a = await makeAuth({ usdcAmount: 30_000_000n });
-  const releaseFor = (h, who = buyer) => who.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: { authHash: h } });
-  await reverts(call(executor, settlement, S, "releaseEarly", [a.auth, await releaseFor(a.hash)]), "AuthorizationNotLocked", "nothing to release before the lock");
+  const R = (msg, sig) => call(executor, settlement, S, "releaseEarly", [a.auth, msg, sig]);
+  { const m = { authHash: a.hash, sellerUsdcRecipient: seller.address, usdcAmount: 30_000_000n, csdTxid: fakeTxid(), lockedAt: 0n, deadline: BigInt((await now()) + 600) };
+    await reverts(R(m, await signRelease(m)), "AuthorizationNotLocked", "nothing to release before the lock"); }
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
-  await reverts(call(executor, settlement, S, "releaseEarly", [a.auth, await releaseFor(a.hash, seller)]), "BadSignature", "the seller can't release it");
-  await reverts(call(executor, settlement, S, "releaseEarly", [a.auth, await releaseFor(a.hash, executor)]), "BadSignature", "the executor can't release it");
+  let m = await releaseMsg(a);
+  await reverts(R(m, await signRelease(m, seller)), "BadSignature", "the seller can't release it");
+  await reverts(R(m, await signRelease(m, executor)), "BadSignature", "the executor can't release it");
   const other = await makeAuth({ usdcAmount: 30_000_000n });
-  await reverts(call(executor, settlement, S, "releaseEarly", [a.auth, await releaseFor(other.hash)]), "BadSignature", "a release signed for another trade doesn't work");
+  { const o = { ...m, authHash: other.hash }; await reverts(R(o, await signRelease(o)), "EarlyReleaseMismatch", "a release for another trade doesn't work"); }
+  { const o = { ...m, usdcAmount: 29_000_000n }; await reverts(R(o, await signRelease(o)), "EarlyReleaseMismatch", "a release naming a different amount doesn't work"); }
+  { const o = { ...m, sellerUsdcRecipient: executor.address }; await reverts(R(o, await signRelease(o)), "EarlyReleaseMismatch", "a release naming a different recipient doesn't work"); }
+  { const o = { ...m, lockedAt: m.lockedAt - 1n }; await reverts(R(o, await signRelease(o)), "EarlyReleaseMismatch", "a release for a different lock doesn't work"); }
+  { const o = { ...m, deadline: BigInt((await now()) - 1) }; await reverts(R(o, await signRelease(o)), "EarlyReleaseExpired", "an expired release doesn't work"); }
+  { const o = { ...m, csdTxid: "0x" + "00".repeat(32) }; await reverts(R(o, await signRelease(o)), "EarlyReleaseMismatch", "a release must name a CSD payment"); }
   const s0 = await bal(seller.address), e0 = await bal(executor.address), c0 = await bal(settlement);
-  await call(executor, settlement, S, "releaseEarly", [a.auth, await releaseFor(a.hash)]);
+  await R(m, await signRelease(m));
   check(await bal(seller.address) - s0 === 30_000_000n, "seller received 30 USDC immediately, no CSD proof");
   check(await bal(executor.address) - e0 === 50_000n, "executor received its fee");
   check(c0 - await bal(settlement) === 30_050_000n, "contract paid out exactly the locked amount");
-  await reverts(call(executor, settlement, S, "releaseEarly", [a.auth, await releaseFor(a.hash)]), "AuthorizationAlreadyFinalized", "can't be released twice");
+  check(await read(settlement, S, "consumedCsdTx", [m.csdTxid]) === true, "the accepted CSD payment is used up");
+  await reverts(R(m, await signRelease(m)), "AuthorizationAlreadyFinalized", "can't be released twice");
   const before = tip;
   const proof = payAndConfirm({ value: a.auth.csdAmount, time: await now() + 60, extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]), "AuthorizationAlreadyFinalized", "can't also be settled with a proof");
@@ -160,42 +187,60 @@ console.log("\n[5] Early release: the buyer waives the wait");
   await reverts(call(executor, settlement, S, "refundExpiredLock", [a.auth]), "AuthorizationAlreadyFinalized", "can't be refunded afterwards");
   await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "AuthorizationAlreadyFinalized", "can't be locked again"); }
 
-console.log("\n[6] Release after the window, and the refund path");
+console.log("\n[6] A CSD payment accepted by an early release can't pay for another trade");
+{ const a = await makeAuth({ usdcAmount: 10_000_000n }), b = await makeAuth({ usdcAmount: 10_000_000n });
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
+  const before = tip;
+  const proof = payAndConfirm({ value: a.auth.csdAmount, time: await now() + 60, extra: 2 }); // one payment to the (shared) address
+  const txid = hx(csdTxidFromRaw(proof.txRaw));
+  const m = await releaseMsg(a, { csdTxid: txid });
+  await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
+  await reverts(call(executor, settlement, S, "settleCsdUsdc", [b.auth, b.sig, proof]), "CsdTxAlreadyConsumed", "the same payment can't settle trade B");
+  tip = before; }
+
+console.log("\n[7] Release after the window, refunds, and no re-locking after a refund");
 { const a = await makeAuth({ usdcAmount: 5_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  const m = await releaseMsg(a, { deadline: BigInt((await now()) + 3600) });
   await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
   const s0 = await bal(seller.address);
-  await call(executor, settlement, S, "releaseEarly", [a.auth, await buyer.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: { authHash: a.hash } })]);
+  await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
   check(await bal(seller.address) - s0 === 5_000_000n, "buyer can still release after the window, before anyone refunds");
   const b = await makeAuth({ usdcAmount: 5_000_000n });
   await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
+  const stale = await releaseMsg(b, { deadline: BigInt((await now()) + 6 * 3600) }); // signed, never submitted
+  const staleSig = await signRelease(stale);
   await reverts(call(executor, settlement, S, "refundExpiredLock", [b.auth]), "AuthorizationLocked", "no refund inside the window");
   await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
   const b0 = await bal(buyer.address);
   await call(executor, settlement, S, "refundExpiredLock", [b.auth]);
   check(await bal(buyer.address) - b0 === 5_050_000n, "refund returns USDC plus the unused fee to the buyer");
-  await reverts(call(executor, settlement, S, "releaseEarly", [b.auth, await buyer.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: { authHash: b.hash } })]), "AuthorizationNotLocked", "nothing to release after a refund"); }
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]), "AuthorizationRefunded", "a refunded authorization can't be locked again");
+  await reverts(call(executor, settlement, S, "releaseEarly", [b.auth, stale, staleSig]), "AuthorizationNotLocked", "an old, unsent release can't be used after the refund"); }
 
-console.log("\n[7] Namespace objects and the executor");
+console.log("\n[8] Namespace objects and the executor");
 { const ns = await import("../src/index.ts");
   const { buildCsdUsdcAuthorizationObject, buildCsdUsdcEarlyReleaseObject, csdUsdcNamespace, EARLY_RELEASE_TYPES, csdUsdcAuthHash, releaseMatchesAuthorization, releaseEarlyOnEvm, lockCsdUsdcOnEvm } = ns;
   Object.assign(process.env, { AON_SETTLEMENT_CONTRACT: settlement, AON_EVM_RPC_URL: RPC, AON_EXECUTOR_PRIVATE_KEY: K[2] });
   const a = await makeAuth({ usdcAmount: 20_000_000n });
   const authObj = await buildCsdUsdcAuthorizationObject({ authorization: a.auth, signature: a.sig, domain, types: AUTH_TYPES });
   check(csdUsdcAuthHash(authObj) === a.hash, "csdUsdcAuthHash matches the contract's authorization hash");
-  const relSig = await buyer.signTypedData({ domain, types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: { authHash: a.hash } });
-  const rel = await buildCsdUsdcEarlyReleaseObject({ authorization: authObj, signature: relSig });
+  await lockCsdUsdcOnEvm({ authorization: authObj });
+  const relArgs = { csdTxid: fakeTxid(), lockedAt: await read(settlement, S, "lockedAt", [a.hash]), deadline: BigInt((await now()) + 600) };
+  const relMsg = ns.earlyReleaseMessage(authObj, relArgs);
+  const relSig = await buyer.signTypedData({ domain, types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: relMsg });
+  const rel = await buildCsdUsdcEarlyReleaseObject({ authorization: authObj, ...relArgs, signature: relSig });
   await csdUsdcNamespace.validateObject(rel);
   check(rel.objectType === "release" && rel.references[0] === authObj.objectHash, "release object references its authorization and validates");
   check(releaseMatchesAuthorization(rel, authObj), "releaseMatchesAuthorization: true for its own authorization");
   const o = await makeAuth({ usdcAmount: 20_000_000n });
   const other = await buildCsdUsdcAuthorizationObject({ authorization: o.auth, signature: o.sig, domain, types: AUTH_TYPES });
   check(!releaseMatchesAuthorization(rel, other), "releaseMatchesAuthorization: false for another authorization");
-  const sellerSig = await seller.signTypedData({ domain, types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: { authHash: a.hash } });
-  await reverts(buildCsdUsdcEarlyReleaseObject({ authorization: authObj, signature: sellerSig }), "BAD_EARLY_RELEASE_SIGNATURE", "builder refuses a release not signed by the buyer");
+  const sellerSig = await seller.signTypedData({ domain, types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: relMsg });
+  await reverts(buildCsdUsdcEarlyReleaseObject({ authorization: authObj, ...relArgs, signature: sellerSig }), "BAD_EARLY_RELEASE_SIGNATURE", "builder refuses a release not signed by the buyer");
   const forged = JSON.parse(JSON.stringify(rel)); forged.payload.signature.signature = sellerSig;
   await reverts(csdUsdcNamespace.validateObject(forged), "RELEASE_SIGNATURE_INVALID", "validator rejects a release with the wrong signature");
-  await lockCsdUsdcOnEvm({ authorization: authObj });
   const s0 = await bal(seller.address);
   const r = await releaseEarlyOnEvm({ authorization: authObj, release: rel });
   check(r.executed && await bal(seller.address) - s0 === 20_000_000n, "releaseEarlyOnEvm pays the seller immediately"); }

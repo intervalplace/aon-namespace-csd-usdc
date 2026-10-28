@@ -54,7 +54,7 @@ export async function verifyAuthorizationObject(obj: AonObject): Promise<void> {
 
 // ── Early release ─────────────────────────────────────────────────────────────
 // A release object: the buyer's EIP-712 signature over CsdUsdcEarlyRelease
-// { authHash }, where authHash is the referenced authorization's EIP-712 hash.
+// { authHash, sellerUsdcRecipient, usdcAmount, csdTxid, lockedAt, deadline }.
 
 export function csdUsdcAuthHash(authorizationObject: AonObject): Hex {
   const sig = (authorizationObject as any).signature;
@@ -72,7 +72,8 @@ export async function verifyEarlyReleaseObject(obj: AonObject): Promise<void> {
   if (p.releaseType !== "csd_usdc_early_release") throw new Error("UNKNOWN_RELEASE_TYPE");
   if (!sig || sig.scheme !== "eip712")             throw new Error("MISSING_RELEASE_SIGNATURE");
   if (sig.primaryType !== "CsdUsdcEarlyRelease")   throw new Error("WRONG_RELEASE_PRIMARY_TYPE");
-  if (String(sig.message?.authHash).toLowerCase() !== String(p.authHash).toLowerCase())
+  assertSameObject(p.release, sig.message);
+  if (String(p.release?.authHash).toLowerCase() !== String(p.authHash).toLowerCase())
     throw new Error("RELEASE_PAYLOAD_MESSAGE_MISMATCH");
   if (getAddress(sig.signer) !== getAddress(p.buyer)) throw new Error("RELEASE_SIGNER_NOT_BUYER");
   const ok = await verifyTypedData({
@@ -93,6 +94,9 @@ export function releaseMatchesAuthorization(release: AonObject, authorization: A
   const a = (authorization.payload as any)?.authorization;
   if (!a || !(release.references ?? []).map(r => r.toLowerCase()).includes(String(authorization.objectHash).toLowerCase())) return false;
   if (getAddress(p.buyer) !== getAddress(a.buyer)) return false;
+  const r = p.release ?? {};
+  if (getAddress(r.sellerUsdcRecipient) !== getAddress(a.sellerUsdcRecipient)) return false;
+  if (String(r.usdcAmount) !== String(a.usdcAmount)) return false;
   const ad = (authorization as any).signature?.domain, rd = p.signature?.domain;
   if (!ad || !rd || getAddress(ad.verifyingContract) !== getAddress(rd.verifyingContract) || Number(ad.chainId) !== Number(rd.chainId)) return false;
   return csdUsdcAuthHash(authorization).toLowerCase() === String(p.authHash).toLowerCase();

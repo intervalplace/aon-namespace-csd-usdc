@@ -202,13 +202,31 @@ export function buildCsdSellOfferObject(body: CsdSellOfferBody): AonObject {
 // that the CSD payment is reversed, so only sign after seeing the payment
 // (a market maker typically waits for 1 CSD confirmation).
 //
-// Sign with: signTypedData({ domain: <the authorization's domain>,
-//   types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease",
-//   message: { authHash: csdUsdcAuthHash(authorizationObject) } })
+// The release names the CSD payment it accepts (csdTxid, used up on-chain so
+// it can't also pay for another trade), the lock it applies to (lockedAt, read
+// from the contract), and a deadline. Sign the message from
+// earlyReleaseMessage() with EARLY_RELEASE_TYPES / "CsdUsdcEarlyRelease" under
+// the authorization's domain.
+
+export function earlyReleaseMessage(authorization: AonObject, args: { csdTxid: Hex; lockedAt: bigint | string; deadline: bigint | number | string }) {
+  const a = (authorization as any)?.payload?.authorization;
+  if (!a) throw new Error("INVALID_AUTHORIZATION_OBJECT");
+  return {
+    authHash:            csdUsdcAuthHash(authorization),
+    sellerUsdcRecipient: getAddress(a.sellerUsdcRecipient),
+    usdcAmount:          String(a.usdcAmount),
+    csdTxid:             requireHex(args.csdTxid, "INVALID_CSD_TXID"),
+    lockedAt:            String(args.lockedAt),
+    deadline:            String(args.deadline),
+  };
+}
 
 export async function buildCsdUsdcEarlyReleaseObject(body: {
   authorization: AonObject;   // the authorization object being released
-  signature: any;             // the buyer's EIP-712 signature
+  csdTxid: Hex;               // the CSD payment being accepted
+  lockedAt: bigint | string;  // lockedAt(authHash) from the contract
+  deadline: bigint | number | string;
+  signature: any;             // the buyer's EIP-712 signature over earlyReleaseMessage()
   createdAt?: number;
 }): Promise<AonObject> {
   const authObj = body.authorization as any;
@@ -216,8 +234,7 @@ export async function buildCsdUsdcEarlyReleaseObject(body: {
   const domain = authObj?.signature?.domain;
   if (!a || !domain || !authObj.objectHash) throw new Error("INVALID_AUTHORIZATION_OBJECT");
 
-  const authHash = csdUsdcAuthHash(authObj);
-  const message = { authHash };
+  const message = earlyReleaseMessage(authObj, body);
   await requireValidTypedSignature({
     domain,
     types: EARLY_RELEASE_TYPES,
@@ -236,8 +253,9 @@ export async function buildCsdUsdcEarlyReleaseObject(body: {
     references: [authObj.objectHash],
     payload: {
       releaseType: "csd_usdc_early_release",
-      authHash,
+      authHash: message.authHash,
       buyer: getAddress(a.buyer),
+      release: message,
       signature: {
         scheme: "eip712",
         signer: getAddress(a.buyer),

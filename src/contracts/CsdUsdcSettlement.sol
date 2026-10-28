@@ -57,8 +57,14 @@ contract CsdUsdcSettlement {
     // without waiting for the CSD proof. The buyer carries the risk of the
     // CSD payment being reversed. Market makers use this to give sellers
     // near-instant USDC, and price that risk into their quotes.
+    //
+    // The release names what it pays (recipient, amount) so wallets can show
+    // it, the CSD payment it accepts (that txid is then used up, exactly as a
+    // proof would use it up), the lock it applies to (lockedAt; a release can't
+    // carry over to a later re-lock), and a deadline.
     bytes32 public constant CSD_USDC_EARLY_RELEASE_TYPEHASH = keccak256(
-        "CsdUsdcEarlyRelease(bytes32 authHash)"
+        "CsdUsdcEarlyRelease(bytes32 authHash,address sellerUsdcRecipient,uint256 usdcAmount,"
+        "bytes32 csdTxid,uint256 lockedAt,uint64 deadline)"
     );
 
     bytes32 private immutable DOMAIN_SEPARATOR;
@@ -73,17 +79,19 @@ contract CsdUsdcSettlement {
     mapping(bytes32 => uint256) public lockedUntil;
     mapping(bytes32 => uint256) public lockedAmount;
     mapping(bytes32 => uint256) public lockedAt;
+    mapping(bytes32 => bool)    public refundedAuthorization;   // a refunded authorization can't be locked again
 
 
-    // Caps scale with the confirmations the buyer asks for. Faking a payment
-    // means mining that many blocks at the oracle's difficulty floor, so the
-    // cost of an attack grows with each confirmation: 10 USDC per
-    // confirmation (3 confirmations = 30 USDC, as before; 20 = 200 USDC).
-    // Grounded in attack economics against the current network hashrate.
+    // Single cap: maximum 30 USDC per trade, at least 3 confirmations.
+    // Conservative for launch — caps are grounded in real attack economics
+    // against the current network hashrate. Buyers may ask for more
+    // confirmations (up to 60), but that doesn't raise the cap: one fake
+    // header chain can carry fake payments for every open trade at once, so
+    // bigger per-trade caps would make such a chain worth more.
     // Changing these requires redeployment — intentional.
-    uint256 public constant MIN_CONFIRMATIONS          = 3;
-    uint256 public constant MAX_CONFIRMATIONS          = 60;
-    uint256 public constant MAX_USDC_PER_CONFIRMATION  = 10_000_000;  // 10 USDC (6 decimals)
+    uint256 public constant MIN_CONFIRMATIONS   = 3;
+    uint256 public constant MAX_CONFIRMATIONS   = 60;
+    uint256 public constant MAX_USDC_PER_TRADE  = 30_000_000;  // 30 USDC (6 decimals)
 
     // Settlement window grows with the confirmations asked for: 10 minutes
     // plus 5 minutes per confirmation (2.5x CSD's 2-minute block time), so
@@ -93,10 +101,11 @@ contract CsdUsdcSettlement {
     uint256 public constant SETTLEMENT_LOCK_PER_CONFIRMATION = 5 minutes;
 
     // A CSD payment only counts if its block is from after the lock (with
-    // slack for CSD block timestamps running behind). Otherwise an older,
-    // unrelated payment to the same CSD address could be presented as this
-    // trade's payment.
-    uint256 public constant PAYMENT_TIME_TOLERANCE = 30 minutes;
+    // slack for CSD block timestamps running behind: median-time-past of 11
+    // two-minute blocks is ~12 minutes). Otherwise an older, unrelated payment
+    // to the same CSD address could be presented as this trade's payment.
+    // Using a fresh CSD address per trade avoids the question entirely.
+    uint256 public constant PAYMENT_TIME_TOLERANCE = 20 minutes;
 
     // ── Structs ───────────────────────────────────────────────────────────────
 
@@ -169,6 +178,9 @@ contract CsdUsdcSettlement {
     error CsdBlockNotConfirmed();
     error InvalidHeaderOracle();
     error CsdPaymentBeforeLock();
+    error AuthorizationRefunded(bytes32 authHash);
+    error EarlyReleaseMismatch();
+    error EarlyReleaseExpired();
 
     // ── Constructor ───────────────────────────────────────────────────────────
 
@@ -217,12 +229,13 @@ constructor(address _csdHeaderOracle) {
 
         if (usdcLocked[authHash])            revert AuthorizationLocked(authHash, lockedUntil[authHash]);
         if (finalizedAuthorization[authHash]) revert AuthorizationAlreadyFinalized(authHash);
+        if (refundedAuthorization[authHash])  revert AuthorizationRefunded(authHash);
         if (block.timestamp < auth.validAfter || block.timestamp > auth.validBefore)
             revert AuthorizationExpired(authHash);
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
         if (auth.minConfirmations < MIN_CONFIRMATIONS)  revert TradeLimitExceeded();
         if (auth.minConfirmations > MAX_CONFIRMATIONS)  revert TradeLimitExceeded();
-        if (auth.usdcAmount > maxUsdcForConfirmations(auth.minConfirmations)) revert TradeLimitExceeded();
+        if (auth.usdcAmount > MAX_USDC_PER_TRADE)       revert TradeLimitExceeded();
 
         // CEI: set state before external call to prevent reentrancy
         uint256 lockAmount = auth.usdcAmount + auth.executorFeeAmount;
@@ -257,6 +270,7 @@ constructor(address _csdHeaderOracle) {
         usdcLocked[authHash]   = false;
         lockedUntil[authHash]  = 0;
         lockedAt[authHash]     = 0;
+        refundedAuthorization[authHash] = true;
 
         if (!IERC20(auth.usdc).transfer(auth.buyer, amount)) revert TransferFailed();
     }
@@ -267,25 +281,46 @@ constructor(address _csdHeaderOracle) {
     // over this exact authorization can do it; anyone may submit it (an
     // executor relays it and earns the executor fee, as with settlement).
 
-    function hashCsdUsdcEarlyRelease(bytes32 authHash) public view returns (bytes32) {
+    struct CsdUsdcEarlyRelease {
+        bytes32 authHash;
+        address sellerUsdcRecipient;
+        uint256 usdcAmount;
+        bytes32 csdTxid;      // the CSD payment the buyer accepts; used up like a proof would
+        uint256 lockedAt;     // the lock this applies to
+        uint64  deadline;
+    }
+
+    function hashCsdUsdcEarlyRelease(CsdUsdcEarlyRelease calldata r) public view returns (bytes32) {
         return keccak256(abi.encodePacked(
             "\x19\x01",
             DOMAIN_SEPARATOR,
-            keccak256(abi.encode(CSD_USDC_EARLY_RELEASE_TYPEHASH, authHash))
+            keccak256(abi.encode(
+                CSD_USDC_EARLY_RELEASE_TYPEHASH,
+                r.authHash, r.sellerUsdcRecipient, r.usdcAmount, r.csdTxid, r.lockedAt, r.deadline
+            ))
         ));
     }
 
     function releaseEarly(
         CsdUsdcAuthorization calldata auth,
+        CsdUsdcEarlyRelease calldata release,
         bytes calldata releaseSig
     ) external {
         bytes32 authHash = hashCsdUsdcAuthorization(auth);
 
         if (finalizedAuthorization[authHash]) revert AuthorizationAlreadyFinalized(authHash);
         if (!usdcLocked[authHash])            revert AuthorizationNotLocked(authHash);
-        if (_recover(hashCsdUsdcEarlyRelease(authHash), releaseSig) != auth.buyer) revert BadSignature();
+        if (release.authHash != authHash
+            || release.sellerUsdcRecipient != auth.sellerUsdcRecipient
+            || release.usdcAmount != auth.usdcAmount
+            || release.lockedAt != lockedAt[authHash]
+            || release.csdTxid == bytes32(0)) revert EarlyReleaseMismatch();
+        if (block.timestamp > release.deadline) revert EarlyReleaseExpired();
+        if (_recover(hashCsdUsdcEarlyRelease(release), releaseSig) != auth.buyer) revert BadSignature();
+        if (consumedCsdTx[release.csdTxid]) revert CsdTxAlreadyConsumed(release.csdTxid);
 
         // CEI: update all state before transfers
+        consumedCsdTx[release.csdTxid]   = true;
         finalizedAuthorization[authHash] = true;
         lockedAmount[authHash] = 0;
         usdcLocked[authHash]   = false;
@@ -299,6 +334,7 @@ constructor(address _csdHeaderOracle) {
             if (!IERC20(auth.usdc).transfer(msg.sender, auth.executorFeeAmount))
                 revert TransferFailed();
 
+        emit CsdUsdcAuthorizationFinalized(authHash, release.csdTxid);
         emit CsdUsdcReleasedEarly(
             authHash, auth.buyer, auth.sellerUsdcRecipient,
             auth.usdc, auth.usdcAmount, auth.csdAmount
@@ -306,10 +342,6 @@ constructor(address _csdHeaderOracle) {
     }
 
     // ── Limits ────────────────────────────────────────────────────────────────
-
-    function maxUsdcForConfirmations(uint256 confirmations) public pure returns (uint256) {
-        return confirmations * MAX_USDC_PER_CONFIRMATION;
-    }
 
     function lockSecondsForConfirmations(uint256 confirmations) public pure returns (uint256) {
         return SETTLEMENT_LOCK_BASE_SECONDS + confirmations * SETTLEMENT_LOCK_PER_CONFIRMATION;

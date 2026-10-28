@@ -40,10 +40,16 @@ const AUTH_TYPES: EIP712Types = {
 
 // The buyer waives the confirmation wait for one locked trade
 // (CsdUsdcSettlement.releaseEarly). authHash is the EIP-712 hash of the
-// authorization, exactly as the contract computes it.
+// authorization, exactly as the contract computes it; csdTxid is the CSD
+// payment being accepted (used up on-chain); lockedAt pins the current lock.
 export const EARLY_RELEASE_TYPES: EIP712Types = {
   CsdUsdcEarlyRelease: [
-    { name: "authHash", type: "bytes32" },
+    { name: "authHash",            type: "bytes32" },
+    { name: "sellerUsdcRecipient", type: "address" },
+    { name: "usdcAmount",          type: "uint256" },
+    { name: "csdTxid",             type: "bytes32" },
+    { name: "lockedAt",            type: "uint256" },
+    { name: "deadline",            type: "uint64"  },
   ],
 };
 

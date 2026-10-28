@@ -21,8 +21,9 @@ USDC who runs a bot.
    (`settleCsdUsdc`). Only the market maker waits here.
 
 Because only the market maker waits, users can be offered deeper
-confirmations and bigger trades at no cost to their experience: the cap is
-10 USDC per confirmation (20 confirmations = 200 USDC).
+confirmations (say 20 instead of 3) at no cost to their experience. That
+makes faking the payment that much more expensive; the 30 USDC per-trade cap
+stays the same.
 
 **The UI should show "CSD received" as soon as the payment is in a block**,
 not "waiting for 3 confirmations".
@@ -36,7 +37,8 @@ not "waiting for 3 confirmations".
    CSD address of its own** as the payment address, and locks its USDC.
 4. The user sends the CSD to that address.
 5. When the payment has `EARLY_RELEASE_CONFIRMATIONS` (default 1), the bot
-   signs a `CsdUsdcEarlyRelease` and submits `releaseEarly`. The user gets
+   signs a `CsdUsdcEarlyRelease` naming that payment's txid, the current lock
+   and a short deadline, and submits `releaseEarly`. The user gets
    USDC right away; the bot carries the risk that the CSD payment is
    reversed, and prices that into its quote.
 6. If anything looks wrong, the bot simply doesn't release: the user's proof
@@ -47,7 +49,9 @@ not "waiting for 3 confirmations".
 - **A fresh CSD address per trade.** Then a payment to that address can only
   be for that trade: no old payment and no payment meant for another trade
   can be mistaken for it. (The contract doesn't check payment age for early
-  releases; the bot is the one choosing to trust the payment.)
+  releases; the bot is the one choosing to trust the payment. It does use up
+  the txid named in the release, so that payment can't also settle another
+  trade.)
 - **Payment found in a block** (not just the mempool) with at least
   `EARLY_RELEASE_CONFIRMATIONS` confirmations, paying at least `csdAmount`.
 - **The USDC lock is still active** (`usdcLocked(authHash)`), the

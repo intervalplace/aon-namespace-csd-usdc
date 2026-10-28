@@ -93,7 +93,9 @@ await runExecutor({
 
 The confirmation wait only protects the buyer (who locked the USDC). The
 buyer can waive it for a single locked trade by signing a
-`CsdUsdcEarlyRelease { authHash }`: anyone can then submit it to
+`CsdUsdcEarlyRelease`: it names the recipient and amount, the CSD payment
+being accepted (its txid is then used up, so it can't also pay for another
+trade), the current lock, and a deadline. Anyone can submit it to
 `releaseEarly`, and the seller is paid immediately without a CSD proof. The
 buyer carries the risk of the CSD payment being reversed.
 
@@ -107,19 +109,21 @@ one CSD block of waiting in both directions. See
 | | |
 |---|---|
 | Confirmations | 3 to 60, chosen by the buyer |
-| Max per trade | 10 USDC × confirmations (3 → 30 USDC, 20 → 200 USDC) |
+| Max per trade | 30 USDC, whatever the confirmations |
 | Lock window | 10 min + 5 min × confirmations (3 → 25 min, 20 → 110 min) |
-| Payment age | the CSD payment's block must be no more than 30 min older than the lock |
+| Payment age | the CSD payment's block may be at most 20 min older than the lock |
+| Refunds | a refunded authorization can't be locked again |
 
-The cap grows with confirmations because faking a payment means mining that
-many blocks at the oracle's difficulty floor. Changing these numbers means
-deploying a new contract.
+The per-trade cap doesn't grow with confirmations: one fake header chain at
+the oracle's difficulty floor can carry fake payments for every open trade at
+once, so a bigger cap would make such a chain worth more. Changing these
+numbers means deploying a new contract.
 
 ## Tests
 
 ```bash
 npm install
-npm test     # compiles with solc 0.8.26, runs a local anvil, 34 checks
+npm test     # compiles with solc 0.8.26, runs a local anvil, 43 checks
 ```
 
 ## Exports
@@ -133,6 +137,7 @@ import {
   buildCsdUsdcAuthorizationObject,
   buildCsdUsdcRevocationObject,
   buildCsdUsdcEarlyReleaseObject,
+  earlyReleaseMessage,
   EARLY_RELEASE_TYPES,
   csdUsdcAuthHash,
 
