@@ -141,6 +141,23 @@ export function txToNodeJson(tx: CsdTx) {
   };
 }
 
+// The reverse, for transactions handed over by another wallet. Only plain
+// payments (app "None"); throws on anything malformed.
+export function txFromNodeJson(j: any): CsdTx {
+  const bytes = (a: any, n?: number) => {
+    if (!Array.isArray(a) || (n !== undefined && a.length !== n) || a.length > 10_000 || !a.every(x => Number.isInteger(x) && x >= 0 && x <= 255)) throw new Error("BAD_TX_JSON");
+    return Uint8Array.from(a);
+  };
+  const int = (x: any, max: number) => { if (!Number.isSafeInteger(x) || x < 0 || x > max) throw new Error("BAD_TX_JSON"); return x; };
+  if (!j || j.app !== "None" || !Array.isArray(j.inputs) || !Array.isArray(j.outputs) || j.inputs.length > 512 || j.outputs.length > 512) throw new Error("BAD_TX_JSON");
+  return {
+    version: int(j.version, 0xffffffff),
+    inputs: j.inputs.map((i: any) => ({ prevout: { txid: bytesToHex(bytes(i?.prevout?.txid, 32)), vout: int(i?.prevout?.vout, 0xffffffff) }, scriptSig: bytes(i?.script_sig) })),
+    outputs: j.outputs.map((o: any) => ({ value: BigInt(int(o?.value, Number.MAX_SAFE_INTEGER)), addr20: bytesToHex(bytes(o?.script_pubkey, 20)) })),
+    locktime: int(j.locktime, 0xffffffff),
+  };
+}
+
 // ── address-ownership proof for the settlement contract ─────────────────────
 // Matches CsdUsdcSettlement.csdOwnershipDigest / _checkCsdAddressProof
 export function csdOwnershipDigest(authHash: Hex): Bytes {
@@ -175,7 +192,7 @@ export function csdNode(base: string, fetchImpl: typeof fetch = fetch) {
     async headerAt(height: number) { const b = await get(`/block/height/${height}`); return { hash: b.hash as Hex, ...b.header } as any; },
     async currentBits(): Promise<number> { const t = await this.tip(); return Number((await this.headerAt(t.height)).bits); },
     async utxos(key: CsdKey): Promise<CsdUtxo[]> {
-      const r = await get(`/utxos/${addrHex(key.addr20)}`);
+      const r = await get(`/utxos/${addrHex(key.addr20)}?available=true`); // skips coins already spent in the mempool
       return (r.utxos ?? []).map((u: any) => ({ txid: u.txid, vout: Number(u.vout), value: BigInt(u.value), key }));
     },
     async activity(addr20: Hex, limit = 50) { return (await get(`/address/${addrHex(addr20)}/activity?limit=${limit}`)).activity ?? []; },

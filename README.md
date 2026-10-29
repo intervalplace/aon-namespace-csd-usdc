@@ -99,15 +99,21 @@ trade), the current lock, and a deadline. Anyone can submit it to
 `releaseEarly`, and the seller is paid immediately without a CSD proof. The
 buyer carries the risk of the CSD payment being reversed.
 
-That lets a market maker on the other side of every trade give users about
-one CSD block of waiting in both directions. See
-[docs/market-maker.md](docs/market-maker.md) and the bot sketch in
-`examples/market-maker.ts`.
+That lets a market maker on the other side of every trade make both
+directions feel like an ordinary swap: about one Ethereum block, no CSD
+confirmations to wait for, and no ETH needed by the user (USDC permits; the
+market maker pays the gas). `src/market-maker.ts` is that bot, pricing from
+its own pool; `src/csd-wallet.ts` is the in-site CSD wallet it trades with.
+See [docs/market-maker.md](docs/market-maker.md).
+
+Locks also need a **CSD address proof** (the CSD key behind the payment
+address signs the authorization hash), so nobody can open trades on an
+address they don't control.
 
 ## How a CSD payment is proven (CsdUsdcSettlement v4)
 
 Settlement is self-contained, so it runs on Ethereum mainnet next to the
-ETH/USDT market with nothing to keep running: no header oracle, no relayer.
+ETH market with nothing to keep running: no header oracle, no relayer.
 
 - The buyer signs `csdMaxTarget` in the authorization: every block in the
   proof must be at least that hard. Interfaces and bots set it to about 3/4

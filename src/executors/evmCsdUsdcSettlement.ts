@@ -181,7 +181,7 @@ function asHex(x: any, code: string): Hex {
   return x as Hex;
 }
 
-function authTuple(a: any) {
+export function authTuple(a: any) {
   return {
     buyer:               getAddress(a.buyer),
     sellerUsdcRecipient: getAddress(a.sellerUsdcRecipient),
@@ -200,7 +200,7 @@ function authTuple(a: any) {
   };
 }
 
-function spvProofTuple(p: any) {
+export function spvProofTuple(p: any) {
   return {
     txRaw: asHex(p.tx_raw, "INVALID_TX_RAW"),
     merkleBranch: (p.merkle_branch ?? []).map((step: any) => ({
