@@ -11,6 +11,8 @@ contract MockUSDC {
   function transfer(address to, uint256 a) external returns (bool) { require(balanceOf[msg.sender] >= a, "bal"); balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
   function transferFrom(address f, address to, uint256 a) external returns (bool) { require(allowance[f][msg.sender] >= a, "allow"); require(balanceOf[f] >= a, "bal"); allowance[f][msg.sender] -= a; balanceOf[f] -= a; balanceOf[to] += a; return true; }
   // EIP-2612, as USDC implements it (domain "USD Coin", version "2")
+  string public constant name = "USD Coin"; uint8 public constant decimals = 6;
+  function version() external pure returns (string memory) { return "2"; }
   mapping(address=>uint256) public nonces;
   bytes32 public constant PERMIT_TYPEHASH = keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
   function DOMAIN_SEPARATOR() public view returns (bytes32) { return keccak256(abi.encode(keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"), keccak256("USD Coin"), keccak256("2"), block.chainid, address(this))); }

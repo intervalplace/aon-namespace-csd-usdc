@@ -125,6 +125,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   const serial = <T>(fn: () => Promise<T>): Promise<T> => { const r = queue.then(fn); queue = r.catch(() => {}); return r; };
 
   const now = () => Math.floor(Date.now() / 1000);
+  // The difficulty to sign: 3/4 of the current one, and never stricter than the blocks being mined
+  const signTarget = (bits: number) => { const s = suggestedMaxTarget(bits), t = bitsToTarget(bits); return s > t ? s : t; };
   const chainNow = async () => Number((await pub.getBlock()).timestamp);
   const authHashOf = (auth: any) => hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: authTuple(auth) });
   const strAuth = (a: any) => Object.fromEntries(Object.entries(authTuple(a)).map(([k, v]) => [k, String(v)]));
@@ -272,7 +274,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const keyIndex = S.nextKey++; const k = key(keyIndex); const t0 = await chainNow();
     const auth = authTuple({ buyer: account.address, sellerUsdcRecipient: recipient, sellerCsdScriptHash: addr20ToBytes32(k.addr20), csdGenesisHash: C.csdGenesis,
       tradeIntentHash: keccak256(toHex("covenant market maker: sell")), csdAmount: csd, usdc, usdcAmount, minConfirmations: C.sellConfirmations,
-      csdMaxTarget: suggestedMaxTarget(bits), executorFeeAmount: 0n, validAfter: t0 - 60, validBefore: t0 + 3 * 3600, nonce: toHex(randomBytes(32)) });
+      csdMaxTarget: signTarget(bits), executorFeeAmount: 0n, validAfter: t0 - 60, validBefore: t0 + 3 * 3600, nonce: toHex(randomBytes(32)) });
     const authHash = authHashOf(auth);
     const sig = await account.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth as any });
     let lockTx: Hex;
@@ -402,7 +404,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       pool: { usdc: String(p.usdc), csd: String(p.csd) }, mid: String(midPrice(p)), spreadBps: String(C.spreadBps), feeUsdc: String(C.feeUsdc),
       bestAsk: String(quoteBuy(p, 100_000_000n)), bestBid: String(quoteSell(p, 100_000_000n)),
       limits: { minTradeUsdc: String(C.minTradeUsdc), maxTradeUsdc: String(C.maxTradeUsdc), buyConfirmations: C.buyConfirmations, instantRoomUsdc: String(C.maxUnconfirmedUsdc - exposure()) },
-      csd: { height: tip.height, bits, suggestedMaxTarget: String(suggestedMaxTarget(bits)) },
+      csd: { height: tip.height, bits, suggestedMaxTarget: String(signTarget(bits)) },
       asks: l.asks.map(x => ({ price: String(x.price), csd: String(x.csd) })), bids: l.bids.map(x => ({ price: String(x.price), csd: String(x.csd) })),
       recent,
     };
