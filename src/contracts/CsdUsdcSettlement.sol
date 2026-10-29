@@ -29,6 +29,10 @@ interface IERC20 {
     function transfer(address to, uint256 amount) external returns (bool);
 }
 
+interface IERC20Permit {
+    function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external;
+}
+
 contract CsdUsdcSettlement {
 
     bytes32 public constant CSD_USDC_AUTH_TYPEHASH = keccak256(
@@ -76,11 +80,9 @@ contract CsdUsdcSettlement {
 
     // One open lock per CSD receiving address. A CSD payment can't say which
     // trade it's for, so two open trades paying the same address could be
-    // confused (one seller settling with the other's payment). The buyer uses
-    // another address for trades in parallel. To keep anyone from reserving a
-    // buyer's address first, buyers lock (or have their executor lock,
-    // privately) before publishing the authorization, and use a fresh CSD
-    // address per trade.
+    // confused (one seller settling with the other's payment). Locks need a
+    // proof that the buyer controls the address (CsdAddressProof), so nobody
+    // can reserve someone else's address; a buyer uses a fresh address per trade.
     mapping(bytes32 => bytes32) public openLockForCsdAddress;   // sellerCsdScriptHash => authHash
 
     mapping(bytes32 => bool)    public finalizedAuthorization;
@@ -211,6 +213,7 @@ contract CsdUsdcSettlement {
     error CsdTxMalformed();
     error CsdCoinbaseNotSupported();
     error CsdAddressBusy(bytes32 openAuthHash);
+    error CsdAddressProofInvalid();
     error CsdChainBroken();
     error CsdBlockTooSoon();
     error EarlyReleaseMismatch();
@@ -254,10 +257,58 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
     // ── Lock ─────────────────────────────────────────────────────────────────
     // Buyer locks USDC to signal commitment. Seller can then safely send CSD.
 
+    // Proof that the buyer controls the CSD receiving address: the address's
+    // public key (64 bytes, uncompressed x||y) and its signature over
+    // csdOwnershipDigest(authHash). CSD keys are secp256k1, like Ethereum's,
+    // so ecrecover checks the signature; the address is hash160 of the
+    // compressed key, as on CSD. This stops anyone from opening a trade on
+    // someone else's CSD address (and so reserving it).
+    struct CsdAddressProof {
+        bytes pubKey;   // 64 bytes: x || y
+        bytes sig;      // 65 bytes: r || s || v
+    }
+
+    struct UsdcPermit {
+        uint256 deadline;
+        uint8   v;
+        bytes32 r;
+        bytes32 s;
+    }
+
+    function csdOwnershipDigest(bytes32 authHash) public pure returns (bytes32) {
+        return keccak256(abi.encodePacked("AON CSD/USDC: I control this CSD address for trade ", authHash));
+    }
+
     function lockCsdUsdcAuthorization(
         CsdUsdcAuthorization calldata auth,
-        bytes calldata authSig
+        bytes calldata authSig,
+        CsdAddressProof calldata addressProof
     ) external {
+        _lock(auth, authSig, addressProof);
+    }
+
+    // The same, with a USDC permit (EIP-2612) instead of a prior approval, so
+    // the buyer only signs and anyone (an executor or market maker) submits.
+    // The permit is for exactly usdcAmount + executorFeeAmount. If it was
+    // already used (e.g. someone submitted it first), the lock still works as
+    // long as the allowance is there.
+    function lockCsdUsdcAuthorizationWithPermit(
+        CsdUsdcAuthorization calldata auth,
+        bytes calldata authSig,
+        CsdAddressProof calldata addressProof,
+        UsdcPermit calldata permit
+    ) external {
+        try IERC20Permit(usdcToken).permit(
+            auth.buyer, address(this), auth.usdcAmount + auth.executorFeeAmount, permit.deadline, permit.v, permit.r, permit.s
+        ) {} catch {}
+        _lock(auth, authSig, addressProof);
+    }
+
+    function _lock(
+        CsdUsdcAuthorization calldata auth,
+        bytes calldata authSig,
+        CsdAddressProof calldata addressProof
+    ) internal {
         bytes32 authHash = hashCsdUsdcAuthorization(auth);
 
         if (usdcLocked[authHash])            revert AuthorizationLocked(authHash, lockedUntil[authHash]);
@@ -266,6 +317,7 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
         if (block.timestamp < auth.validAfter || block.timestamp > auth.validBefore)
             revert AuthorizationExpired(authHash);
         if (_recover(authHash, authSig) != auth.buyer) revert BadSignature();
+        _checkCsdAddressProof(auth.sellerCsdScriptHash, authHash, addressProof);
         if (auth.minConfirmations < MIN_CONFIRMATIONS)  revert TradeLimitExceeded();
         if (auth.minConfirmations > MAX_CONFIRMATIONS)  revert TradeLimitExceeded();
         if (auth.usdc != usdcToken)                     revert WrongToken();
@@ -294,6 +346,19 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
             revert TransferFailed();
 
         emit CsdUsdcAuthorizationLocked(authHash, until);
+    }
+
+    function _checkCsdAddressProof(bytes32 csdScriptHash, bytes32 authHash, CsdAddressProof calldata p) internal pure {
+        if (p.pubKey.length != 64) revert CsdAddressProofInvalid();
+        bytes32 x = bytes32(p.pubKey[0:32]);
+        bytes32 y = bytes32(p.pubKey[32:64]);
+        // CSD address = ripemd160(sha256(compressed pubkey))
+        bytes1 prefix = (uint256(y) & 1) == 1 ? bytes1(0x03) : bytes1(0x02);
+        bytes20 addr = ripemd160(abi.encodePacked(sha256(abi.encodePacked(prefix, x))));
+        if (addr != bytes20(csdScriptHash) || uint256(csdScriptHash) << 160 != 0) revert CsdAddressProofInvalid();
+        // The same key's Ethereum-style address must have signed
+        address keyAddress = address(uint160(uint256(keccak256(p.pubKey))));
+        if (_recover(csdOwnershipDigest(authHash), p.sig) != keyAddress) revert CsdAddressProofInvalid();
     }
 
     // ── Refund ────────────────────────────────────────────────────────────────
@@ -668,10 +733,10 @@ constructor(address _usdcToken, uint256 _maxTotalLocked, bytes32 _csdGenesisHash
 
     // ── Byte helpers ──────────────────────────────────────────────────────────
 
-function _readU64LE(bytes calldata data, uint256 off) internal pure returns (uint64 v) {
-    require(off + 8 <= data.length, "CSD_U64_OVF");
-    for (uint i = 0; i < 8; i++) v |= uint64(uint8(data[off + i])) << (i * 8);
-}
+    function _readU64LE(bytes calldata data, uint256 off) internal pure returns (uint64 v) {
+        require(off + 8 <= data.length, "CSD_U64_OVF");
+        for (uint256 i = 0; i < 8; i++) v |= uint64(uint8(data[off + i])) << uint64(i * 8);
+    }
 
     function _u32LE(uint32 v) internal pure returns (bytes4) {
         return bytes4(abi.encodePacked(uint8(v), uint8(v>>8), uint8(v>>16), uint8(v>>24)));

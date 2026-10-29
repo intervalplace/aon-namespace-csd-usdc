@@ -69,14 +69,39 @@ const SPV_PROOF_COMPONENTS = [
   },
 ] as const;
 
-const abi = [
+const ADDRESS_PROOF_COMPONENTS = [
+  { name: "pubKey", type: "bytes" },
+  { name: "sig",    type: "bytes" },
+] as const;
+
+const PERMIT_COMPONENTS = [
+  { name: "deadline", type: "uint256" },
+  { name: "v",        type: "uint8"   },
+  { name: "r",        type: "bytes32" },
+  { name: "s",        type: "bytes32" },
+] as const;
+
+export const settlementAbi = [
   {
     type: "function",
     name: "lockCsdUsdcAuthorization",
     stateMutability: "nonpayable",
     inputs: [
-      { name: "auth",    type: "tuple",  components: AUTH_COMPONENTS },
-      { name: "authSig", type: "bytes" },
+      { name: "auth",         type: "tuple",  components: AUTH_COMPONENTS },
+      { name: "authSig",      type: "bytes" },
+      { name: "addressProof", type: "tuple",  components: ADDRESS_PROOF_COMPONENTS },
+    ],
+    outputs: [],
+  },
+  {
+    type: "function",
+    name: "lockCsdUsdcAuthorizationWithPermit",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "auth",         type: "tuple",  components: AUTH_COMPONENTS },
+      { name: "authSig",      type: "bytes" },
+      { name: "addressProof", type: "tuple",  components: ADDRESS_PROOF_COMPONENTS },
+      { name: "permit",       type: "tuple",  components: PERMIT_COMPONENTS },
     ],
     outputs: [],
   },
@@ -111,31 +136,37 @@ const abi = [
     ],
     outputs: [],
   },
-  // errors
-  { type: "error", name: "BadSignature",               inputs: [] },
-  { type: "error", name: "CsdGenesisHashMismatch",     inputs: [] },
-  { type: "error", name: "CsdMerkleInvalid",           inputs: [] },
-  { type: "error", name: "CsdPaymentOutputNotFound",   inputs: [] },
-  { type: "error", name: "CsdInsufficientPoW",         inputs: [] },
-  { type: "error", name: "TransferFailed",             inputs: [] },
-  { type: "error", name: "AuthorizationAlreadyFinalized", inputs: [{ name: "authHash", type: "bytes32" }] },
-  { type: "error", name: "AuthorizationExpired",          inputs: [{ name: "authHash", type: "bytes32" }] },
-  { type: "error", name: "AuthorizationLocked",           inputs: [{ name: "authHash", type: "bytes32" }, { name: "lockedUntil", type: "uint256" }] },
-  { type: "error", name: "AuthorizationNotLocked",        inputs: [{ name: "authHash", type: "bytes32" }] },
-  { type: "error", name: "CsdTxAlreadyConsumed",          inputs: [{ name: "csdTxid",  type: "bytes32" }] },
-  { type: "error", name: "CsdPaymentBeforeLock",          inputs: [] },
-  { type: "error", name: "TradeLimitExceeded",            inputs: [] },
-  { type: "error", name: "CsdBlockNotConfirmed",          inputs: [] },
-  { type: "error", name: "AuthorizationRefunded",         inputs: [{ name: "authHash", type: "bytes32" }] },
-  { type: "error", name: "EarlyReleaseMismatch",          inputs: [] },
-  { type: "error", name: "EarlyReleaseExpired",           inputs: [] },
-  { type: "error", name: "TotalLockedLimitExceeded",      inputs: [] },
-  { type: "error", name: "WrongToken",                    inputs: [] },
-  { type: "error", name: "CsdBlockTooEasy",               inputs: [] },
-  { type: "error", name: "CsdChainBroken",                inputs: [] },
-  { type: "error", name: "CsdBlockTooSoon",               inputs: [] },
-  { type: "error", name: "CsdBitsInvalid",                inputs: [] },
+  // errors (kept identical to the contract's; test/settlement.test.mjs checks)
+  { type: "error", name: "AuthorizationAlreadyFinalized" , inputs: [{ name: "authHash", type: "bytes32" }] },
+  { type: "error", name: "AuthorizationExpired"          , inputs: [{ name: "authHash", type: "bytes32" }] },
+  { type: "error", name: "AuthorizationLocked"           , inputs: [{ name: "authHash", type: "bytes32" }, { name: "lockedUntil", type: "uint256" }] },
+  { type: "error", name: "AuthorizationNotLocked"        , inputs: [{ name: "authHash", type: "bytes32" }] },
+  { type: "error", name: "AuthorizationRefunded"         , inputs: [{ name: "authHash", type: "bytes32" }] },
+  { type: "error", name: "BadSignature"                  , inputs: [] },
+  { type: "error", name: "CsdAddressBusy"                , inputs: [{ name: "openAuthHash", type: "bytes32" }] },
+  { type: "error", name: "CsdAddressProofInvalid"        , inputs: [] },
+  { type: "error", name: "CsdBitsInvalid"                , inputs: [] },
+  { type: "error", name: "CsdBlockInFuture"              , inputs: [] },
+  { type: "error", name: "CsdBlockNotConfirmed"          , inputs: [] },
+  { type: "error", name: "CsdBlockTooSoon"               , inputs: [] },
+  { type: "error", name: "CsdChainBroken"                , inputs: [] },
+  { type: "error", name: "CsdCoinbaseNotSupported"       , inputs: [] },
+  { type: "error", name: "CsdGenesisHashMismatch"        , inputs: [] },
+  { type: "error", name: "CsdInsufficientPoW"            , inputs: [] },
+  { type: "error", name: "CsdInsufficientWork"           , inputs: [{ name: "have", type: "uint256" }, { name: "need", type: "uint256" }] },
+  { type: "error", name: "CsdMerkleInvalid"              , inputs: [] },
+  { type: "error", name: "CsdPaymentBeforeLock"          , inputs: [] },
+  { type: "error", name: "CsdPaymentOutputNotFound"      , inputs: [] },
+  { type: "error", name: "CsdTxAlreadyConsumed"          , inputs: [{ name: "csdTxid", type: "bytes32" }] },
+  { type: "error", name: "CsdTxMalformed"                , inputs: [] },
+  { type: "error", name: "EarlyReleaseExpired"           , inputs: [] },
+  { type: "error", name: "EarlyReleaseMismatch"          , inputs: [] },
+  { type: "error", name: "TotalLockedLimitExceeded"      , inputs: [] },
+  { type: "error", name: "TradeLimitExceeded"            , inputs: [] },
+  { type: "error", name: "TransferFailed"                , inputs: [] },
+  { type: "error", name: "WrongToken"                    , inputs: [] },
 ] as const;
+const abi = settlementAbi;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -260,7 +291,14 @@ export async function executeCsdUsdcSettlementOnEvm(args: {
   };
 }
 
-export async function lockCsdUsdcOnEvm(args: { authorization: any }) {
+// Locks the buyer's USDC. `addressProof` shows the CSD payment address belongs
+// to the buyer (csdAddressProof in csd-wallet.ts). With `permit` (an EIP-2612
+// USDC permit signed by the buyer) the buyer needs no approval transaction and
+// no ETH: the executor pays the gas.
+export type CsdAddressProof = { pubKey: Hex; sig: Hex };
+export type UsdcPermit = { deadline: bigint | string; v: number; r: Hex; s: Hex };
+
+export async function lockCsdUsdcOnEvm(args: { authorization: any; addressProof?: CsdAddressProof; permit?: UsdcPermit }) {
   const contract   = getAddress(requireEnv("AON_SETTLEMENT_CONTRACT"));
   const rpcUrl     = requireEnv("AON_EVM_RPC_URL");
   const privateKey = asHex(requireEnv("AON_EXECUTOR_PRIVATE_KEY"), "INVALID_EXECUTOR_PRIVATE_KEY");
@@ -275,12 +313,19 @@ export async function lockCsdUsdcOnEvm(args: { authorization: any }) {
   const sig  = args.authorization.signature?.signature;
   if (!sig) throw new Error("AUTH_SIGNATURE_MISSING");
 
-  const tx = await wallet.writeContract({
-    address:      contract,
-    abi,
-    functionName: "lockCsdUsdcAuthorization",
-    args:         [authTuple(auth), asHex(sig, "INVALID_AUTH_SIG")],
-  });
+  const ap = args.addressProof ?? args.authorization.payload?.csdAddressProof;
+  if (!ap) throw new Error("CSD_ADDRESS_PROOF_MISSING");
+  const proof = { pubKey: asHex(ap.pubKey, "INVALID_CSD_PUBKEY"), sig: asHex(ap.sig, "INVALID_CSD_PROOF_SIG") };
+  const tx = args.permit
+    ? await wallet.writeContract({
+        address: contract, abi, functionName: "lockCsdUsdcAuthorizationWithPermit",
+        args: [authTuple(auth), asHex(sig, "INVALID_AUTH_SIG"), proof,
+               { deadline: BigInt(args.permit.deadline), v: Number(args.permit.v), r: asHex(args.permit.r, "INVALID_PERMIT"), s: asHex(args.permit.s, "INVALID_PERMIT") }],
+      })
+    : await wallet.writeContract({
+        address: contract, abi, functionName: "lockCsdUsdcAuthorization",
+        args: [authTuple(auth), asHex(sig, "INVALID_AUTH_SIG"), proof],
+      });
 
   const receipt = await pub.waitForTransactionReceipt({ hash: tx, confirmations: 1 });
 

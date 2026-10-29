@@ -14,11 +14,15 @@ USDC who runs a bot.
    address).
 2. The user signs a `CsdUsdcAuthorization` against it: their USDC for
    `csdAmount` CSD paid to a *fresh* CSD address of their own
-   (`sellerCsdScriptHash` is the address the CSD must be paid **to**). The
-   user's interface locks the USDC (the user's own transaction, or an
-   executor submitting it privately) and only then publishes the
-   authorization. The contract allows one open trade per CSD address, so
-   publishing first would let someone reserve the address before the lock.
+   (`sellerCsdScriptHash` is the address the CSD must be paid **to**), plus
+   two more signatures that cost nothing:
+   - an **address proof**: the CSD key behind that address signs the
+     authorization hash (`csdAddressProof` in `src/csd-wallet.ts`). The
+     contract allows one open trade per CSD address and only lets the
+     address's owner open one, so nobody can reserve someone else's address;
+   - a **USDC permit** (EIP-2612), so the user needs no approval transaction
+     and no ETH: the market maker submits `lockCsdUsdcAuthorizationWithPermit`
+     and pays the gas (it's paid back through `executorFeeAmount`).
 3. The bot sees the lock, checks the difficulty the user signed
    (`csdMaxTarget`) is comfortably below the real one (otherwise real blocks
    might not qualify and the payment could never be proven), and
@@ -71,8 +75,9 @@ not "waiting for 3 confirmations".
 
 `examples/market-maker.ts` is a skeleton of the loop above. It needs:
 
-- a CSD node with the HTTP API (`/tip`, `/tx/:id`, `/address/:addr20/activity`)
-  and the `csd` CLI wallet to send CSD and make fresh addresses;
+- a CSD node with the HTTP API (`/tip`, `/tx/:id`, `/utxos/:addr20`,
+  `/address/:addr20/activity`, `/tx/submit`); `src/csd-wallet.ts` builds,
+  signs and submits CSD payments and makes fresh addresses (no CLI needed);
 - an EVM RPC and a key holding USDC (and a little ETH for gas);
 - an AON node URL.
 

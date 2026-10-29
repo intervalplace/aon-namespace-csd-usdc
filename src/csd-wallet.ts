@@ -1,0 +1,190 @@
+// A small CSD wallet for browsers and bots: keys, addresses, transactions,
+// signing, and the address-ownership proof the settlement contract checks.
+//
+// Everything here follows compute-substrate's consensus code:
+//   - addresses: addr20 = ripemd160(sha256(compressed secp256k1 pubkey))  (crypto/mod.rs hash160)
+//   - transactions: bincode, fixed-int, little-endian                    (types/mod.rs, codec/mod.rs)
+//   - txid: sha256d(tx with input script_sigs emptied)                   (crypto/mod.rs txid)
+//   - sighash: sha256d(tagged_hash("CSD_SIG_V1", stripped tx || CHAIN_ID_HASH))  (crypto/mod.rs sighash)
+//   - script_sig: [64][sig64 compact low-S][33][pub33] = 99 bytes        (state/utxo.rs parse_scriptsig)
+// Checked against CSD's own Rust code by test/wallet.test.mjs.
+//
+// Keys can be derived from an Ethereum wallet signature (deriveCsdWallet), so
+// the same Ethereum wallet recreates the same CSD keys on any device. Anyone
+// who gets that signature gets the CSD keys: only sign CSD_WALLET_MESSAGE on
+// the site you trust.
+
+import { secp256k1 } from "@noble/curves/secp256k1";
+import { sha256 } from "@noble/hashes/sha2";
+import { ripemd160 } from "@noble/hashes/legacy";
+import { hmac } from "@noble/hashes/hmac";
+import { keccak_256 } from "@noble/hashes/sha3";
+
+export type Hex = `0x${string}`;
+export type Bytes = Uint8Array;
+
+// sha256("compute-substrate-mainnet")  (params/mod.rs CHAIN_ID_HASH)
+export const CSD_CHAIN_ID_HASH = hexToBytes("0x1b17c7b04d05394674ca2c8e24f7433e251a1973cac2000c7b60966546e0b875");
+export const CSD_COIN = 100_000_000n;
+
+export const CSD_WALLET_MESSAGE =
+  "Covenant CSD wallet\n\n" +
+  "Signing this creates your CSD wallet keys. Anyone with this signature can spend your CSD on Covenant, " +
+  "so only sign it on covenant.market.\n\n" +
+  "Version 1";
+
+// ── bytes ──────────────────────────────────────────────────────────────────
+export function hexToBytes(h: string): Bytes {
+  const s = h.startsWith("0x") ? h.slice(2) : h;
+  if (s.length % 2) throw new Error("ODD_HEX");
+  const out = new Uint8Array(s.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(2 * i, 2 * i + 2), 16);
+  return out;
+}
+export const bytesToHex = (b: Bytes): Hex => ("0x" + Array.from(b, x => x.toString(16).padStart(2, "0")).join("")) as Hex;
+const concat = (...xs: Bytes[]) => { const n = xs.reduce((a, x) => a + x.length, 0); const o = new Uint8Array(n); let k = 0; for (const x of xs) { o.set(x, k); k += x.length; } return o; };
+const u32 = (n: number) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n >>> 0, true); return b; };
+const u64 = (n: bigint | number) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(n), true); return b; };
+const utf8 = (s: string) => new TextEncoder().encode(s);
+export const sha256d = (b: Bytes) => sha256(sha256(b));
+export const hash160 = (b: Bytes) => ripemd160(sha256(b));
+
+// ── keys ───────────────────────────────────────────────────────────────────
+export type CsdKey = { index: number; priv: Bytes; pub33: Bytes; pub64: Bytes; addr20: Hex };
+
+export function keyFromPrivate(priv: Bytes, index = 0): CsdKey {
+  const pub33 = secp256k1.getPublicKey(priv, true);
+  const pub64 = secp256k1.getPublicKey(priv, false).slice(1);
+  return { index, priv, pub33, pub64, addr20: bytesToHex(hash160(pub33)) };
+}
+
+// Deterministic keys from a wallet signature over CSD_WALLET_MESSAGE
+export function deriveCsdWallet(walletSignature: Hex) {
+  const seed = sha256(concat(utf8("AON CSD wallet v1"), hexToBytes(walletSignature)));
+  const key = (index: number): CsdKey => {
+    for (let ctr = 0; ; ctr++) {
+      const d = hmac(sha256, seed, concat(utf8("key"), u32(index), u32(ctr)));
+      if (secp256k1.utils.isValidPrivateKey(d)) return keyFromPrivate(d, index);
+    }
+  };
+  return { key };
+}
+
+// ── transactions ───────────────────────────────────────────────────────────
+export type CsdOutPoint = { txid: Hex; vout: number };
+export type CsdTxIn = { prevout: CsdOutPoint; scriptSig: Bytes };
+export type CsdTxOut = { value: bigint; addr20: Hex };
+export type CsdTx = { version: number; inputs: CsdTxIn[]; outputs: CsdTxOut[]; locktime: number }; // app: None
+
+export function serializeTx(tx: CsdTx, stripScripts = false): Bytes {
+  const parts: Bytes[] = [u32(tx.version), u64(tx.inputs.length)];
+  for (const i of tx.inputs) {
+    const s = stripScripts ? new Uint8Array(0) : i.scriptSig;
+    parts.push(hexToBytes(i.prevout.txid), u32(i.prevout.vout), u64(s.length), s);
+  }
+  parts.push(u64(tx.outputs.length));
+  for (const o of tx.outputs) {
+    const a = hexToBytes(o.addr20);
+    if (a.length !== 20) throw new Error("BAD_ADDR20");
+    parts.push(u64(o.value), a);
+  }
+  parts.push(u32(tx.locktime), u32(0)); // AppPayload::None
+  return concat(...parts);
+}
+
+export const csdTxid = (tx: CsdTx): Hex => bytesToHex(sha256d(serializeTx(tx, true)));
+
+export function csdSighash(tx: CsdTx): Bytes {
+  const tag = sha256(utf8("CSD_SIG_V1"));
+  const tagged = sha256(concat(tag, tag, serializeTx(tx, true), CSD_CHAIN_ID_HASH));
+  return sha256d(tagged);
+}
+
+// Signs every input (each input's key must own its prevout's address)
+export function signTx(tx: CsdTx, keys: CsdKey[]): CsdTx {
+  if (keys.length !== tx.inputs.length) throw new Error("ONE_KEY_PER_INPUT");
+  const digest = csdSighash(tx);
+  return {
+    ...tx,
+    inputs: tx.inputs.map((inp, k) => {
+      const sig = secp256k1.sign(digest, keys[k].priv, { lowS: true }).toCompactRawBytes();
+      return { ...inp, scriptSig: concat(new Uint8Array([64]), sig, new Uint8Array([33]), keys[k].pub33) };
+    }),
+  };
+}
+
+export type CsdUtxo = { txid: Hex; vout: number; value: bigint; key: CsdKey };
+
+// A plain payment: picks inputs (largest first), pays `to`, change to `change`
+export function buildPayment(args: { utxos: CsdUtxo[]; to: CsdTxOut[]; change: Hex; fee?: bigint }): { tx: CsdTx; txid: Hex; spent: CsdOutPoint[] } {
+  const fee = args.fee ?? 10_000n;
+  const need = args.to.reduce((s, o) => s + o.value, 0n) + fee;
+  const sorted = [...args.utxos].sort((a, b) => (b.value > a.value ? 1 : b.value < a.value ? -1 : 0));
+  const picked: CsdUtxo[] = []; let total = 0n;
+  for (const u of sorted) { if (total >= need) break; picked.push(u); total += u.value; }
+  if (total < need) throw new Error("INSUFFICIENT_CSD");
+  const outputs = [...args.to];
+  if (total > need) outputs.push({ value: total - need, addr20: args.change });
+  const unsigned: CsdTx = { version: 1, inputs: picked.map(u => ({ prevout: { txid: u.txid, vout: u.vout }, scriptSig: new Uint8Array(0) })), outputs, locktime: 0 };
+  const tx = signTx(unsigned, picked.map(u => u.key));
+  return { tx, txid: csdTxid(tx), spent: picked.map(u => ({ txid: u.txid, vout: u.vout })) };
+}
+
+// The node's /tx/submit JSON (serde: byte arrays as number arrays)
+export function txToNodeJson(tx: CsdTx) {
+  return {
+    version: tx.version,
+    inputs: tx.inputs.map(i => ({ prevout: { txid: Array.from(hexToBytes(i.prevout.txid)), vout: i.prevout.vout }, script_sig: Array.from(i.scriptSig) })),
+    outputs: tx.outputs.map(o => ({ value: Number(o.value), script_pubkey: Array.from(hexToBytes(o.addr20)) })),
+    locktime: tx.locktime,
+    app: "None",
+  };
+}
+
+// ── address-ownership proof for the settlement contract ─────────────────────
+// Matches CsdUsdcSettlement.csdOwnershipDigest / _checkCsdAddressProof
+export function csdOwnershipDigest(authHash: Hex): Bytes {
+  return keccak_256(concat(utf8("AON CSD/USDC: I control this CSD address for trade "), hexToBytes(authHash)));
+}
+export function csdAddressProof(key: CsdKey, authHash: Hex): { pubKey: Hex; sig: Hex } {
+  const s = secp256k1.sign(csdOwnershipDigest(authHash), key.priv, { lowS: true });
+  return { pubKey: bytesToHex(key.pub64), sig: bytesToHex(concat(s.toCompactRawBytes(), new Uint8Array([27 + s.recovery]))) };
+}
+// The address as the contract's bytes32 sellerCsdScriptHash (left-aligned)
+export const addr20ToBytes32 = (addr20: Hex): Hex => (addr20 + "00".repeat(12)) as Hex;
+
+// ── difficulty ─────────────────────────────────────────────────────────────
+export function bitsToTarget(bits: number): bigint {
+  const e = BigInt(bits >>> 24), m = BigInt(bits & 0xffffff);
+  return e <= 3n ? m >> (8n * (3n - e)) : m << (8n * (e - 3n));
+}
+const POW_LIMIT_TARGET = bitsToTarget(0x1e00ffff);
+// The csdMaxTarget to sign: 3/4 of the current difficulty (target x 4/3)
+export function suggestedMaxTarget(currentBits: number): bigint {
+  const t = bitsToTarget(currentBits) * 4n / 3n;
+  return t > POW_LIMIT_TARGET ? POW_LIMIT_TARGET : t;
+}
+
+// ── node API ───────────────────────────────────────────────────────────────
+export function csdNode(base: string, fetchImpl: typeof fetch = fetch) {
+  const url = (p: string) => `${base.replace(/\/$/, "")}${p}`;
+  const get = async (p: string) => { const r = await fetchImpl(url(p)); if (!r.ok) throw new Error(`CSD_API_${r.status}`); return r.json(); };
+  const addrHex = (a: Hex) => a.slice(2);
+  return {
+    async tip(): Promise<{ height: number; hash: Hex }> { const t = await get("/tip"); return { height: Number(t.height), hash: t.tip }; },
+    async headerAt(height: number) { const b = await get(`/block/height/${height}`); return { hash: b.hash as Hex, ...b.header } as any; },
+    async currentBits(): Promise<number> { const t = await this.tip(); return Number((await this.headerAt(t.height)).bits); },
+    async utxos(key: CsdKey): Promise<CsdUtxo[]> {
+      const r = await get(`/utxos/${addrHex(key.addr20)}`);
+      return (r.utxos ?? []).map((u: any) => ({ txid: u.txid, vout: Number(u.vout), value: BigInt(u.value), key }));
+    },
+    async activity(addr20: Hex, limit = 50) { return (await get(`/address/${addrHex(addr20)}/activity?limit=${limit}`)).activity ?? []; },
+    async tx(txid: Hex) { return get(`/tx/${txid}`); },
+    async submit(tx: CsdTx): Promise<Hex> {
+      const r = await fetchImpl(url("/tx/submit"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx: txToNodeJson(tx) }) });
+      const j = await r.json();
+      if (!j.ok) throw new Error(`CSD_SUBMIT_FAILED: ${j.err ?? r.status}`);
+      return j.txid;
+    },
+  };
+}

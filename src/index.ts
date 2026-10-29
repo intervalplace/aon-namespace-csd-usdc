@@ -28,4 +28,9 @@ export {
   lockCsdUsdcOnEvm,
   refundExpiredCsdUsdcLockOnEvm,
   releaseEarlyOnEvm,
+  settlementAbi,
+  type CsdAddressProof,
+  type UsdcPermit,
 } from "./executors/evmCsdUsdcSettlement.js";
+// In-browser / bot CSD wallet: keys, transactions, the address-ownership proof
+export * from "./csd-wallet.js";

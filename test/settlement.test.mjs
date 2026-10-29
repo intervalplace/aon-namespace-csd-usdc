@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { createPublicClient, createWalletClient, http, defineChain, hashTypedData, keccak256, toHex, BaseError, ContractFunctionRevertedError } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { readFileSync } from "fs";
+import { keyFromPrivate, csdAddressProof, addr20ToBytes32 } from "../src/csd-wallet.ts";
 
 const RPC = `http://127.0.0.1:${process.env.ANVIL_PORT ?? "8546"}`;
 const art = JSON.parse(readFileSync(new URL("./artifacts.json", import.meta.url), "utf8"));
@@ -88,14 +89,19 @@ const signRelease = (msg, who = buyer) => who.signTypedData({ domain, types: REL
 const BUYER_CSD_ADDR = createHash("ripemd160").update(sha(Buffer.from("buyer-csd-pubkey"))).digest(); // hash160
 let nonceN = 0;
 let addrN = 0;
-const freshAddr = () => createHash("ripemd160").update(sha(Buffer.from(`buyer-csd-${addrN++}`))).digest();
+// Real CSD keys, so locks can carry the address-ownership proof
+const csdKeys = new Map(); // addr20 hex -> key
+const newCsdKey = () => { const k = keyFromPrivate(sha(Buffer.from(`buyer-csd-${addrN++}`))); csdKeys.set(k.addr20, k); return k; };
+const freshAddr = () => Buffer.from(newCsdKey().addr20.slice(2), "hex");
+// The ownership proof for an authorization, signed by the key behind its CSD address
+const proofFor = (auth, dom = domain) => csdAddressProof(csdKeys.get(auth.sellerCsdScriptHash.slice(0, 42)), hashTypedData({ domain: dom, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }));
 async function makeAuth({ usdcAmount, conf = 3n, fee = 50_000n, csdAmount = 500_00000000n, maxTarget = TARGET, addr = freshAddr() }) {
   const t = await now();
   const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([addr, Buffer.alloc(12)])),
     csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount, usdc, usdcAmount, minConfirmations: conf, csdMaxTarget: maxTarget,
     executorFeeAmount: fee, validAfter: BigInt(t - 60), validBefore: BigInt(t + 6 * 3600), nonce: keccak256(toHex(`n${nonceN++}`)) };
   const sig = await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
-  return { auth, sig, addr, hash: hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) };
+  return { auth, sig, addr, hash: hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }), proof: proofFor(auth) };
 }
 let payN = 0;
 // A CSD payment block plus `extra` confirmation headers on top of the current tip
@@ -126,35 +132,35 @@ console.log("\n[1] Hashing matches between contract and off-chain signing");
 
 console.log("\n[2] Lock windows scale with confirmations; the cap stays 30 USDC");
 { let a = await makeAuth({ usdcAmount: 29_950_000n, conf: 3n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   const t = await now();
   check(Number(await read(settlement, S, "lockedUntil", [a.hash])) === t + 25 * 60, "3 confirmations: 30 USDC (incl. fee) allowed, locked for 25 minutes (unchanged)");
   a = await makeAuth({ usdcAmount: 29_950_001n, conf: 3n });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "3 confirmations: 30.000001 USDC (incl. fee) rejected");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]), "TradeLimitExceeded", "3 confirmations: 30.000001 USDC (incl. fee) rejected");
   a = await makeAuth({ usdcAmount: 29_950_000n, conf: 20n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   check(Number(await read(settlement, S, "lockedUntil", [a.hash])) === (await now()) + 110 * 60, "20 confirmations: locked for 110 minutes");
   a = await makeAuth({ usdcAmount: 29_950_001n, conf: 20n });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "20 confirmations: still max 30 USDC");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]), "TradeLimitExceeded", "20 confirmations: still max 30 USDC");
   a = await makeAuth({ usdcAmount: 1_000_000n, conf: 61n });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "61 confirmations rejected");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]), "TradeLimitExceeded", "61 confirmations rejected");
   a = await makeAuth({ usdcAmount: 1_000_000n, conf: 2n });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "TradeLimitExceeded", "2 confirmations rejected"); }
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]), "TradeLimitExceeded", "2 confirmations rejected"); }
 
 console.log("\n[2b] Total locked across all trades is capped");
 { const capped = await deploy("TestCsdUsdcSettlement", [usdc, 60_000_000n, GENESIS]);
   await send(buyer, usdc, "MockUSDC", "approve", [capped, 10_000_000_000n]);
   const cdomain = { ...domain, verifyingContract: capped };
   const mk = async (usdcAmount, n) => { const t = await now(); const auth = { buyer: buyer.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([freshAddr(), Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, csdMaxTarget: TARGET, executorFeeAmount: 0n, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`cap${n}`)) };
-    return { auth, sig: await buyer.signTypedData({ domain: cdomain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) }; };
+    return { auth, sig: await buyer.signTypedData({ domain: cdomain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }), proof: proofFor(auth, cdomain) }; };
   const x = await mk(30_000_000n, 1), y = await mk(30_000_000n, 2), z = await mk(1_000_000n, 3);
-  await call(executor, capped, S, "lockCsdUsdcAuthorization", [x.auth, x.sig]);
-  await call(executor, capped, S, "lockCsdUsdcAuthorization", [y.auth, y.sig]);
+  await call(executor, capped, S, "lockCsdUsdcAuthorization", [x.auth, x.sig, x.proof]);
+  await call(executor, capped, S, "lockCsdUsdcAuthorization", [y.auth, y.sig, y.proof]);
   check(await read(capped, S, "totalLocked") === 60_000_000n, "two 30 USDC trades fill a 60 USDC cap");
-  await reverts(call(executor, capped, S, "lockCsdUsdcAuthorization", [z.auth, z.sig]), "TotalLockedLimitExceeded", "a third trade has to wait");
+  await reverts(call(executor, capped, S, "lockCsdUsdcAuthorization", [z.auth, z.sig, z.proof]), "TotalLockedLimitExceeded", "a third trade has to wait");
   await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
   await call(executor, capped, S, "refundExpiredLock", [x.auth]);
-  await call(executor, capped, S, "lockCsdUsdcAuthorization", [z.auth, z.sig]);
+  await call(executor, capped, S, "lockCsdUsdcAuthorization", [z.auth, z.sig, z.proof]);
   check(await read(capped, S, "totalLocked") === 31_000_000n, "room frees up when a trade closes"); }
 
 console.log("\n[2c] Only the deployment's USDC; fees count toward the cap");
@@ -162,15 +168,63 @@ console.log("\n[2c] Only the deployment's USDC; fees count toward the cap");
   const t = await now();
   const auth = { ...(await makeAuth({ usdcAmount: 1_000_000n })).auth, usdc: other, nonce: keccak256(toHex("wrongtoken")), validBefore: BigInt(t + 3600) };
   const sig = await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [auth, sig]), "WrongToken", "an authorization for another token can't be locked");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [auth, sig, proofFor(auth)]), "WrongToken", "an authorization for another token can't be locked");
   const tiny = await makeAuth({ usdcAmount: 999_999n });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [tiny.auth, tiny.sig]), "TradeLimitExceeded", "a trade under 1 USDC can't be locked (so an address can't be reserved for free)");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [tiny.auth, tiny.sig, tiny.proof]), "TradeLimitExceeded", "a trade under 1 USDC can't be locked (so an address can't be reserved for free)");
   const big = await makeAuth({ usdcAmount: 1_000_000n, fee: 100_000_000n });
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [big.auth, big.sig]), "TradeLimitExceeded", "a huge executor fee can't get around the cap"); }
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [big.auth, big.sig, big.proof]), "TradeLimitExceeded", "a huge executor fee can't get around the cap"); }
+
+console.log("\n[2d] Locking needs proof that the buyer controls the CSD payment address");
+{ const a = await makeAuth({ usdcAmount: 2_000_000n });
+  const L = (proof, auth = a.auth, sig = a.sig) => call(executor, settlement, S, "lockCsdUsdcAuthorization", [auth, sig, proof]);
+  const other = newCsdKey();
+  await reverts(L(csdAddressProof(other, a.hash)), "CsdAddressProofInvalid", "a proof from a different CSD key is rejected");
+  const b = await makeAuth({ usdcAmount: 2_000_000n, addr: Buffer.from(a.addr) });
+  await reverts(L(b.proof), "CsdAddressProofInvalid", "the right key's proof for another trade is rejected");
+  await reverts(L({ ...a.proof, pubKey: "0x02" + a.proof.pubKey.slice(2, 66) }), "CsdAddressProofInvalid", "a compressed (33-byte) key is rejected; the contract needs x and y");
+  { const flip = a.proof.sig.slice(0, -2) + (a.proof.sig.endsWith("1b") ? "1c" : "1b");
+    await reverts(L({ ...a.proof, sig: flip }), "CsdAddressProofInvalid", "a signature recovering to another key is rejected"); }
+  { const t = await now(); const dirty = { ...a.auth, sellerCsdScriptHash: a.auth.sellerCsdScriptHash.slice(0, 42) + "00".repeat(11) + "01", nonce: keccak256(toHex("dirty")), validBefore: BigInt(t + 3600) };
+    const dsig = await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: dirty });
+    await reverts(L(proofFor(dirty), dirty, dsig), "CsdAddressProofInvalid", "an address with junk after its 20 bytes is rejected"); }
+  await L(a.proof);
+  check(await read(settlement, S, "usdcLocked", [a.hash]) === true, "the real key's proof for this trade locks it");
+  await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
+  await call(executor, settlement, S, "refundExpiredLock", [a.auth]); }
+
+console.log("\n[2e] Gasless lock: a USDC permit instead of an approval");
+{ const { generatePrivateKey } = await import("viem/accounts");
+  const fresh = privateKeyToAccount(generatePrivateKey()); // no ETH, no approval
+  await send(deployer, usdc, "MockUSDC", "mint", [fresh.address, 5_000_000n]);
+  const permitDomain = { name: "USD Coin", version: "2", chainId: 31337, verifyingContract: usdc };
+  const PERMIT_TYPES = { Permit: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }, { name: "value", type: "uint256" }, { name: "nonce", type: "uint256" }, { name: "deadline", type: "uint256" }] };
+  const mk = async (n, usdcAmount = 2_000_000n, fee = 10_000n) => {
+    const t = await now();
+    const auth = { buyer: fresh.address, sellerUsdcRecipient: seller.address, sellerCsdScriptHash: hx(Buffer.concat([freshAddr(), Buffer.alloc(12)])), csdGenesisHash: GENESIS, tradeIntentHash: keccak256(toHex("offer")), csdAmount: 1n, usdc, usdcAmount, minConfirmations: 3n, csdMaxTarget: TARGET, executorFeeAmount: fee, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3600), nonce: keccak256(toHex(`permit${n}`)) };
+    const sig = await fresh.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
+    const deadline = BigInt(t + 3600), nonce = await read(usdc, "MockUSDC", "nonces", [fresh.address]);
+    const ps = await fresh.signTypedData({ domain: permitDomain, types: PERMIT_TYPES, primaryType: "Permit", message: { owner: fresh.address, spender: settlement, value: usdcAmount + fee, nonce, deadline } });
+    const permit = { deadline, r: ps.slice(0, 66), s: "0x" + ps.slice(66, 130), v: parseInt(ps.slice(130, 132), 16) };
+    return { auth, sig, proof: proofFor(auth), permit, hash: hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth }) };
+  };
+  const a = await mk(1);
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]), "", "without approval or permit, the lock fails");
+  await call(executor, settlement, S, "lockCsdUsdcAuthorizationWithPermit", [a.auth, a.sig, a.proof, a.permit]);
+  check(await read(settlement, S, "usdcLocked", [a.hash]) === true && await bal(fresh.address) === 2_990_000n, "the executor locks with the buyer's permit: 2.01 USDC locked");
+  check(await pub.getBalance({ address: fresh.address }) === 0n, "the buyer never needed ETH");
+  const b = await mk(2);
+  await send(executor, usdc, "MockUSDC", "permit", [fresh.address, settlement, 2_010_000n, b.permit.deadline, b.permit.v, b.permit.r, b.permit.s]); // someone front-runs the permit
+  await call(executor, settlement, S, "lockCsdUsdcAuthorizationWithPermit", [b.auth, b.sig, b.proof, b.permit]);
+  check(await read(settlement, S, "usdcLocked", [b.hash]) === true, "a front-run permit doesn't block the lock (the allowance is already there)");
+  const c = await mk(3);
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorizationWithPermit", [c.auth, c.sig, c.proof, { ...c.permit, s: c.permit.r }]), "", "a bad permit leaves no allowance, so the lock fails");
+  await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
+  await call(executor, settlement, S, "refundExpiredLock", [a.auth]); await call(executor, settlement, S, "refundExpiredLock", [b.auth]);
+  check(await bal(fresh.address) === 5_000_000n, "refunds return everything to the permit buyer"); }
 
 console.log("\n[3] Normal settlement with a CSD proof still works");
 { const a = await makeAuth({ usdcAmount: 25_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   const s0 = await bal(seller.address), e0 = await bal(executor.address);
   const proof = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, proof]);
@@ -181,20 +235,20 @@ console.log("\n[3] Normal settlement with a CSD proof still works");
 console.log("\n[3b] The proof's blocks: linked, enough work, at least the signed difficulty, CSD's spacing");
 { // A buyer who asks for a harder minimum difficulty than these blocks have
   const hard = await makeAuth({ usdcAmount: 10_000_000n, maxTarget: TARGET / 4n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [hard.auth, hard.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [hard.auth, hard.sig, hard.proof]);
   let before = tip;
   const easy = await payAndConfirm({ to: hard.addr, value: hard.auth.csdAmount, extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [hard.auth, hard.sig, easy]), "CsdInsufficientWork", "3 blocks at a quarter of the signed difficulty aren't enough work");
   tip = before;
   // More blocks make up the work: at half the signed difficulty, 6 blocks count as 3
   const half = await makeAuth({ usdcAmount: 10_000_000n, maxTarget: TARGET / 2n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [half.auth, half.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [half.auth, half.sig, half.proof]);
   const six = await payAndConfirm({ to: half.addr, value: half.auth.csdAmount, extra: 5 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [half.auth, half.sig, { ...six, confirmationChain: six.confirmationChain.slice(0, 4) }]), "CsdInsufficientWork", "5 blocks at half the difficulty: not yet");
   await call(executor, settlement, S, "settleCsdUsdc", [half.auth, half.sig, six]);
   check(await read(settlement, S, "finalizedAuthorization", [half.hash]) === true, "6 blocks at half the difficulty settle (if difficulty eases, the seller just waits for more blocks)");
   const a = await makeAuth({ usdcAmount: 10_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   before = tip;
   const p = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, { ...p, confirmationChain: p.confirmationChain.slice(0, 1) }]), "CsdBlockNotConfirmed", "too few confirming blocks");
@@ -211,13 +265,13 @@ console.log("\n[3b] The proof's blocks: linked, enough work, at least the signed
   const rc = await call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, p]);
   check(await read(settlement, S, "finalizedAuthorization", [a.hash]) === true, `the valid proof settles (gas ${rc.gasUsed} with 3 confirmations)`);
   const g = { ...(await makeAuth({ usdcAmount: 1_000_000n })).auth, csdGenesisHash: hx(sha(Buffer.from("other-chain"))), nonce: keccak256(toHex("g")) };
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [g, await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: g })]), "CsdGenesisHashMismatch", "an authorization for another CSD chain can't be locked");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [g, await buyer.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: g }), proofFor(g)]), "CsdGenesisHashMismatch", "an authorization for another CSD chain can't be locked");
 }
 
 console.log("\n[4] A CSD payment from before the lock doesn't count");
 { const gap = tip.time + 3600 - await now(); if (gap > 0) { await rpc("evm_increaseTime", [gap]); await rpc("evm_mine"); }
   const a = await makeAuth({ usdcAmount: 10_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   const before = tip;
   const old = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: await now() - 21 * 60, extra: 2 });
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [a.auth, a.sig, old]), "CsdPaymentBeforeLock", "payment 21 minutes before the lock rejected");
@@ -231,7 +285,7 @@ console.log("\n[5] Early release: the buyer waives the wait");
   const R = (msg, sig) => call(executor, settlement, S, "releaseEarly", [a.auth, msg, sig]);
   { const m = { authHash: a.hash, sellerUsdcRecipient: seller.address, usdcAmount: 29_950_000n, csdTxid: fakeTxid(), lockedAt: 0n, deadline: BigInt((await now()) + 600) };
     await reverts(R(m, await signRelease(m)), "AuthorizationNotLocked", "nothing to release before the lock"); }
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   let m = await releaseMsg(a);
   await reverts(R(m, await signRelease(m, seller)), "BadSignature", "the seller can't release it");
   await reverts(R(m, await signRelease(m, executor)), "BadSignature", "the executor can't release it");
@@ -255,24 +309,24 @@ console.log("\n[5] Early release: the buyer waives the wait");
   tip = before;
   await rpc("evm_increaseTime", [3600]); await rpc("evm_mine");
   await reverts(call(executor, settlement, S, "refundExpiredLock", [a.auth]), "AuthorizationAlreadyFinalized", "can't be refunded afterwards");
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]), "AuthorizationAlreadyFinalized", "can't be locked again"); }
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]), "AuthorizationAlreadyFinalized", "can't be locked again"); }
 
 console.log("\n[6] A CSD payment accepted by an early release can't pay for another trade");
 { const a = await makeAuth({ usdcAmount: 10_000_000n }), b = await makeAuth({ usdcAmount: 10_000_000n, addr: a.addr }); // same CSD address
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]), "CsdAddressBusy", "a second open trade to the same CSD address has to wait");
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig, b.proof]), "CsdAddressBusy", "a second open trade to the same CSD address has to wait");
   const before = tip;
   const proof = await payAndConfirm({ to: a.addr, value: a.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   const txid = hx(csdTxidFromRaw(proof.txRaw));
   const m = await releaseMsg(a, { csdTxid: txid });
   await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig, b.proof]);
   await reverts(call(executor, settlement, S, "settleCsdUsdc", [b.auth, b.sig, proof]), "CsdTxAlreadyConsumed", "once A closes, B can open, but A's payment can't settle B");
   tip = before; }
 
 console.log("\n[6b] Nobody can block a seller by naming their payment in an unrelated trade");
 { const victim = await makeAuth({ usdcAmount: 10_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [victim.auth, victim.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [victim.auth, victim.sig, victim.proof]);
   const before = tip;
   const proof = await payAndConfirm({ to: victim.addr, value: victim.auth.csdAmount, time: Math.max(await now() + 60, tip.time + 120), extra: 2 });
   const txid = hx(csdTxidFromRaw(proof.txRaw));
@@ -281,12 +335,13 @@ console.log("\n[6b] Nobody can block a seller by naming their payment in an unre
   await send(executor, usdc, "MockUSDC", "approve", [settlement, 10_000_000n]);
   const t = await now();
   const evil = { ...victim.auth, buyer: executor.address, sellerUsdcRecipient: executor.address, usdcAmount: 1_000_000n, executorFeeAmount: 0n,
-    sellerCsdScriptHash: hx(Buffer.concat([Buffer.alloc(20, 0xee), Buffer.alloc(12)])), nonce: keccak256(toHex("evil")), validBefore: BigInt(t + 3600) };
+    sellerCsdScriptHash: hx(Buffer.concat([freshAddr(), Buffer.alloc(12)])), nonce: keccak256(toHex("evil")), validBefore: BigInt(t + 3600) };
   const evilSig = await executor.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: evil });
   const evilHash = hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: evil });
   const squat = { ...evil, sellerCsdScriptHash: victim.auth.sellerCsdScriptHash, nonce: keccak256(toHex("squat")) };
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [squat, await executor.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: squat })]), "CsdAddressBusy", "nobody can open a second trade on the victim's busy CSD address");
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [evil, evilSig]);
+  const squatSig = await executor.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: squat });
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [squat, squatSig, proofFor(evil)]), "CsdAddressProofInvalid", "nobody can open a trade on the victim's CSD address without its key");
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [evil, evilSig, proofFor(evil)]);
   const em = { authHash: evilHash, sellerUsdcRecipient: executor.address, usdcAmount: 1_000_000n, csdTxid: txid, lockedAt: await read(settlement, S, "lockedAt", [evilHash]), deadline: BigInt((await now()) + 600) };
   await call(executor, settlement, S, "releaseEarly", [evil, em, await executor.signTypedData({ domain, types: RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: em })]);
   const s0 = await bal(seller.address);
@@ -296,14 +351,14 @@ console.log("\n[6b] Nobody can block a seller by naming their payment in an unre
 
 console.log("\n[7] Release after the window, refunds, and no re-locking after a refund");
 { const a = await makeAuth({ usdcAmount: 5_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [a.auth, a.sig, a.proof]);
   const m = await releaseMsg(a, { deadline: BigInt((await now()) + 3600) });
   await rpc("evm_increaseTime", [26 * 60]); await rpc("evm_mine");
   const s0 = await bal(seller.address);
   await call(executor, settlement, S, "releaseEarly", [a.auth, m, await signRelease(m)]);
   check(await bal(seller.address) - s0 === 5_000_000n, "buyer can still release after the window, before anyone refunds");
   const b = await makeAuth({ usdcAmount: 5_000_000n });
-  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]);
+  await call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig, b.proof]);
   const stale = await releaseMsg(b, { deadline: BigInt((await now()) + 6 * 3600) }); // signed, never submitted
   const staleSig = await signRelease(stale);
   await reverts(call(executor, settlement, S, "refundExpiredLock", [b.auth]), "AuthorizationLocked", "no refund inside the window");
@@ -311,7 +366,7 @@ console.log("\n[7] Release after the window, refunds, and no re-locking after a 
   const b0 = await bal(buyer.address);
   await call(executor, settlement, S, "refundExpiredLock", [b.auth]);
   check(await bal(buyer.address) - b0 === 5_050_000n, "refund returns USDC plus the unused fee to the buyer");
-  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig]), "AuthorizationRefunded", "a refunded authorization can't be locked again");
+  await reverts(call(executor, settlement, S, "lockCsdUsdcAuthorization", [b.auth, b.sig, b.proof]), "AuthorizationRefunded", "a refunded authorization can't be locked again");
   await reverts(call(executor, settlement, S, "releaseEarly", [b.auth, stale, staleSig]), "AuthorizationNotLocked", "an old, unsent release can't be used after the refund"); }
 
 console.log("\n[8] Namespace objects and the executor");
@@ -321,7 +376,14 @@ console.log("\n[8] Namespace objects and the executor");
   const a = await makeAuth({ usdcAmount: 20_000_000n });
   const authObj = await buildCsdUsdcAuthorizationObject({ authorization: a.auth, signature: a.sig, domain, types: AUTH_TYPES });
   check(csdUsdcAuthHash(authObj) === a.hash, "csdUsdcAuthHash matches the contract's authorization hash");
-  await lockCsdUsdcOnEvm({ authorization: authObj });
+  const { settlementAbi } = await import("../src/executors/evmCsdUsdcSettlement.ts");
+  const canon = (i) => i.type.startsWith("tuple") ? `(${i.components.map(canon).join(",")})${i.type.slice(5)}` : i.type;
+  const sigOf = (x) => `${x.name}(${x.inputs.map(canon).join(",")})`;
+  const exec = new Set(settlementAbi.map(sigOf));
+  const missing = art[S].abi.filter(x => x.type === "error" || (x.type === "function" && settlementAbi.some(y => y.name === x.name))).filter(x => !exec.has(sigOf(x)));
+  check(missing.length === 0, `the executor's ABI matches the contract (errors and the functions it calls)${missing.length ? ": " + missing.map(sigOf).join(" ") : ""}`);
+  await reverts(lockCsdUsdcOnEvm({ authorization: authObj }), "CSD_ADDRESS_PROOF_MISSING", "the executor won't lock without the CSD address proof");
+  await lockCsdUsdcOnEvm({ authorization: authObj, addressProof: a.proof });
   const relArgs = { csdTxid: fakeTxid(), lockedAt: await read(settlement, S, "lockedAt", [a.hash]), deadline: BigInt((await now()) + 600) };
   const relMsg = ns.earlyReleaseMessage(authObj, relArgs);
   const relSig = await buyer.signTypedData({ domain, types: EARLY_RELEASE_TYPES, primaryType: "CsdUsdcEarlyRelease", message: relMsg });

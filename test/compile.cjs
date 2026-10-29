@@ -10,6 +10,16 @@ contract MockUSDC {
   function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
   function transfer(address to, uint256 a) external returns (bool) { require(balanceOf[msg.sender] >= a, "bal"); balanceOf[msg.sender] -= a; balanceOf[to] += a; return true; }
   function transferFrom(address f, address to, uint256 a) external returns (bool) { require(allowance[f][msg.sender] >= a, "allow"); require(balanceOf[f] >= a, "bal"); allowance[f][msg.sender] -= a; balanceOf[f] -= a; balanceOf[to] += a; return true; }
+  // EIP-2612, as USDC implements it (domain "USD Coin", version "2")
+  mapping(address=>uint256) public nonces;
+  bytes32 public constant PERMIT_TYPEHASH = keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+  function DOMAIN_SEPARATOR() public view returns (bytes32) { return keccak256(abi.encode(keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"), keccak256("USD Coin"), keccak256("2"), block.chainid, address(this))); }
+  function permit(address owner, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+    require(block.timestamp <= deadline, "expired");
+    bytes32 d = keccak256(abi.encodePacked("\\x19\\x01", DOMAIN_SEPARATOR(), keccak256(abi.encode(PERMIT_TYPEHASH, owner, spender, value, nonces[owner]++, deadline))));
+    address signer = ecrecover(d, v, r, s); require(signer != address(0) && signer == owner, "permit sig");
+    allowance[owner][spender] = value;
+  }
 }`;
 const sources = {
   "CsdUsdcSettlement.sol": { content: fs.readFileSync(dir + "CsdUsdcSettlement.sol", "utf8") },
