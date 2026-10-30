@@ -8,6 +8,9 @@ import { deriveCsdWallet, csdNode, buildPayment, csdAddressProof, addr20ToBytes3
 import { startMarketMaker } from "../src/market-maker.ts";
 import { quoteBuy, quoteSell, midPrice } from "../src/pool.ts";
 import { csdUsdcNamespace } from "../src/namespace.ts";
+import { hashObject } from "@intervalplace/aon-sdk";
+import { recoverMessageAddress } from "viem";
+const obj = (h) => published.find(o => o.objectHash?.toLowerCase() === h?.toLowerCase());
 
 const RPC = `http://127.0.0.1:${process.env.ANVIL_PORT ?? "8546"}`;
 const art = JSON.parse(readFileSync(new URL("./artifacts.json", import.meta.url), "utf8"));
@@ -47,11 +50,11 @@ const uKey = userCsd.key(0);
 for (let i = 0; i < 4; i++) csd.mine({ rewardTo: uKey.addr20, reward: 150n * 100_000_000n }); // CSD the user already had, in a few coins
 
 const STATE = "/tmp/claude-0/mm-test-state.json"; rmSync(STATE, { force: true });
-const logs = [];
+const logs = [], published = [];
 const mmCfg = { rpcUrl: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: MM_SEED,
   stateFile: STATE, port: 18990, allowedOrigins: ["https://covenant.market"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n },
   maxUnconfirmedUsdc: 10_000_000n, maxLossUsdc: 1_000_000n, sellPayWindowSecs: 8, trustProxy: true,
-  pollMs: 60_000, rebroadcastSecs: 1, log: (...a) => logs.push(a.join(" ")) };
+  pollMs: 60_000, rebroadcastSecs: 1, log: (...a) => logs.push(a.join(" ")), publishToAon: async (o) => { published.push(o); } };
 let mm = await startMarketMaker(mmCfg);
 const API = "http://127.0.0.1:18990/api";
 const get = async (p) => { const r = await fetch(API + p); return { ...(await r.json()), http: r.status }; };
@@ -82,7 +85,7 @@ await mm.tick(); await mine(); await mm.tick(); // splits the inventory into coi
 async function signBuy({ csdAmount, usdcAmount, conf = 10, maxTarget = bitsToTarget(BITS), fee = 250_000n, key = uKey, proofKey = key }) {
   const t = Number((await pub.getBlock()).timestamp);
   const auth = { buyer: user.address, sellerUsdcRecipient: mmEvm.address, sellerCsdScriptHash: addr20ToBytes32(key.addr20), csdGenesisHash: GENESIS,
-    tradeIntentHash: keccak256(toHex("covenant")), csdAmount, usdc, usdcAmount, minConfirmations: BigInt(conf), csdMaxTarget: maxTarget,
+    tradeIntentHash: (await get("/market")).offers?.sell ?? keccak256(toHex("covenant")), csdAmount, usdc, usdcAmount, minConfirmations: BigInt(conf), csdMaxTarget: maxTarget,
     executorFeeAmount: fee, validAfter: BigInt(t - 60), validBefore: BigInt(t + 3 * 3600), nonce: keccak256(toHex(Math.random().toString())) };
   const signature = await user.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
   const hash = hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth });
@@ -121,7 +124,17 @@ console.log("\n[2] User buys 50 CSD: CSD sent once the USDC is locked, no ETH ne
   check(tr(b.hash).status === "locked", "not settled yet: the user asked for 10 confirmations");
   await mine(9); await mm.tick(); await mm.tick();
   check(tr(b.hash).status === "settled" && await bal(mmEvm.address) === m0 + price + 250_000n, "after 10 confirmations the bot proves its payment and receives the USDC plus fee");
-  check(midPrice(pool()) > 150000n, `buying moved the price up to ${Number(midPrice(pool())) / 1e6}`); }
+  check(midPrice(pool()) > 150000n, `buying moved the price up to ${Number(midPrice(pool())) / 1e6}`);
+  await mm.tick();
+  const g = tr(b.hash).aon ?? {}, offer = obj(g.offer), auth = obj(g.auth), proof = obj(g.proof), receipt = obj(g.receipt);
+  check(offer && auth && proof && receipt, "AON: offer, authorization, proof and receipt all published");
+  const { signature: osig, objectHash: _h, ...unsignedOffer } = offer;
+  check(offer.objectType === "offer" && await recoverMessageAddress({ message: { raw: hashObject(unsignedOffer) }, signature: osig.signature }) === mmEvm.address, "the offer is signed by the market maker");
+  check(auth.references.includes(offer.objectHash.toLowerCase()) && auth.signature.signer === user.address, "the buyer's authorization (signed by the buyer) references the offer");
+  check(proof.references.includes(auth.objectHash.toLowerCase()) && proof.payload.txid === tr(b.hash).csdTxid, "the CSD payment proof references the authorization");
+  check(receipt.objectType === "receipt" && receipt.references.includes(auth.objectHash.toLowerCase()) && receipt.references.includes(proof.objectHash.toLowerCase())
+    && receipt.payload.executionTx === tr(b.hash).settleTx, "the receipt references both and names the settlement transaction");
+  check((await get(`/trade/${b.hash}`)).aon.receipt === receipt.objectHash, "the site can look up the receipt"); }
 
 console.log("\n[2b] Racing the bot's lock: CSD is only sent if the USDC really is locked");
 { await rpc("anvil_setBalance", [user.address, "0xde0b6b3a7640000"]); // the attacker has ETH for front-running
@@ -201,6 +214,14 @@ let sold;
   check(midPrice(pool()) < mid0, "once it's in a block, the price moves");
   await mine(2); await mm.tick();
   check(tr(o.authHash).status === "done", "after 3 CSD confirmations the bot stops counting it as risk");
+  await mm.tick();
+  const g = tr(o.authHash).aon ?? {}, req = obj(g.request), auth = obj(g.auth), rel = obj(g.release), receipt = obj(g.receipt);
+  check(req && auth && rel && receipt, "AON: request, authorization, release and receipt all published");
+  check(req.signature.signers.includes(uKey.addr20) && req.payload.coins.length === o.sel.length, "the seller's request is signed with the keys that own its coins");
+  check(auth.references.includes(req.objectHash.toLowerCase()) && auth.signature.signer === mmEvm.address, "the market maker's authorization references the seller's request");
+  check(rel.references.includes(auth.objectHash.toLowerCase()) && rel.payload.release.csdTxid === tr(o.authHash).csdTxid, "the release references it and names the seller's CSD payment");
+  check(receipt.references.includes(auth.objectHash.toLowerCase()) && receipt.references.includes(rel.objectHash.toLowerCase()) && receipt.references.includes(req.objectHash.toLowerCase())
+    && receipt.payload.executionTx === tr(o.authHash).releaseTx, "the receipt ties request, authorization and release to the release transaction");
   sold = o; }
 
 console.log("\n[4] Over the instant limit, the bot waits for confirmations; one payment, one sale");

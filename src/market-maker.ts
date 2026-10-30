@@ -37,6 +37,8 @@ import {
 import { settlementAbi, authTuple, spvProofTuple } from "./executors/evmCsdUsdcSettlement.js";
 import { csdUsdcNamespace, EARLY_RELEASE_TYPES } from "./namespace.js";
 import { quoteBuy, quoteSell, afterBuy, afterSell, midPrice, ladder, type Pool } from "./pool.js";
+import { finalizeObject, hashObject } from "@intervalplace/aon-sdk";
+import { buildCsdUsdcAuthorizationObject, buildCsdUsdcEarlyReleaseObject } from "./builders.js";
 
 export type MarketMakerConfig = {
   rpcUrl: string; chainId: number; privateKey: Hex;
@@ -87,10 +89,14 @@ type Trade = {
   coins?: string[]; poolMoved?: boolean;                    // sell: the coins the seller will pay with ("txid:vout")
   owners?: string[]; swept?: boolean; sweepTxid?: Hex;      // sell: the addresses that signed for them; our key emptied
   trusted?: boolean;                                        // sell: released before its payment had safeConfirmations
+  request?: any; proofJson?: any;                           // sell: the seller's signed request; buy: the proof that settled it
+  aon?: { offer?: string; request?: string; auth?: string; proof?: string; release?: string; receipt?: string };
   payBy?: number; unpaidAt?: number; paidAt?: number;       // sell: payment deadline; when it lapsed
   releaseTx?: Hex; settleTx?: Hex; instant?: boolean; direct?: boolean; error?: string;
 };
-type State = { pool: { usdc: string; csd: string }; nextKey: number; trades: Record<string, Trade>; lossUsdc: string; lastSplit?: number };
+type Offer = { hash: string; mid: string; at: number };
+type State = { pool: { usdc: string; csd: string }; nextKey: number; trades: Record<string, Trade>; lossUsdc: string; lastSplit?: number;
+  offers?: { sell?: Offer; buy?: Offer }; aonQueue?: any[] };
 
 const ERC20 = [
   { type: "function", name: "allowance", stateMutability: "view", inputs: [{ type: "address" }, { type: "address" }], outputs: [{ type: "uint256" }] },
@@ -293,12 +299,58 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const pending = !r && t.lockTx ? await pub.getTransaction({ hash: t.lockTx }).then(() => true, () => false) : false;
     if (r || (!pending && now() - t.createdAt > 600)) { t.status = t.kind === "buy" ? "lock_failed" : "open_failed"; save(); log(`[mm] ${t.kind} ${t.authHash}: lock didn't happen; nothing sent`); }
   }
-  async function publish(t: Trade) {
+  // ── AON: every trade is a graph of objects ──────────────────────────────
+  //   buy:  offer (bot) ← authorization (buyer) ← proof (the CSD payment) ← receipt
+  //   sell: offer (bot), request (seller, signed with their CSD key) ← authorization (bot) ← release (bot) ← receipt
+  // Objects queue up and are published in the background, so AON never slows a trade.
+  const NS = "aon:csd-usdc";
+  const queueObject = (o: any) => { if (!C.publishToAon) return o; S.aonQueue = [...(S.aonQueue ?? []), o].slice(-500); save(); flushAon(); return o; };
+  let flushing = false;
+  async function flushAon() {
+    if (!C.publishToAon || flushing) return; flushing = true;
+    try {
+      while (S.aonQueue?.length) {
+        try { await C.publishToAon(S.aonQueue[0]); } catch (e: any) { log(`[mm] AON publish failed (will retry): ${e.message}`); break; }
+        S.aonQueue.shift(); save();
+      }
+    } finally { flushing = false; }
+  }
+  // Signs over the hash of everything but the signature (objectHash then covers the signature too)
+  async function signed(obj: any) {
+    const digest = hashObject(obj as any) as Hex;
+    const signature = await account.signMessage({ message: { raw: digest } });
+    return finalizeObject({ ...obj, signature: { scheme: "eip191-object", signer: account.address, signature } } as any);
+  }
+  // The bot's standing quotes, re-published when the price moves 1% or every 30 minutes
+  async function refreshOffers() {
+    if (!C.publishToAon) return;
+    const p = pool(), mid = midPrice(p), t = now();
+    const stale = (o?: Offer) => !o || t - o.at > 1800 || (BigInt(o.mid) - mid) * 100n > mid || (mid - BigInt(o.mid)) * 100n > mid;
+    S.offers ??= {};
+    for (const side of ["sell", "buy"] as const) {
+      if (!stale(S.offers[side])) continue;
+      const o = await signed({ objectType: "offer", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: [],
+        payload: { offerType: side === "sell" ? "csd_usdc_sell_csd" : "csd_usdc_buy_csd", marketMaker: account.address, settlementContract: settlement, usdc,
+          csdGenesisHash: C.csdGenesis, pricing: "pool", poolUsdc: String(p.usdc), poolCsd: String(p.csd), midUsdcPerCsd: String(mid),
+          spreadBps: String(C.spreadBps), feeUsdc: String(C.feeUsdc), minTradeUsdc: String(C.minTradeUsdc), maxTradeUsdc: String(C.maxTradeUsdc), validBefore: t + 3600 } });
+      queueObject(o); S.offers[side] = { hash: o.objectHash!, mid: String(mid), at: t }; save();
+    }
+  }
+  const ref = (...h: (string | undefined)[]) => h.filter(Boolean).map(x => x!.toLowerCase());
+  async function publishAuth(t: Trade, references: string[]) {
     if (!C.publishToAon) return;
     try {
-      const { buildCsdUsdcAuthorizationObject } = await import("./builders.js");
-      await C.publishToAon(await buildCsdUsdcAuthorizationObject({ authorization: t.auth, signature: t.authSig, domain, types: AUTH_TYPES }));
-    } catch (e: any) { log(`[mm] AON publish failed for ${t.authHash}: ${e.message}`); }
+      const o = await buildCsdUsdcAuthorizationObject({ authorization: t.auth, signature: t.authSig, domain, types: AUTH_TYPES, references });
+      t.aon = { ...t.aon, auth: o.objectHash }; save(); queueObject(o);
+    } catch (e: any) { log(`[mm] AON authorization for ${t.authHash}: ${e.message}`); }
+  }
+  function publishReceipt(t: Trade, extra: Record<string, unknown>) {
+    if (!C.publishToAon || t.aon?.receipt) return;
+    const o = finalizeObject({ objectType: "receipt", schemaVersion: "1", namespace: NS, createdAt: Date.now(),
+      references: ref(t.aon?.auth, t.aon?.proof, t.aon?.release, t.aon?.request),
+      payload: { receiptType: "authorized_state_transition_completed", settlementContract: settlement, authHash: t.authHash,
+        csdTxid: t.csdTxid, csdAmount: t.csdAmount, usdcAmount: t.usdcAmount, buyer: t.auth.buyer, sellerUsdcRecipient: t.auth.sellerUsdcRecipient, ...extra } } as any);
+    t.aon = { ...t.aon, receipt: o.objectHash }; save(); queueObject(o);
   }
 
   // ── user buys CSD ─────────────────────────────────────────────────────────
@@ -342,7 +394,9 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     try {
       t.lockTx = permit ? await send("lockCsdUsdcAuthorizationWithPermit", [auth, sig, proof, permit]) : await send("lockCsdUsdcAuthorization", [auth, sig, proof]);
     } catch (e: any) { delete S.trades[authHash]; save(); return bad(`LOCK_REJECTED:${e.shortMessage ?? e.message}`); }
-    save(); watchLock(t); publish(t);
+    save(); watchLock(t);
+    const offer = [S.offers?.sell?.hash].find(h => h && h.toLowerCase() === auth.tradeIntentHash.toLowerCase());
+    t.aon = { offer }; publishAuth(t, ref(offer));
     log(`[mm] buy ${authHash}: ${Number(auth.csdAmount) / 1e8} CSD for ${Number(auth.usdcAmount) / 1e6} USDC, lock ${t.lockTx}`);
     return tradeView(t);
   }
@@ -421,7 +475,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     S.trades[authHash] = t; save();
     try { t.lockTx = await send("lockCsdUsdcAuthorization", [auth, sig, csdAddressProof(k, authHash)]); }
     catch (e: any) { delete S.trades[authHash]; save(); return bad(`LOCK_REJECTED:${e.shortMessage ?? e.message}`); }
-    save(); watchLock(t); publish(t);
+    save(); watchLock(t);
+    if (C.publishToAon) {
+      // The seller's side: their request, signed with the keys that own the coins (sale-request digest, src/csd-wallet.ts)
+      const reqObj = finalizeObject({ objectType: "request", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(S.offers?.buy?.hash),
+        payload: { requestType: "csd_usdc_sale", csdAmount: String(csd), usdcRecipient: recipient, validUntil: Number(body.validUntil), coins: body.coins },
+        signature: { scheme: "csd-sale-request-v1", signers: owners, proofs: body.proofs } } as any);
+      t.aon = { offer: S.offers?.buy?.hash, request: reqObj.objectHash }; save(); queueObject(reqObj);
+      publishAuth(t, ref(reqObj.objectHash, S.offers?.buy?.hash));
+    }
     log(`[mm] sell ${authHash} opened: ${Number(csd) / 1e8} CSD for ${Number(usdcAmount) / 1e6} USDC, lock ${t.lockTx}`);
     return tradeView(t);
   }
@@ -498,6 +560,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const sig = await account.signTypedData({ domain, types: EARLY_RELEASE_TYPES as any, primaryType: "CsdUsdcEarlyRelease", message: msg as any });
     if (confirmations(t.csdTxid!) < C.safeConfirmations) { t.trusted = true; save(); }
     t.releaseTx = await send("releaseEarly", [authTuple(t.auth), msg, sig]);
+    if (C.publishToAon && t.aon?.auth) {
+      try {
+        const authObj = await buildCsdUsdcAuthorizationObject({ authorization: t.auth, signature: t.authSig, domain, types: AUTH_TYPES, references: ref(t.aon.request, t.aon.offer) });
+        const rel = await buildCsdUsdcEarlyReleaseObject({ authorization: { ...authObj, createdAt: authObj.createdAt } as any, csdTxid: t.csdTxid!, lockedAt: msg.lockedAt, deadline: msg.deadline, signature: sig });
+        // (the release names the published authorization by its hash)
+        const relFixed = finalizeObject({ ...rel, objectHash: undefined, references: ref(t.aon.auth) } as any);
+        t.aon = { ...t.aon, release: relFixed.objectHash }; save(); queueObject(relFixed);
+      } catch (e: any) { log(`[mm] AON release for ${t.authHash}: ${e.message}`); }
+    }
     t.status = "released"; save();
   }
 
@@ -517,14 +588,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     }
     if (have < need) return;
     proof.confirmation_chain = chainH;
-    t.settleTx = await send("settleCsdUsdc", [authTuple(t.auth), t.authSig, spvProofTuple(proof)]); save();
+    t.settleTx = await send("settleCsdUsdc", [authTuple(t.auth), t.authSig, spvProofTuple(proof)]); t.proofJson = proof; save();
   }
   const FINAL = new Set(["settled", "lock_failed", "refunded", "done", "expired", "reversed", "open_failed"]);
   async function tick() {
     const tNow = await chainNow();
     await syncBlocks();
     for (const t of Object.values(S.trades)) {
-      if (FINAL.has(t.status)) {
+      if (FINAL.has(t.status) && !(t.status === "done" && t.releaseTx && !t.aon?.receipt && C.publishToAon)) {
         // A lock that looked failed but got mined after all (someone rebroadcast it): honour it
         if (t.kind === "buy" && t.status === "lock_failed" && now() - t.createdAt < 3 * 3600 && await view("usdcLocked", t.authHash).catch(() => false)) {
           t.status = "locking"; await checkLock(t);
@@ -537,14 +608,23 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
           if (r || (!t.lockTx && now() - t.createdAt > 120)) await checkLock(t);
         }
         if (t.kind === "buy" && t.status === "locked") {
-          // Someone else settled it (anyone may submit the proof): we were paid all the same
-          if (await view("finalizedAuthorization", t.authHash)) { t.status = "settled"; save(); continue; }
           if (!t.csdTxid || (confirmations(t.csdTxid) === 0 && now() - (t.csdSentAt ?? 0) > C.rebroadcastSecs)) await sendBuyCsd(t);
           if (t.settleTx) {
             const r = await pub.getTransactionReceipt({ hash: t.settleTx }).catch(() => null);
-            if (r?.status === "success") { t.status = "settled"; save(); log(`[mm] buy ${t.authHash} settled (${t.settleTx})`); continue; }
+            if (r?.status === "success") {
+              t.status = "settled"; save(); log(`[mm] buy ${t.authHash} settled (${t.settleTx})`);
+              if (C.publishToAon) {
+                const pr = finalizeObject({ objectType: "proof", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(t.aon?.auth),
+                  payload: { proofType: "csd_payment", txid: t.csdTxid, minConfirmations: Number(t.auth.minConfirmations), proof: t.proofJson } } as any);
+                t.aon = { ...t.aon, proof: pr.objectHash }; t.proofJson = undefined; save(); queueObject(pr);
+                publishReceipt(t, { executionTx: t.settleTx, method: "settleCsdUsdc", executorFeeAmount: t.auth.executorFeeAmount });
+              }
+              continue;
+            }
             if (r) { t.settleTx = undefined; save(); } else continue; // reverted: try again; pending: wait
           }
+          // Someone else settled it (anyone may submit the proof): we were paid all the same
+          if (await view("finalizedAuthorization", t.authHash)) { t.status = "settled"; save(); continue; }
           if (!(await view("usdcLocked", t.authHash))) {
             t.status = "refunded"; setPool({ ...pool(), usdc: pool().usdc - BigInt(t.poolUsdc) });
             addLoss(BigInt(t.usdcAmount), `buy ${t.authHash} refunded before settlement`); save();
@@ -567,9 +647,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
             if (tNow > Number(t.lockedUntil) + 30 && await view("usdcLocked", t.authHash)) await send("refundExpiredLock", [authTuple(t.auth)]);
             else if (tNow > Number(t.lockedUntil) + 86400 && !(await mined(t.csdTxid!, true))) { t.status = "expired"; save(); }
           }
-          if (t.status === "released" && t.releaseTx) {
+          if ((t.status === "released" || t.status === "done") && t.releaseTx && !t.aon?.receipt) {
             const r = await pub.getTransactionReceipt({ hash: t.releaseTx }).catch(() => null);
             if (r?.status === "reverted") { log(`[mm] release ${t.releaseTx} reverted; retrying`); t.status = "paid"; t.releaseTx = undefined; save(); }
+            else if (r?.status === "success") publishReceipt(t, { executionTx: t.releaseTx, method: t.direct ? "direct_transfer" : "releaseEarly" });
           }
           if (t.status === "released") {
             const c = confirmations(t.csdTxid!);
@@ -597,6 +678,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       } catch (e: any) { log(`[mm] ${t.kind} ${t.authHash} (${t.status}): ${e.shortMessage ?? e.message}`); }
     }
     try { await sweepFinished(); } catch (e: any) { log(`[mm] sweep: ${e.message}`); }
+    try { await refreshOffers(); } catch (e: any) { log(`[mm] offers: ${e.message}`); }
+    flushAon();
     try { await splitInventory(); } catch (e: any) { log(`[mm] split: ${e.message}`); }
   }
   let stopped = false, ticking: Promise<unknown> = Promise.resolve();
@@ -605,7 +688,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // ── market data ───────────────────────────────────────────────────────────
   function tradeView(t: Trade) {
     return { authHash: t.authHash, kind: t.kind, status: t.status, csdAmount: t.csdAmount, usdcAmount: t.usdcAmount, lockTx: t.lockTx,
-      csdTxid: t.csdTxid, releaseTx: t.releaseTx, settleTx: t.settleTx, instant: t.instant, csdAddress: t.csdAddr, lockedUntil: t.lockedUntil, payBy: t.payBy,
+      csdTxid: t.csdTxid, releaseTx: t.releaseTx, settleTx: t.settleTx, instant: t.instant, csdAddress: t.csdAddr, lockedUntil: t.lockedUntil, payBy: t.payBy, aon: t.aon,
       ...(t.kind === "sell" ? { authorization: t.auth, signature: t.authSig } : {}) };
   }
   async function market() {
@@ -622,6 +705,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       limits: { minTradeUsdc: String(C.minTradeUsdc), maxTradeUsdc: String(C.maxTradeUsdc), buyConfirmations: C.buyConfirmations, sellsPaused,
         instantSells: BigInt(S.lossUsdc) < C.maxLossUsdc, instantRoomUsdc: String(C.maxUnconfirmedUsdc - exposure()) },
       csd: { height: tip.height, bits, suggestedMaxTarget: String(signTarget(bits)) },
+      offers: { sell: S.offers?.sell?.hash, buy: S.offers?.buy?.hash },
       asks: l.asks.map(x => ({ price: String(x.price), csd: String(x.csd) })), bids: l.bids.map(x => ({ price: String(x.price), csd: String(x.csd) })),
       recent,
     };
