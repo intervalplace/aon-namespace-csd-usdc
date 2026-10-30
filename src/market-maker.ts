@@ -32,7 +32,7 @@ import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
-  createPublicClient, createWalletClient, defineChain, getAddress, hashTypedData, http as viemHttp, recoverAddress, parseAbiItem,
+  createPublicClient, createWalletClient, decodeFunctionData, defineChain, getAddress, hashTypedData, http as viemHttp, recoverAddress, parseAbiItem,
   keccak256, maxUint256, toHex, type Hex,
 } from "viem";
 import { privateKeyToAccount, nonceManager } from "viem/accounts";
@@ -1095,6 +1095,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // page references it and includes the maker's signed authorization), and every candidate payment
   // is kept, so a fake one can't crowd out the real one. The seller can always claim it themselves too.
   const towerLocks = new Map<string, number>(); // authHash → lockedUntil
+  const towerTx = new Map<string, Hex>(); // authHash → the transaction that locked it
+  const towerAuth = new Map<string, { auth: Record<string, string>; sig: Hex } | null>(); // from that transaction's calldata
   const towerPays = new Map<string, Map<string, { auth: Record<string, string>; sig: Hex; tx: CsdTx }>>(); // authHash → txid → payment (in a block)
   // Payments not in a block yet, per lock: kept only if they spend coins that really exist (unspent,
   // owned by their signers), at most a few per coin, so made-up payments can't crowd out the real one
@@ -1110,12 +1112,37 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       let ls: any[];
       try { ls = await pub.getLogs({ address: settlement, event: LOCKED_EVENT, fromBlock: from, toBlock: to }); }
       catch (e) { if (chunk > 1n) { chunk = chunk / 2n; continue; } throw e; }
-      for (const l of ls) { const h = String(l.args.authHash).toLowerCase(); if (!S.trades[h]) towerLocks.set(h, Number(l.args.lockedUntil)); }
+      for (const l of ls) { const h = String(l.args.authHash).toLowerCase(); if (!S.trades[h]) { towerLocks.set(h, Number(l.args.lockedUntil)); towerTx.set(h, l.transactionHash as Hex); } }
       from = to + 1n; towerFrom = from;
     }
     while (towerLocks.size > 5000) towerLocks.delete(towerLocks.keys().next().value!);
     const tNow = await chainNow();
-    for (const [h, until] of [...towerLocks]) if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); pending.delete(h); }
+    for (const [h, until] of [...towerLocks]) if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); pending.delete(h); towerTx.delete(h); towerAuth.delete(h); }
+    // Every open lock: its authorization and the maker's signature from the lock transaction itself
+    // (no need for anything on AON), and any coins already paid to the sale's CSD address, as seen
+    // by the bot's own CSD node. AON payments are a second source.
+    for (const [h] of [...towerLocks].slice(-300)) {
+      try {
+        if (!towerAuth.has(h)) {
+          let got: { auth: Record<string, string>; sig: Hex } | null = null;
+          try {
+            const tx = await pub.getTransaction({ hash: towerTx.get(h)! });
+            const d = decodeFunctionData({ abi: settlementAbi as any, data: tx.input }) as any;
+            if (d.functionName === "lockCsdUsdcAuthorization" || d.functionName === "lockCsdUsdcAuthorizationWithPermit") {
+              const auth = authTuple(d.args[0]);
+              if (authHashOf(auth).toLowerCase() === h && auth.executorFeeAmount >= C.sellExecutorFeeUsdc && auth.usdc === usdc
+                && (await recoverAddress({ hash: h as Hex, signature: d.args[1] })).toLowerCase() === auth.buyer.toLowerCase()) got = { auth: strAuth(auth), sig: d.args[1] };
+            }
+          } catch {}
+          towerAuth.set(h, got);
+        }
+        const w = towerAuth.get(h); if (!w) continue;
+        const pays = towerPays.get(h) ?? new Map(); towerPays.set(h, pays);
+        const sums = new Map<string, bigint>();
+        for (const u of await node.utxosAt(w.auth.sellerCsdScriptHash.slice(0, 42) as Hex)) sums.set(u.txid, (sums.get(u.txid) ?? 0n) + u.value);
+        for (const [txid, v] of sums) if (v >= BigInt(w.auth.csdAmount) && !pays.has(txid)) pays.set(txid, { ...w, tx: undefined as any });
+      } catch {}
+    }
     // Soonest to expire first; a lock costs a contract read, and only those with a payment in a
     // CSD block cost more (so locks opened just to crowd the queue get nowhere)
     const due = [...towerLocks].filter(([, u]) => u - tNow <= 1800).sort((a, b) => a[1] - b[1]).slice(0, 200);

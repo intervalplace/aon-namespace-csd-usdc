@@ -520,6 +520,10 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   }
   const r = await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o).tx) });
   check(r.status === "paid" && !r.releaseTx, "the seller paid; the maker hasn't released (instant sales are off here)");
+  // A second sale whose seller paid straight to the CSD network: nothing about it on AON at all
+  const o2 = await openSale(20n * 100_000_000n, await fresh(72));
+  await until(() => tr(o2.authHash).status === "open");
+  csd.submit(payFor(o2).tx);
   await mm.stop(); // the maker disappears
   const tower = await startMarketMaker({ ...mmCfg, privateKey: "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba", csdSeed: "0x" + "71".repeat(32),
     stateFile: STATE + ".tower", port: 18995, watchtowerMs: 1, log: () => {} });
@@ -528,10 +532,12 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   await rpc("evm_increaseTime", [until0 - now0 - 900]); await rpc("evm_mine");
   const u0 = await bal(user.address), t0 = await bal(tower.address);
   await tower.watchtower();
-  await until(async () => await bal(user.address) > u0, 10_000);
-  check(await bal(user.address) === u0 + BigInt(o.usdcAmount) && await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o.authHash]),
+  await until(async () => await bal(user.address) >= u0 + BigInt(o.usdcAmount) + BigInt(o2.usdcAmount), 10_000);
+  check(await bal(user.address) === u0 + BigInt(o.usdcAmount) + BigInt(o2.usdcAmount) && await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o.authHash]),
     "15 minutes before the lock runs out, another bot settles the sale with a proof of the seller's payment: the seller gets the USDC");
-  check(await bal(tower.address) === t0 + 2_000_000n, "and earns the sale's executor fee for it (25 forged payments published first didn't stop it)");
+  check(await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o2.authHash]),
+    "including the sale paid with nothing on AON (authorization read from the lock transaction, payment from the CSD chain)");
+  check(await bal(tower.address) === t0 + 4_000_000n, "and earns the sale's executor fee for it (25 forged payments published first didn't stop it)");
   { const bn = await pub.getBlockNumber(); let gas = 0n;
     for (let i = 0n; i < 6n && !gas; i++) for (const h of (await pub.getBlock({ blockNumber: bn - i })).transactions) {
       const tx = await pub.getTransaction({ hash: h }); if (tx.from.toLowerCase() === tower.address.toLowerCase()) { gas = (await pub.getTransactionReceipt({ hash: h })).gasUsed; break; } }

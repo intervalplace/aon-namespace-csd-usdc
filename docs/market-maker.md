@@ -129,9 +129,12 @@ What the site checks, since it doesn't trust any maker:
   site marks a trade done only once Ethereum says so.
 
 **Watchtower.** The bot also watches other makers' sales (`WATCHTOWER_MS`,
-on by default). It finds every lock from the contract's events, and the
-seller's payment on AON by the trade's hash (the site's payment object carries
-the maker's signed authorization). Payments count once they're in a CSD block; until then only ones spending
+on by default). It finds every lock from the contract's events, reads the
+sale's authorization and the maker's signature from the lock transaction
+itself, and looks for the seller's payment at the sale's CSD address on its own
+CSD node; payments published on AON (the site's payment object references the
+trade's hash) are a second source. Nothing a maker publishes or withholds on
+AON can hide a sale from it. Payments count once they're in a CSD block; until then only ones spending
 coins that really exist are kept, a few per coin, so forged ones can't crowd
 out the real one. If a maker never releases a sale its seller has paid, the bot settles it for the seller with a proof of the payment 30
 minutes before the lock runs out, and earns that sale's executor fee. Running more bots means
