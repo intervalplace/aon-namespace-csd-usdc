@@ -38,7 +38,7 @@ import {
 import { privateKeyToAccount, nonceManager } from "viem/accounts";
 import {
   csdNode, deriveCsdWallet, buildPayment, csdTxid, csdAddressProof, addr20ToBytes32, bitsToTarget, bytesToHex, hash160,
-  suggestedMaxTarget, txToNodeJson, txFromNodeJson, csdSaleRequestDigest, csdSignerAddress, type CsdKey, type CsdTx, type CsdUtxo,
+  suggestedMaxTarget, txToNodeJson, txFromNodeJson, csdInputSigners, hexToBytes, csdSaleRequestDigest, csdSignerAddress, type CsdKey, type CsdTx, type CsdUtxo,
 } from "./csd-wallet.js";
 import { settlementAbi, authTuple, spvProofTuple } from "./executors/evmCsdUsdcSettlement.js";
 import { csdUsdcNamespace, EARLY_RELEASE_TYPES } from "./namespace.js";
@@ -73,7 +73,7 @@ export type MarketMakerConfig = {
   maxUnpaidPerDay?: number;     // ... in the last day; default 10
   coinBanSecs?: number;         // coins named in a sale left unpaid can't open another for this long; default 86400
   maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
-  maxAonRequestsPerMinute?: number; // buys (and, separately, sale requests) handled per minute in all; default 60
+  maxAonChecksPerPass?: number;  // new buys and sales checked against the chain per look at AON (the rest wait); default 10
   lateLockSlackSecs?: number;    // a buy's lock may have this much less than its full window and still be paid; default 300
   inventoryPieces?: number;     // CSD is kept split into this many coins; default 20
   pollMs?: number;              // default 5000
@@ -130,7 +130,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonRequestsPerMinute: 60, lateLockSlackSecs: 300,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -297,6 +297,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   async function checkLock(t: Trade) {
     if (t.status !== "locking" && t.status !== "opening") return;
     const [locked, fin] = await Promise.all([view("usdcLocked", t.authHash), view("finalizedAuthorization", t.authHash)]);
+    if (t.kind === "buy" && fin && !locked) { t.status = "settled"; save(); log(`[mm] buy ${t.authHash}: already settled by someone else; nothing to send`); return; }
     if (locked || fin) {
       t.lockedAt = String(await view("lockedAt", t.authHash)); t.lockedUntil = String(await view("lockedUntil", t.authHash));
       if (t.kind === "buy") {
@@ -339,9 +340,24 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     }))).some(Boolean);
     if (!ok) throw new Error(errs.join("; "));
   }
-  // Objects referencing a hash, from every node (fails only if no node answers)
+  // New objects referencing a hash, from every node (fails only if no node answers). Read in
+  // pages, in the order each node received them, from where the last read stopped: junk can't
+  // jump ahead by claiming an early date, and big objects can't make one read time out.
+  const cursors = new Map<string, number>();
+  async function nodeInbound(b: string, hash: string): Promise<any[] | null> {
+    const key = `${b}|${hash.toLowerCase()}`, out: any[] = [];
+    for (let page = 0; page < 8; page++) {
+      const j = await tfetch(`${b}/v1/objects/${hash}/references?after=${cursors.get(key) ?? 0}&limit=25`).then(r => r.json()).catch(() => null);
+      if (!j) return page ? out : null;
+      if (j.next === undefined) return j.inbound ?? []; // an older node: the whole list at once
+      out.push(...(j.inbound ?? []));
+      if (!j.inbound?.length) break;
+      cursors.set(key, Number(j.next));
+    }
+    return out;
+  }
   async function aonInbound(hash: string): Promise<any[]> {
-    const lists = await Promise.all(aonBases.map(b => tfetch(`${b}/v1/objects/${hash}/references`).then(r => r.json()).then(j => j.inbound ?? [], () => null)));
+    const lists = await Promise.all(aonBases.map(b => nodeInbound(b, hash)));
     if (lists.every(l => l === null)) throw new Error("AON_UNREACHABLE");
     const out = new Map<string, any>();
     for (const l of lists) for (const o of l ?? []) if (o?.objectHash) out.set(String(o.objectHash).toLowerCase(), o);
@@ -414,7 +430,11 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const a = body?.authorization; if (!a) bad("MISSING_AUTHORIZATION");
     let auth: ReturnType<typeof authTuple>; try { auth = authTuple(a); } catch { return bad("BAD_AUTHORIZATION"); }
     const authHash = authHashOf(auth);
-    if (S.trades[authHash]) return tradeView(S.trades[authHash]);
+    if (S.trades[authHash]) {
+      const t = S.trades[authHash];
+      if (t.status === "lock_failed") throw new HttpError(409, t.lateLock ? "LOCK_TOO_OLD" : "LOCK_FAILED");
+      return tradeView(t);
+    }
     // One buy at a time per buyer and per client, with the USDC actually there: otherwise one
     // balance could back many locks that all but one revert, at the bot's expense
     if (Object.values(S.trades).some(t => t.kind === "buy" && t.status === "locking" && (t.auth.buyer.toLowerCase() === auth.buyer.toLowerCase() || t.ip === ip)))
@@ -777,76 +797,108 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     try { await aonPut(o); } catch { queueObject(o); }
   }
   const asError = (e: any) => ({ accepted: false, code: e instanceof HttpError ? e.code : 500, error: e instanceof HttpError ? e.message : "INTERNAL_ERROR" });
-  async function handle(o: any) {
+  // Anyone can publish anything, so an object only gets work in proportion to what it proves:
+  //   - checks that cost nothing (signatures, the coins named) run first; failing them, the object
+  //     is junk: no answer, nothing kept
+  //   - new buys and sales then cost the bot a few chain reads, so only `budget` of them are
+  //     looked at per pass, in the order the bot first saw them; the rest wait ("defer")
+  //   - a buy is only taken further if its buyer actually has the USDC
+  type Verdict = "drop" | "defer" | void;
+  let budget = 0;
+  async function handle(o: any): Promise<Verdict> {
     const P = o.payload ?? {};
     if (o.objectType === "authorization" && P.authorizationType === "csd_usdc_release") {
       const a = P.authorization ?? {};
-      if (String(a.sellerUsdcRecipient ?? "").toLowerCase() !== account.address.toLowerCase()) return; // for someone else
-      const client = `buyer:${String(a.buyer).toLowerCase()}`;
-      // Nothing is done for an authorization its buyer didn't sign (no state, no answer)
-      let h: Hex;
+      if (String(a.sellerUsdcRecipient ?? "").toLowerCase() !== account.address.toLowerCase()) return "drop"; // for someone else
+      let h: Hex, auth: ReturnType<typeof authTuple>;
       try {
-        h = authHashOf(authTuple(a));
-        if ((await recoverAddress({ hash: h, signature: o.signature?.signature })).toLowerCase() !== String(a.buyer).toLowerCase()) return;
-      } catch { return; }
-      // Past the overall limit, requests are dropped unanswered (answering a flood is work too)
-      try { limitRate("aon:buys", C.maxAonRequestsPerMinute); } catch { return; }
+        auth = authTuple(a); h = authHashOf(auth);
+        if ((await recoverAddress({ hash: h, signature: o.signature?.signature })).toLowerCase() !== auth.buyer.toLowerCase()) return "drop";
+      } catch { return "drop"; }
+      if (!S.trades[h]) {
+        if (budget <= 0) return "defer";
+        budget--;
+        const bal = await pub.readContract({ address: usdc, abi: ERC20, functionName: "balanceOf", args: [auth.buyer] });
+        if (bal < auth.usdcAmount + auth.executorFeeAmount) return "drop";
+      }
+      const client = `buyer:${auth.buyer.toLowerCase()}`;
       try {
-        limitRate(client);
+        if (!S.trades[h]) limitRate(client);
         const v = await serial(() => buy({ authorization: a, signature: o.signature?.signature, addressProof: P.csdAddressProof, permit: P.usdcPermit }, client, o));
         await respond(o, { accepted: true, ...v });
       } catch (e: any) {
-        // If someone locks it anyway with the public permit, the buyer gets their USDC back once the lock expires
-        // (only ones that could still be locked; bounded, so it can't be flooded)
+        // If someone locks it anyway with the public permit, the buyer gets their USDC back once the
+        // lock expires (the buyer has the USDC, so it could really be locked; the list is bounded)
         const rb = S.rejectedBuys ?? {};
         if (!S.trades[h] && Number(a.validBefore) <= now() + 2 * 86400 && Object.keys(rb).length < 300) { S.rejectedBuys = { ...rb, [h]: strAuth(a) }; save(); }
         await respond(o, asError(e));
       }
     } else if (o.objectType === "request" && P.requestType === "csd_usdc_sale") {
-      const client = `seller:${String(P.usdcRecipient ?? "").toLowerCase()}`;
-      try { limitRate("aon:sells", C.maxAonRequestsPerMinute); } catch { return; }
+      // Signed by the keys that own the coins, or junk
+      let signers: string[] = [], digest: Hex | undefined;
       try {
-        limitRate(client);
+        digest = saleDigest(P, BigInt(P.csdAmount), getAddress(P.usdcRecipient));
+        signers = [...new Set((Array.isArray(o.signature?.proofs) ? o.signature.proofs : []).slice(0, 10)
+          .map((p: any) => csdSignerAddress(hexToBytes(digest!), p?.sig)).filter(Boolean) as string[])].sort();
+      } catch { return "drop"; }
+      if (!digest || !signers.length) return "drop";
+      const prior = Object.values(S.trades).some(t => t.kind === "sell" && t.requestDigest === digest);
+      if (!prior) { if (budget <= 0) return "defer"; budget--; }
+      const client = `seller:${signers[0]}`;
+      try {
+        if (!prior) limitRate(client);
         const v = await serial(() => sellOpen({ csdAmount: P.csdAmount, usdcRecipient: P.usdcRecipient, minUsdcOut: P.minUsdcOut, validUntil: P.validUntil,
           coins: P.coins, proofs: o.signature?.proofs }, client, o));
         await respond(o, { accepted: true, ...v });
       } catch (e: any) { await respond(o, asError(e)); }
     } else if (o.objectType === "payment" && P.paymentType === "csd_usdc_sale_payment") {
-      const t = Object.values(S.trades).find(x => x.kind === "sell" && x.aon?.auth && o.references.map((r: string) => r.toLowerCase()).includes(x.aon.auth.toLowerCase()));
-      if (!t) return;
+      const t = Object.values(S.trades).find(x => x.kind === "sell" && x.aon?.auth && (o.references ?? []).map((r: string) => String(r).toLowerCase()).includes(x.aon.auth.toLowerCase()));
+      if (!t) return "drop";
+      // Only the seller can sign with the keys behind the sale: anything else is junk
+      let signers: Hex[] | null = null;
+      try { signers = csdInputSigners(txFromNodeJson(P.csdTx)); } catch {}
+      if (!signers?.length || (t.owners && !signers.every(a => t.owners!.includes(a)))) return "drop";
       try {
-        // Only the trade's own seller can pay it, but anyone can publish junk: a few attempts per sale
         limitRate(`pay:${t.authHash}`, 10);
         const v = await serial(() => sellPay({ authHash: t.authHash, tx: P.csdTx, arrivedAt: Math.floor(Number(o.arrivedAt ?? Date.now()) / 1000) }));
         await respond(o, { accepted: true, ...v });
       } catch (e: any) { await respond(o, asError(e)); }
-    }
+    } else return "drop";
   }
-  let dirty = false;
+  // Objects waiting to be handled, in the order the bot first saw them
+  const backlog: any[] = [], queued = new Set<string>();
   async function watch() {
     S.seen ??= {};
+    budget = C.maxAonChecksPerPass;
     const targets = [...(S.liveOffers ?? []).map(o => o.hash),
       ...Object.values(S.trades).filter(t => t.kind === "sell" && t.aon?.auth && (t.status === "open" || now() - t.createdAt < 3600)).map(t => t.aon!.auth!)];
-    // Fetched first, then handled: an object's arrival time is when the bot first saw it
-    const fresh: any[] = [], t0 = Date.now();
+    // Paid sales are read first, so a seller's payment never waits behind new requests
+    targets.reverse();
     for (const h of targets) {
+      if (backlog.length >= 2000) break; // (reading resumes where it stopped once the backlog shrinks)
       let inbound: any[] = [];
       try { inbound = await aonInbound(h); } catch { continue; }
+      const t0 = Date.now();
       for (const o of inbound) {
         const k = String(o?.objectHash ?? "").toLowerCase();
-        if (!k || S.seen[k] || o.namespace !== NS) continue;
-        S.seen[k] = now(); dirty = true;
-        // Dated in the future: junk trying to jump the queue
-        if (!(Number(o.createdAt) <= t0 + 120_000)) continue;
-        fresh.push({ ...o, arrivedAt: t0 });
+        if (!k || S.seen[k] || queued.has(k) || o.namespace !== NS) continue;
+        queued.add(k); backlog.push({ ...o, arrivedAt: t0 });
       }
     }
-    if (dirty) { save(); dirty = false; }
-    for (const o of fresh.sort((a, b) => a.createdAt - b.createdAt)) {
-      try { await handle(o); } catch (e: any) { log(`[mm] AON ${o.objectType} ${o.objectHash}: ${e.message}`); }
+    // Payments first (each is for one known sale), then the rest in arrival order
+    backlog.sort((a, b) => (a.objectType === "payment" ? 0 : 1) - (b.objectType === "payment" ? 0 : 1));
+    let dirty = false;
+    for (let i = 0; i < backlog.length; ) {
+      const o = backlog[i];
+      let v: Verdict = undefined;
+      try { v = await handle(o); } catch (e: any) { log(`[mm] AON ${o.objectType} ${o.objectHash}: ${e.message}`); }
+      if (v === "defer") { i++; continue; }
+      backlog.splice(i, 1); queued.delete(String(o.objectHash).toLowerCase());
+      S.seen[String(o.objectHash).toLowerCase()] = now(); dirty = true;
     }
     const cutoff = now() - 3 * 86400;
-    for (const [k, t] of Object.entries(S.seen)) if (t < cutoff) delete S.seen[k];
+    for (const [k, t] of Object.entries(S.seen)) if (t < cutoff) { delete S.seen[k]; dirty = true; }
+    if (dirty) save();
   }
   let watching: Promise<unknown> = Promise.resolve();
   const watchLoop = () => { if (stopped) return; watching = watch().catch(e => log(`[mm] watch: ${e.message}`)).finally(() => { if (!stopped) setTimeout(watchLoop, C.watchMs); }); };
@@ -856,9 +908,9 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     for (const [h, a] of Object.entries(S.rejectedBuys ?? {})) {
       if (S.trades[h] && !S.trades[h].lateLock) { delete S.rejectedBuys![h]; save(); continue; }
       try {
-        const [locked, until] = await Promise.all([view("usdcLocked", h as Hex), view("lockedUntil", h as Hex)]);
-        if (Number(a.validBefore) < now() - 86400 && !locked) { delete S.rejectedBuys![h]; save(); continue; }
-        if (locked && (await chainNow()) > Number(until) + 30) { await send("refundExpiredLock", [authTuple(a)]); log(`[mm] refunded a declined buy someone locked anyway (${h})`); }
+        // Not locked: forgotten once it can no longer be (its validBefore has passed)
+        if (!(await view("usdcLocked", h as Hex))) { if (Number(a.validBefore) < (await chainNow()) - 60) { delete S.rejectedBuys![h]; save(); } continue; }
+        if ((await chainNow()) > Number(await view("lockedUntil", h as Hex)) + 30) { await send("refundExpiredLock", [authTuple(a)]); log(`[mm] refunded a declined buy someone locked anyway (${h})`); }
       } catch (e: any) { log(`[mm] declined buy ${h}: ${e.shortMessage ?? e.message}`); }
     }
   }

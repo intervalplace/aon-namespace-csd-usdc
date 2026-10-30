@@ -258,7 +258,23 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   const fo = buyAuthorizationObject({ offerHash: (await offers()).sell.objectHash, authorization: d.body.authorization, signature: forged, domain, types: AUTH_TYPES, addressProof: d.body.addressProof, permit: d.body.permit });
   await A.put(fo); await mm.watch();
   check(await A.response(fo.objectHash, mmEvm.address, 1500).then(() => false, e => e.message === "NO_RESPONSE") && !tr(d.hash) && !mm.state().rejectedBuys?.[d.hash],
-    "an authorization not signed by its buyer is ignored: no trade, no answer, nothing kept"); }
+    "an authorization not signed by its buyer is ignored: no trade, no answer, nothing kept");
+  // A flood of properly signed buys from throwaway keys with no USDC: dropped, and real buyers still get through
+  const so = (await offers()).sell.objectHash, junk = [];
+  for (let i = 0; i < 30; i++) {
+    const k = privateKeyToAccount(generatePrivateKey()), t = Number((await pub.getBlock()).timestamp);
+    const ja = { ...d.body.authorization, buyer: k.address, nonce: keccak256(toHex("junk" + i)), validBefore: BigInt(t + 2 * 86400) };
+    const js = await k.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: ja });
+    const jo = buyAuthorizationObject({ offerHash: so, authorization: ja, signature: js, domain, types: AUTH_TYPES, addressProof: d.body.addressProof });
+    await A.put(jo); junk.push(jo);
+  }
+  await mm.watch(); await mm.watch(); await mm.watch();
+  const real = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount), key: userCsd.key(34) });
+  const rr = await post("/buy", real.body);
+  check(rr.accepted === true && tr(real.hash), "after 30 signed buys from wallets with no USDC, a real buyer is answered and served");
+  check(junk.every(j => ![...aonNode.objects.values()].some(x => x.objectType === "response" && x.references.includes(j.objectHash.toLowerCase())))
+    && Object.keys(mm.state().rejectedBuys ?? {}).length <= 2, "the junk got no answers and isn't kept anywhere");
+  await until(() => tr(real.hash).status === "locked"); await mine(10); await mm.tick(); await mm.tick(); }
 
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
@@ -284,6 +300,13 @@ let sold;
   check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o, { fee: 500n }).tx) })).error === "CSD_FEE_TOO_LOW", "a payment with a token fee is refused");
   const other = (await userNode.utxos(uKey)).filter(c => !o.sel.some(x => x.txid === c.txid && x.vout === c.vout));
   check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o, { from: other }).tx) })).error === "PAY_WITH_THE_COINS_YOU_NAMED", "paying with other coins than the ones named is refused");
+  // Ten forged payments (not signed by the seller's keys) first: they don't use up the seller's attempts
+  for (let i = 0; i < 10; i++) {
+    const f = payFor(o); f.tx.inputs = f.tx.inputs.map(x => ({ ...x, scriptSig: new Uint8Array([64, ...new Uint8Array(64).fill(i + 1), 33, ...x.scriptSig.slice(66)]) }));
+    await A.put(salePaymentObject({ authorizationObjectHash: tr(o.authHash).aon.auth, csdTxid: "0x", csdTx: txToNodeJson(f.tx) }));
+  }
+  await mm.watch();
+  check(tr(o.authHash).status === "open" && !tr(o.authHash).csdTxid, "ten forged payments for the sale are ignored");
   const pay = payFor(o);
   const u0 = await bal(user.address), height0 = csd.blocks.length;
   const t0 = Date.now(); const r = await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(pay.tx) });
@@ -315,7 +338,10 @@ console.log("\n[4] Over the instant limit, the bot waits for confirmations; one 
   const pa = payFor(a);
   const ra = await post("/sell/pay", { authHash: a.authHash, tx: txToNodeJson(pa.tx) });
   check(ra.instant, `first ~${Number(a.usdcAmount) / 1e6} USDC: instant (limit 10 USDC in flight)`);
-  check((await post("/sell/pay", { authHash: b.authHash, tx: txToNodeJson(pa.tx) })).error === "PAYMENT_ALREADY_USED", "the same payment can't be used for a second sale");
+  { const dup = salePaymentObject({ authorizationObjectHash: tr(b.authHash).aon.auth, csdTxid: "0x", csdTx: txToNodeJson(pa.tx) });
+    await A.put(dup); await mm.watch();
+    check(!tr(b.authHash).csdTxid && await A.response(dup.objectHash, mmEvm.address, 1500).then(() => false, () => true),
+      "the same payment can't be used for a second sale (it isn't signed by that sale's seller, so it's ignored)"); }
   const rb = await post("/sell/pay", { authHash: b.authHash, tx: txToNodeJson(payFor(b).tx) });
   check(rb.http === 200 && !rb.instant && rb.status === "paid", "second one would pass the limit: accepted, released after one block");
   await mine(); await mm.tick();
@@ -337,7 +363,7 @@ console.log("\n[5] Coins already spent, a payment too late, and a sale nobody pa
   check(o2.http === 200, "(meanwhile another sale opens fine)");
   await until(() => tr(o2.authHash).status === "open"); await mm.tick();
   check(tr(o.authHash).unpaidAt, "the first sale's payment window has passed");
-  check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o, { from: await userNode.utxos(uKey) }).tx) })).error === "TOO_LATE_TO_PAY", "after the payment window the bot won't take the CSD (no free option on the price)");
+  check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o, { from: (await fresh(21, 20n)).coins }).tx) })).error === "TOO_LATE_TO_PAY", "after the payment window the bot won't take the CSD (no free option on the price)");
   await new Promise(r => setTimeout(r, 10_000)); await mm.tick();
   const banned = await openSale(10n * 100_000_000n, { signer: userCsd.key(22), coins: o2.sel });
   check(banned.error === "COINS_FROM_AN_UNPAID_SALE", "coins named in a sale left unpaid can't open another for a day");

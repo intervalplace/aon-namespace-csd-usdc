@@ -29,7 +29,14 @@ export async function startFakeAonNode({ port }) {
     }
     if (req.method === "GET" && (m = p.match(/^\/v1\/objects\/(0x[0-9a-fA-F]{64})\/references$/))) {
       const t = m[1].toLowerCase();
-      return send(200, { ok: true, target: t, inbound: [...objects.values()].filter(o => o.references.map(r => r.toLowerCase()).includes(t)) });
+      const all = order.map((h, i) => ({ o: objects.get(h), rid: i + 1 })).filter(x => x.o.references.map(r => r.toLowerCase()).includes(t));
+      // Paged in arrival order when asked, like the real node
+      if (u.searchParams.has("after") || u.searchParams.has("limit")) {
+        const after = Number(u.searchParams.get("after") ?? 0), limit = Math.min(Number(u.searchParams.get("limit") ?? 50), 200);
+        const page = all.filter(x => x.rid > after).slice(0, limit);
+        return send(200, { ok: true, target: t, inbound: page.map(x => x.o), next: page.length ? page[page.length - 1].rid : after });
+      }
+      return send(200, { ok: true, target: t, inbound: all.map(x => x.o) });
     }
     if (req.method === "GET" && (m = p.match(/^\/v1\/objects\/(0x[0-9a-fA-F]{64})$/))) {
       const o = objects.get(m[1].toLowerCase());

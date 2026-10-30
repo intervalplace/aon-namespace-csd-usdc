@@ -100,6 +100,20 @@ export function csdSighash(tx: CsdTx): Bytes {
   return sha256d(tagged);
 }
 
+// The address behind each input's signature, if every input is validly signed
+// for this transaction (null otherwise). Lets a bot discard forged payments
+// without asking a node anything.
+export function csdInputSigners(tx: CsdTx): Hex[] | null {
+  const digest = csdSighash(tx), out: Hex[] = [];
+  for (const i of tx.inputs) {
+    const s = i.scriptSig;
+    if (s.length !== 99 || s[0] !== 64 || s[65] !== 33) return null;
+    try { if (!secp256k1.verify(s.slice(1, 65), digest, s.slice(66), { lowS: false })) return null; } catch { return null; }
+    out.push(bytesToHex(hash160(s.slice(66))));
+  }
+  return out;
+}
+
 // Signs every input (each input's key must own its prevout's address)
 export function signTx(tx: CsdTx, keys: CsdKey[]): CsdTx {
   if (keys.length !== tx.inputs.length) throw new Error("ONE_KEY_PER_INPUT");
