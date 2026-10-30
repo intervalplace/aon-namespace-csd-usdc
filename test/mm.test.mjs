@@ -200,7 +200,7 @@ let sold;
   check(tr(o.authHash).status === "done", "after 3 CSD confirmations the bot stops counting it as risk");
   sold = o; }
 
-console.log("\n[4] Over the instant limit, the bot waits one CSD block; one payment, one sale");
+console.log("\n[4] Over the instant limit, the bot waits for confirmations; one payment, one sale");
 { const a = await openSale(40n * 100_000_000n);
   const b = await openSale(40n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => !a.sel.some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) });
   check(a.http === 200 && b.http === 200, "two sales from different coins");
@@ -212,7 +212,9 @@ console.log("\n[4] Over the instant limit, the bot waits one CSD block; one paym
   const rb = await post("/sell/pay", { authHash: b.authHash, tx: txToNodeJson(payFor(b).tx) });
   check(rb.http === 200 && !rb.instant && rb.status === "paid", "second one would pass the limit: accepted, released after one block");
   await mine(); await mm.tick();
-  check(tr(b.authHash).status === "released", "released once the payment has a block"); }
+  check(tr(b.authHash).status === "paid", "one block isn't enough while the first sale still counts as in flight (the same limits apply below 3 confirmations)");
+  await mine(2); await mm.tick();
+  check(["released", "done"].includes(tr(b.authHash).status) && tr(b.authHash).releaseTx, "released once its payment is 3 blocks deep"); }
 
 console.log("\n[5] Coins already spent, a payment too late, and a sale nobody pays for");
 { await mine(3); await mm.tick();
@@ -232,9 +234,15 @@ console.log("\n[5] Coins already spent, a payment too late, and a sale nobody pa
   const banned = await openSale(10n * 100_000_000n, { coins: o2.sel.map(c => c) });
   check(banned.error === "COINS_FROM_AN_UNPAID_SALE", "coins named in a sale left unpaid can't open another for a day");
   check(pool().usdc === p0.usdc && pool().csd === p0.csd, "unpaid sales never moved the pool");
-  check((await get("/market")).limits.sellsPaused === true && (await openSale(10n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => ![...o.sel, ...o2.sel].some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) })).error === "SELLS_PAUSED", "two unpaid sales in an hour pause selling (each costs the bot two transactions)");
+  const newcomer = userCsd.key(9); await syncClock(); csd.mine({ rewardTo: newcomer.addr20, reward: 50n * 100_000_000n });
+  check((await get("/market")).limits.sellsPaused === true && (await openSale(10n * 100_000_000n, { signer: newcomer, coins: await userNode.utxos(newcomer) })).error === "SELLS_PAUSED",
+    "two unpaid sales in an hour pause selling for new sellers (each costs the bot two transactions)");
+  const keep = await openSale(10n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => ![...o.sel, ...o2.sel].some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) });
+  check(keep.http === 200, "a seller with completed sales can still sell while it's paused");
+  await until(() => tr(keep.authHash).status === "open");
+  await post("/sell/pay", { authHash: keep.authHash, tx: txToNodeJson(payFor(keep).tx) });
   await rpc("evm_increaseTime", [120 * 60]); await rpc("evm_mine"); await mm.tick(); await mm.tick();
-  check(tr(o.authHash).status === "expired" && tr(o2.authHash).status === "expired" && await bal(mmEvm.address) === m0, "refunded once the locks expired; the bot has its USDC back"); }
+  check(tr(o.authHash).status === "expired" && tr(o2.authHash).status === "expired", "the unpaid sales' locks were refunded once they expired"); }
 
 // let selling resume for the rest of the test
 for (const t of Object.values(mm.state().trades)) if (t.unpaidAt) t.unpaidAt -= 2 * 86400;
@@ -252,8 +260,10 @@ console.log("\n[6] Double spends: an instant one is a capped loss; one that wasn
   check(tr(o.authHash).status === "reversed" && BigInt(mm.state().lossUsdc) === BigInt(o.usdcAmount), `bot records the ${Number(o.usdcAmount) / 1e6} USDC loss`);
   check(pool().csd === p0.csd && pool().usdc === p0.usdc - BigInt(tr(o.authHash).poolUsdc), "the pool counts the USDC as gone and no CSD as received");
   check((await get("/market")).limits.instantSells === false, "past the loss budget (1 USDC in this test) instant sales are off");
+  check((await openSale(10n * 100_000_000n)).error === "ADDRESS_FROM_A_DOUBLE_SPEND", "the cheater's address can't open another sale for a day");
+  const fresh = async (i) => { const k = userCsd.key(i); await syncClock(); csd.mine({ rewardTo: k.addr20, reward: 60n * 100_000_000n }); return { signer: k, coins: await userNode.utxos(k) }; };
   // Not instant now: a double-spent payment leaves the pool (and so the price) untouched
-  const d = await openSale(10n * 100_000_000n);
+  const d = await openSale(10n * 100_000_000n, await fresh(11));
   await until(() => tr(d.authHash).status === "open");
   const rd = await post("/sell/pay", { authHash: d.authHash, tx: txToNodeJson(payFor(d).tx) });
   check(rd.status === "paid" && !rd.instant, "the next sale waits for a CSD block");
@@ -262,7 +272,7 @@ console.log("\n[6] Double spends: an instant one is a capped loss; one that wasn
   await mine(2); await mm.tick();
   check(tr(d.authHash).status === "paid" && pool().usdc === pd.usdc && pool().csd === pd.csd && (await get("/market")).bestAsk === ask0, "its payment was double-spent: nothing released, the price didn't move");
   // A paid sale whose lock expires before its payment confirms: the bot takes its lock back, and pays directly when the CSD arrives
-  const e = await openSale(10n * 100_000_000n);
+  const e = await openSale(10n * 100_000_000n, await fresh(12));
   await until(() => tr(e.authHash).status === "open");
   const pe = payFor(e);
   await post("/sell/pay", { authHash: e.authHash, tx: txToNodeJson(pe.tx) });
@@ -270,9 +280,14 @@ console.log("\n[6] Double spends: an instant one is a capped loss; one that wasn
   await rpc("evm_increaseTime", [120 * 60]); await rpc("evm_mine"); await mm.tick();
   check(!(await read(settlement, "TestCsdUsdcSettlement", "usdcLocked", [e.authHash])), "the lock expired with the payment unconfirmed; the bot refunded it");
   csd.submit(pe.tx); const u0 = await bal(user.address);
-  await mine(); await mm.tick();
+  await mine(3); await mm.tick(); // (past the loss budget, release waits for 3 confirmations)
   await until(async () => await bal(user.address) === u0 + BigInt(e.usdcAmount));
   check(await bal(user.address) === u0 + BigInt(e.usdcAmount), "when the payment confirmed later, the bot paid the seller directly"); }
+
+console.log("\n[6b] CSD received for finished sales is swept into the bot's main address");
+{ await mine(3); await mm.tick(); await mine(); await mm.tick(); await mm.tick();
+  const done = Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.status === "done");
+  check(done.length >= 3 && done.every(t => t.swept), `all ${done.length} finished sales' addresses are emptied and no longer looked up`); }
 
 console.log("\n[7] Restart: state survives, CSD proxy works for the in-site wallet");
 { const before = JSON.stringify(mm.state()); await mm.stop();
