@@ -108,17 +108,20 @@ export function aonApi(base: string, fetchImpl: typeof fetch = fetch) {
         out.set(mm, { ...out.get(mm), [side]: o });
         return true;
       };
-      for (const h of [...new Set(hints.filter(x => /^0x[0-9a-fA-F]{64}$/.test(x)).map(x => x.toLowerCase()))].slice(0, 40)) {
+      for (const h of [...new Set(hints.filter(x => /^0x[0-9a-fA-F]{64}$/.test(x)).map(x => x.toLowerCase()))].slice(0, 16)) {
         let o = await this.get(h).catch(() => null);
-        for (let hop = 0; o && hop < 30; hop++) {
+        for (let hop = 0; o && hop < 12; hop++) {
           const side = sideOf(o), mm = String(o?.payload?.marketMaker ?? "").toLowerCase();
           if (!side || (await objectSigner(o))?.toLowerCase() !== mm) break;
           await consider(o);
-          // the newest offer from the same maker and side that references this one
-          const next = (await this.inbound(o.objectHash).catch(() => []))
+          // the newest offer, signed by the same maker for the same side, that references this one
+          // (candidates checked newest first, so an unsigned look-alike can't stop the walk)
+          const cands = (await this.inbound(o.objectHash).catch(() => []))
             .filter(x => sideOf(x) === side && String(x.payload?.marketMaker ?? "").toLowerCase() === mm && Number(x.createdAt) > Number(o.createdAt) && Number(x.createdAt) <= now + 120_000)
-            .sort((a, b) => Number(b.createdAt) - Number(a.createdAt))[0];
-          if (!next || (await objectSigner(next))?.toLowerCase() !== mm) break;
+            .sort((a, b) => Number(b.createdAt) - Number(a.createdAt)).slice(0, 10);
+          let next: any = null;
+          for (const c of cands) if ((await objectSigner(c))?.toLowerCase() === mm) { next = c; break; }
+          if (!next) break;
           o = next;
         }
       }

@@ -504,6 +504,26 @@ console.log("\n[7] Restart: state survives, CSD proxy works for the in-site wall
   const send2 = buildPayment({ utxos: coins, to: [{ value: 100_000_000n, addr20: "0x" + "ab".repeat(20) }], change: uKey.addr20 });
   check((await userNode.submit(send2.tx)) === send2.txid, "the in-site wallet sends CSD through the proxy"); }
 
+console.log("\n[8] Watchtower: a maker that never releases a paid sale; another bot settles it for the seller");
+{ const o = await openSale(10n * 100_000_000n, await fresh(71));
+  check(o.http === 200 && o.authorization.executorFeeAmount === "1000000", "each sale's lock carries a 1 USDC executor fee (back to the maker when it releases)");
+  await until(() => tr(o.authHash).status === "open");
+  const r = await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o).tx) });
+  check(r.status === "paid" && !r.releaseTx, "the seller paid; the maker hasn't released (instant sales are off here)");
+  await mm.stop(); // the maker disappears
+  const tower = await startMarketMaker({ ...mmCfg, privateKey: "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba", csdSeed: "0x" + "71".repeat(32),
+    stateFile: STATE + ".tower", port: 18995, watchtowerMs: 1, log: () => {} });
+  await mine(25);
+  const until0 = Number(await read(settlement, "TestCsdUsdcSettlement", "lockedUntil", [o.authHash])), now0 = Number((await pub.getBlock()).timestamp);
+  await rpc("evm_increaseTime", [until0 - now0 - 900]); await rpc("evm_mine");
+  const u0 = await bal(user.address), t0 = await bal(tower.address);
+  await tower.watchtower();
+  await until(async () => await bal(user.address) > u0, 10_000);
+  check(await bal(user.address) === u0 + BigInt(o.usdcAmount) && await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o.authHash]),
+    "15 minutes before the lock runs out, another bot settles the sale with a proof of the seller's payment: the seller gets the USDC");
+  check(await bal(tower.address) === t0 + 1_000_000n, "and earns the sale's executor fee for it");
+  await tower.stop(); rmSync(STATE + ".tower", { force: true }); }
+
 await mm.stop(); await csd.close(); await aonNode.close();
 if (logs.some(l => l.includes("INTERNAL"))) console.log(logs.join("\n"));
 console.log(`\nAll ${pass} market-maker checks passed.`);

@@ -111,6 +111,26 @@ several) to read and publish on, Node 20, and your own funds:
   POOL_CSD is your starting price); USDC arrives as you sell.
 - **Buy only** (`SIDES=buy`): just USDC.
 
+What the site checks, since it doesn't trust any maker:
+
+- **Proven makers get the orders.** A maker counts once a trade of theirs has
+  settled on Ethereum (the site checks their signed receipts against the
+  contract) or if the site lists it. While any proven maker quotes a side, only
+  proven makers are used there; so after starting, do one real trade with your
+  maker (from another wallet), and it starts receiving orders.
+- **Every sale's lock carries an executor fee** (1 USDC, the bot's
+  `sellExecutorFeeUsdc`). When you release the sale yourself it comes back to
+  you; if you ever don't, whoever settles the sale for the seller with a proof
+  of their payment earns it. The site won't pay into a lock without it.
+- **Your signature over the sale's authorization** must check out, and the
+  site marks a trade done only once Ethereum says so.
+
+**Watchtower.** The bot also watches other makers' sales (`WATCHTOWER_MS`,
+on by default): if one never releases a sale its seller has paid, the bot
+settles it for the seller with a proof of the payment 30 minutes before the
+lock runs out, and earns that sale's executor fee. Running more bots means
+more watchtowers.
+
 Follow "Running it" below with your own keys. Your offers appear on the site
 on their own; each new offer references your previous one, so a browser that
 has seen any of your offers follows the chain to your current price. Price
@@ -142,6 +162,7 @@ ALLOWED_ORIGINS=https://covenant.market
 AON_NODE_URL=http://127.0.0.1:8787    # AON node(s), comma-separated: trades are requested and answered there
 SIDES=sell,buy                        # or just "sell" (only sell CSD) or "buy"
 MIN_ETH=0.005                         # below this ETH balance no new trades are taken
+WATCHTOWER_MS=60000                   # look for other makers' unreleased sales to settle for their sellers (0: off)
 ```
 
 ```bash

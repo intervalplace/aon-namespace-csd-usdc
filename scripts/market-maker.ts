@@ -69,6 +69,7 @@ const mm = await startMarketMaker({
   maxUnconfirmedUsdc: usdcUnits(env("MAX_INSTANT_USDC", "60")),
   // "sell" = only sell CSD (e.g. a miner), "buy" = only buy it; both by default
   sides:         env("SIDES", "sell,buy").split(",").map(x => x.trim()).filter(x => x === "sell" || x === "buy") as ("sell" | "buy")[],
+  watchtowerMs:  Number(env("WATCHTOWER_MS", "60000")),
   minEthWei:     BigInt(Math.round(Number(env("MIN_ETH", "0.005")) * 1e6)) * 10n ** 12n, // new trades stop below this
   // Requests arrive over AON and every trade is published there
   aonNodeUrl:    env("AON_NODE_URL", "http://127.0.0.1:8787"),
