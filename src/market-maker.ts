@@ -32,7 +32,7 @@ import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
-  createPublicClient, createWalletClient, decodeFunctionData, defineChain, getAddress, hashTypedData, http as viemHttp, recoverAddress, parseAbiItem,
+  createPublicClient, createWalletClient, decodeFunctionData, defineChain, fallback, getAddress, hashTypedData, http as viemHttp, recoverAddress, parseAbiItem,
   keccak256, maxUint256, toHex, type Hex,
 } from "viem";
 import { privateKeyToAccount, nonceManager } from "viem/accounts";
@@ -143,10 +143,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     log: console.log, ...cfg,
   };
   const log = C.log;
-  const chain = defineChain({ id: C.chainId, name: `evm-${C.chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: [C.rpcUrl] } } });
+  // Several RPCs (comma-separated) are tried in order: a provider answering "Internal error"
+  // (some hide revert reasons that way, or fail now and then) falls through to the next
+  const rpcUrls = C.rpcUrl.split(",").map(u => u.trim()).filter(Boolean);
+  const transport = () => rpcUrls.length > 1 ? fallback(rpcUrls.map(u => viemHttp(u)), { retryCount: 1 }) : viemHttp(rpcUrls[0]);
+  const chain = defineChain({ id: C.chainId, name: `evm-${C.chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: rpcUrls } } });
   const account = privateKeyToAccount(C.privateKey, { nonceManager });
-  const pub = createPublicClient({ chain, transport: viemHttp(C.rpcUrl) });
-  const wallet = createWalletClient({ account, chain, transport: viemHttp(C.rpcUrl) });
+  const pub = createPublicClient({ chain, transport: transport() });
+  const wallet = createWalletClient({ account, chain, transport: transport() });
   const settlement = getAddress(C.settlement), usdc = getAddress(C.usdc);
   const domain = { name: "AON CSD/USDC", version: "4", chainId: C.chainId, verifyingContract: settlement } as const;
   const AUTH_TYPES = csdUsdcNamespace.types!() as any;
