@@ -812,6 +812,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     try { await sweepFinished(); } catch (e: any) { log(`[mm] sweep: ${e.message}`); }
     try { await refreshOffers(); } catch (e: any) { log(`[mm] offers: ${e.message}`); }
     try { await refundDeclined(); } catch (e: any) { log(`[mm] declined: ${e.message}`); }
+    try { await towerScan(); } catch (e: any) { log(`[mm] watchtower scan: ${e.message}`); }
     try { await watchtower(); } catch (e: any) { log(`[mm] watchtower: ${e.message}`); }
     flushAon();
     try { await splitInventory(); } catch (e: any) { log(`[mm] split: ${e.message}`); }
@@ -1101,10 +1102,16 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // Payments not in a block yet, per lock: kept only if they spend coins that really exist (unspent,
   // owned by their signers), at most a few per coin, so made-up payments can't crowd out the real one
   const pending = new Map<string, Map<string, { w: { auth: Record<string, string>; sig: Hex; tx: CsdTx }; coin: string }>>();
-  let towerAt = 0, towerFrom: bigint | undefined;
-  async function watchtower(force = false) {
-    if (!C.watchtowerMs || (!force && Date.now() - towerAt < C.watchtowerMs)) return;
-    towerAt = Date.now();
+  let towerAt = 0, towerFrom: bigint | undefined, scannedTip = "";
+  // Every open lock: its authorization and the maker's signature from the lock transaction itself
+  // (no need for anything on AON), and any coins paid to the sale's CSD address, as seen by the
+  // bot's own CSD node. Run on every new CSD block: a payment can only be spent once it's in a
+  // block, so it sits at the sale address for at least a block, and the maker can't sweep it out
+  // before the watchtower has seen it. (AON payments are a second source.)
+  async function towerScan() {
+    if (!C.watchtowerMs || tipHash === scannedTip) return;
+    scannedTip = tipHash;
+    // New locks since the last look (from the contract's events)
     const latest = await pub.getBlockNumber({ cacheTime: 0 });
     let from = towerFrom ?? (latest > 7200n ? latest - 7200n : 0n), chunk = BigInt(Math.max(1, Math.min(logChunk, C.logChunkBlocks)));
     while (from <= latest) {
@@ -1115,12 +1122,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       for (const l of ls) { const h = String(l.args.authHash).toLowerCase(); if (!S.trades[h]) { towerLocks.set(h, Number(l.args.lockedUntil)); towerTx.set(h, l.transactionHash as Hex); } }
       from = to + 1n; towerFrom = from;
     }
-    while (towerLocks.size > 5000) towerLocks.delete(towerLocks.keys().next().value!);
-    const tNow = await chainNow();
-    for (const [h, until] of [...towerLocks]) if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); pending.delete(h); towerTx.delete(h); towerAuth.delete(h); }
-    // Every open lock: its authorization and the maker's signature from the lock transaction itself
-    // (no need for anything on AON), and any coins already paid to the sale's CSD address, as seen
-    // by the bot's own CSD node. AON payments are a second source.
+
     for (const [h] of [...towerLocks].slice(-300)) {
       try {
         if (!towerAuth.has(h)) {
@@ -1143,6 +1145,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         for (const [txid, v] of sums) if (v >= BigInt(w.auth.csdAmount) && !pays.has(txid)) pays.set(txid, { ...w, tx: undefined as any });
       } catch {}
     }
+  }
+  async function watchtower(force = false) {
+    if (!C.watchtowerMs || (!force && Date.now() - towerAt < C.watchtowerMs)) return;
+    towerAt = Date.now();
+    while (towerLocks.size > 5000) towerLocks.delete(towerLocks.keys().next().value!);
+    const tNow = await chainNow();
+    for (const [h, until] of [...towerLocks]) if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); pending.delete(h); towerTx.delete(h); towerAuth.delete(h); }
+    await syncBlocks(); scannedTip = ""; await towerScan(); // (fresh look before settling)
+    for (const [h, until] of [...towerLocks]) if (tNow > until) towerLocks.delete(h);
     // Soonest to expire first; a lock costs a contract read, and only those with a payment in a
     // CSD block cost more (so locks opened just to crowd the queue get nowhere)
     const due = [...towerLocks].filter(([, u]) => u - tNow <= 1800).sort((a, b) => a[1] - b[1]).slice(0, 200);

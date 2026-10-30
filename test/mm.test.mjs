@@ -525,9 +525,16 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   await until(() => tr(o2.authHash).status === "open");
   csd.submit(payFor(o2).tx);
   await mm.stop(); // the maker disappears
+  const towerLogs = [];
   const tower = await startMarketMaker({ ...mmCfg, privateKey: "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba", csdSeed: "0x" + "71".repeat(32),
-    stateFile: STATE + ".tower", port: 18995, watchtowerMs: 1, log: () => {} });
-  await mine(25);
+    stateFile: STATE + ".tower", port: 18995, watchtowerMs: 1, log: (...a) => towerLogs.push(a.join(" ")) });
+  // The maker sweeps the second sale's coin out of the sale address one block after it arrives
+  await mine(1); await tower.tick();
+  { const direct = csdNode(csd.url), k = deriveCsdWallet(MM_SEED).key(tr(o2.authHash).keyIndex), coins = await direct.utxos(k);
+    const sweep = buildPayment({ utxos: coins, to: [{ value: coins.reduce((x, c) => x + c.value, 0n) - 10_000n, addr20: mmInventory.addr20 }], change: k.addr20 });
+    await syncClock(); csd.submit(sweep.tx); await mine(1);
+    check((await direct.utxos(k)).length === 0, "the maker swept the seller's coin out of the sale address the next block"); }
+  await mine(24);
   const until0 = Number(await read(settlement, "TestCsdUsdcSettlement", "lockedUntil", [o.authHash])), now0 = Number((await pub.getBlock()).timestamp);
   await rpc("evm_increaseTime", [until0 - now0 - 900]); await rpc("evm_mine");
   const u0 = await bal(user.address), t0 = await bal(tower.address);
@@ -536,7 +543,7 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   check(await bal(user.address) === u0 + BigInt(o.usdcAmount) + BigInt(o2.usdcAmount) && await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o.authHash]),
     "15 minutes before the lock runs out, another bot settles the sale with a proof of the seller's payment: the seller gets the USDC");
   check(await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o2.authHash]),
-    "including the sale paid with nothing on AON (authorization read from the lock transaction, payment from the CSD chain)");
+    "including the sale paid with nothing on AON and swept right away (authorization read from the lock transaction, payment seen at the sale address on the block it arrived)");
   check(await bal(tower.address) === t0 + 4_000_000n, "and earns the sale's executor fee for it (25 forged payments published first didn't stop it)");
   { const bn = await pub.getBlockNumber(); let gas = 0n;
     for (let i = 0n; i < 6n && !gas; i++) for (const h of (await pub.getBlock({ blockNumber: bn - i })).transactions) {

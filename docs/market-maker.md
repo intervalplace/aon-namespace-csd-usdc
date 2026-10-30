@@ -125,14 +125,16 @@ What the site checks, since it doesn't trust any maker:
   `sellExecutorFeeUsdc`; settling with a proof is about 320k gas). When you release the sale yourself it comes back to
   you; if you ever don't, whoever settles the sale for the seller with a proof
   of their payment earns it. The site won't pay into a lock without it.
-- **Your signature over the sale's authorization** must check out, and the
-  site marks a trade done only once Ethereum says so.
+- **Your signature over the sale's authorization** must check out, the lock
+  must be a direct call to the settlement contract (so anyone can read the sale
+  from Ethereum), and the site marks a trade done only once Ethereum says so.
 
 **Watchtower.** The bot also watches other makers' sales (`WATCHTOWER_MS`,
 on by default). It finds every lock from the contract's events, reads the
 sale's authorization and the maker's signature from the lock transaction
 itself, and looks for the seller's payment at the sale's CSD address on its own
-CSD node; payments published on AON (the site's payment object references the
+CSD node on every new CSD block (a payment can only be spent once it's in a
+block, so a maker can't sweep it away unseen); payments published on AON (the site's payment object references the
 trade's hash) are a second source. Nothing a maker publishes or withholds on
 AON can hide a sale from it. Payments count once they're in a CSD block; until then only ones spending
 coins that really exist are kept, a few per coin, so forged ones can't crowd
