@@ -1126,9 +1126,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     for (const [h] of [...towerLocks].slice(-300)) {
       try {
         if (!towerAuth.has(h)) {
+          // (a failed read is tried again next block; only a definite answer is kept)
           let got: { auth: Record<string, string>; sig: Hex } | null = null;
+          const tx = await pub.getTransaction({ hash: towerTx.get(h)! });
           try {
-            const tx = await pub.getTransaction({ hash: towerTx.get(h)! });
             const d = decodeFunctionData({ abi: settlementAbi as any, data: tx.input }) as any;
             if (d.functionName === "lockCsdUsdcAuthorization" || d.functionName === "lockCsdUsdcAuthorizationWithPermit") {
               const auth = authTuple(d.args[0]);
@@ -1141,7 +1142,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         const w = towerAuth.get(h); if (!w) continue;
         const pays = towerPays.get(h) ?? new Map(); towerPays.set(h, pays);
         const sums = new Map<string, bigint>();
-        for (const u of await node.utxosAt(w.auth.sellerCsdScriptHash.slice(0, 42) as Hex)) sums.set(u.txid, (sums.get(u.txid) ?? 0n) + u.value);
+        // (including coins already being spent in the mempool: a maker's sweep can't hide them)
+        for (const u of await node.utxosAt(w.auth.sellerCsdScriptHash.slice(0, 42) as Hex, true)) sums.set(u.txid, (sums.get(u.txid) ?? 0n) + u.value);
         for (const [txid, v] of sums) if (v >= BigInt(w.auth.csdAmount) && !pays.has(txid)) pays.set(txid, { ...w, tx: undefined as any });
       } catch {}
     }

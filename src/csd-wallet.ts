@@ -229,8 +229,10 @@ export function csdNode(base: string, fetchImpl: typeof fetch = fetch) {
     async headerAt(height: number) { const b = await get(`/block/height/${height}`); return { hash: b.hash as Hex, ...b.header } as any; },
     async currentBits(): Promise<number> { const t = await this.tip(); return Number((await this.headerAt(t.height)).bits); },
     // Confirmed coins at an address, minus those already spent in the node's mempool
-    async utxosAt(addr20: Hex): Promise<{ txid: Hex; vout: number; value: bigint }[]> {
-      const r = await get(`/utxos/${addrHex(addr20)}?available=true`);
+    // Confirmed coins at an address; by default leaving out those already being spent in the
+    // mempool (`includeSpending` keeps them: "what has arrived here", not "what can be spent")
+    async utxosAt(addr20: Hex, includeSpending = false): Promise<{ txid: Hex; vout: number; value: bigint }[]> {
+      const r = await get(`/utxos/${addrHex(addr20)}${includeSpending ? "" : "?available=true"}`);
       return (r.utxos ?? []).map((u: any) => ({ txid: String(u.txid).toLowerCase() as Hex, vout: Number(u.vout), value: BigInt(u.value) }));
     },
     async utxos(key: CsdKey): Promise<CsdUtxo[]> { return (await this.utxosAt(key.addr20)).map(u => ({ ...u, key })); },

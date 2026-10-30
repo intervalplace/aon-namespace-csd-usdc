@@ -529,10 +529,11 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   const tower = await startMarketMaker({ ...mmCfg, privateKey: "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba", csdSeed: "0x" + "71".repeat(32),
     stateFile: STATE + ".tower", port: 18995, watchtowerMs: 1, log: (...a) => towerLogs.push(a.join(" ")) });
   // The maker sweeps the second sale's coin out of the sale address one block after it arrives
-  await mine(1); await tower.tick();
+  // (the sweep is sent the moment the payment's block lands, before the watchtower looks)
+  await mine(1);
   { const direct = csdNode(csd.url), k = deriveCsdWallet(MM_SEED).key(tr(o2.authHash).keyIndex), coins = await direct.utxos(k);
     const sweep = buildPayment({ utxos: coins, to: [{ value: coins.reduce((x, c) => x + c.value, 0n) - 10_000n, addr20: mmInventory.addr20 }], change: k.addr20 });
-    await syncClock(); csd.submit(sweep.tx); await mine(1);
+    await syncClock(); csd.submit(sweep.tx); await tower.tick(); await mine(1);
     check((await direct.utxos(k)).length === 0, "the maker swept the seller's coin out of the sale address the next block"); }
   await mine(24);
   const until0 = Number(await read(settlement, "TestCsdUsdcSettlement", "lockedUntil", [o.authHash])), now0 = Number((await pub.getBlock()).timestamp);
