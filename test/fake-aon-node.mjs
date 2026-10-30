@@ -11,6 +11,7 @@ export async function startFakeAonNode({ port }) {
     let raw = ""; for await (const c of req) raw += c;
     const u = new URL(req.url, "http://x"), p = u.pathname; let m;
     const send = (code, body) => { res.writeHead(code, { "content-type": "application/json", "access-control-allow-origin": "*" }); res.end(JSON.stringify(body)); };
+    if (req.method === "OPTIONS") { res.writeHead(204, { "access-control-allow-origin": "*", "access-control-allow-methods": "GET,POST", "access-control-allow-headers": "content-type" }); return res.end(); }
     if (req.method === "POST" && p === "/v1/objects") {
       const o = JSON.parse(raw);
       if (!o.objectHash || hashObject(o).toLowerCase() !== o.objectHash.toLowerCase()) return send(400, { ok: false, error: { code: "OBJECT_HASH_MISMATCH" } });

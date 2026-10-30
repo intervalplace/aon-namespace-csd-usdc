@@ -134,6 +134,8 @@ mm.covenant.market {
 ```bash
 systemctl reload caddy
 curl -s https://mm.covenant.market/api/market | head -c 300
+# the bot's offers are on AON (trading happens there, not over this API):
+curl -s 'https://explorer.aon.network/v1/objects?namespace=aon:csd-usdc&objectType=offer&limit=2' | head -c 300
 ```
 
 ## 5. Release the site
@@ -149,7 +151,11 @@ NEXT_PUBLIC_CSD_MM_URL=https://mm.covenant.market
 NEXT_PUBLIC_CSD_SETTLEMENT=0x<contract>
 NEXT_PUBLIC_CSD_NODE_URL=https://csd.aon.network
 NEXT_PUBLIC_CSD_TARGET_REF=0x<from above>
+NEXT_PUBLIC_CSD_MARKET_MAKERS=0x71cDFF394fD19cfA97946E6BAA08232cF357abD0
 ```
+
+The page only trades with offers and responses signed by the addresses in
+`NEXT_PUBLIC_CSD_MARKET_MAKERS` (the bot's Ethereum address).
 
 Then the usual release (RELEASING.md): commit, `npm run release:ipfs`, pin,
 `publish-site.sh`, `check-site`, RELEASES.md, tag.
