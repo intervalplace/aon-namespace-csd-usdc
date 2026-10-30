@@ -75,7 +75,8 @@ export type MarketMakerConfig = {
   maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
   maxAonChecksPerPass?: number;  // new buys and sales checked against the chain per look at AON (the rest wait); default 10
   newBuysPerMinute?: number;     // new buys checked per buyer per minute (more get SLOW_DOWN); default 6
-  declinedCheckMs?: number;      // how often declined buys are checked for locks someone made anyway; default 60000
+  declinedCheckMs?: number;
+  logChunkBlocks?: number;       // blocks per log query (some RPC providers allow few); default 500, halved on errors      // how often declined buys are checked for locks someone made anyway; default 60000
   lateLockSlackSecs?: number;    // a buy's lock may have this much less than its full window and still be paid; default 300
   inventoryPieces?: number;     // CSD is kept split into this many coins; default 20
   pollMs?: number;              // default 5000
@@ -133,7 +134,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, newBuysPerMinute: 6, lateLockSlackSecs: 300,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -826,24 +827,36 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     return ids;
   }
   // What a well-formed object is, and who it's from (null: junk)
-  async function classify(o: any): Promise<{ kind: Kind; from: string } | null> {
+  // Senders the bot has reason to think are real: past traders, buyers seen holding USDC,
+  // sellers seen owning their coins. They're looked at before unknown ones.
+  const vouched = new Map<string, number>(); // address → when
+  const vouch = (a: string) => { vouched.delete(a); vouched.set(a, Date.now()); while (vouched.size > 20_000) vouched.delete(vouched.keys().next().value!); };
+  const isKnown = (a: string) => (vouched.get(a) ?? 0) > Date.now() - 7 * 86400_000
+    || Object.values(S.trades).some(t => t.auth.buyer.toLowerCase() === a || t.owners?.includes(a));
+  // Requests already decided (so a copy republished later can't take a queue place)
+  const decided = new Map<string, number>();
+  const decide = (id: string) => { decided.set(id, Date.now()); while (decided.size > 50_000) decided.delete(decided.keys().next().value!); };
+  async function classify(o: any): Promise<{ kind: Kind; from: string; id: string; known: boolean } | null> {
     const P = o.payload ?? {};
     try {
       if (o.objectType === "authorization" && P.authorizationType === "csd_usdc_release") {
         const auth = authTuple(P.authorization ?? {});
         if (auth.sellerUsdcRecipient !== account.address) return null; // for someone else
-        if ((await recoverAddress({ hash: authHashOf(auth), signature: o.signature?.signature })).toLowerCase() !== auth.buyer.toLowerCase()) return null;
-        return { kind: "buy", from: auth.buyer.toLowerCase() };
+        const h = authHashOf(auth);
+        if ((await recoverAddress({ hash: h, signature: o.signature?.signature })).toLowerCase() !== auth.buyer.toLowerCase()) return null;
+        const b = auth.buyer.toLowerCase();
+        return { kind: "buy", from: b, id: h, known: isKnown(b) };
       }
       if (o.objectType === "request" && P.requestType === "csd_usdc_sale") {
         const signers = saleSigners(o); if (!signers) return null;
-        return { kind: "sale", from: signers.join(",") };
+        const id = saleDigest(P, BigInt(P.csdAmount), getAddress(P.usdcRecipient))!;
+        return { kind: "sale", from: signers.join(","), id, known: signers.some(isKnown) };
       }
       if (o.objectType === "payment" && P.paymentType === "csd_usdc_sale_payment") {
         const t = saleFor(o); if (!t) return null;
         const signers = csdInputSigners(txFromNodeJson(P.csdTx));
         if (!signers?.length || (t.owners && !signers.every(a => t.owners!.includes(a)))) return null;
-        return { kind: "payment", from: t.authHash };
+        return { kind: "payment", from: t.authHash, id: String(o.objectHash).toLowerCase(), known: true };
       }
     } catch {}
     return null;
@@ -866,6 +879,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         budget.buy--;
         const bal = await pub.readContract({ address: usdc, abi: ERC20, functionName: "balanceOf", args: [auth.buyer] });
         if (bal < auth.usdcAmount + auth.executorFeeAmount) return "drop";
+        vouch(auth.buyer.toLowerCase());
       }
       try {
         const v = await serial(() => buy({ authorization: a, signature: o.signature?.signature, addressProof: P.csdAddressProof, permit: P.usdcPermit }, client, o));
@@ -902,6 +916,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
           if (coins.every((c: string) => owned.has(c))) break;
           if (fresh) return "drop";
         }
+        signers.forEach(vouch);
         try { limitRate(`seller:${signers[0]}`); } catch { return "drop"; }
         budget.sale--;
       }
@@ -919,18 +934,25 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       } catch (e: any) { await respond(o, asError(e)); }
     }
   }
-  // Waiting objects, per kind, in the order the bot first saw them; one per sender
-  const queues: Record<Kind, Map<string, any>> = { payment: new Map(), buy: new Map(), sale: new Map() };
+  // Waiting objects, per kind, keyed by request (an authorization's hash, a sale request's digest),
+  // in the order the bot first saw them. A sender has at most a few waiting; a request already
+  // waiting or already decided isn't queued again. When a queue is full, reading stops (nothing
+  // read is dropped; the rest is read later from where it stopped).
+  type Entry = { o: any; from: string; known: boolean };
+  const queues: Record<Kind, Map<string, Entry>> = { payment: new Map(), buy: new Map(), sale: new Map() };
   const QUEUE_MAX: Record<Kind, number> = { payment: 2000, buy: 500, sale: 500 };
+  const PER_SENDER = 3;
   async function watch() {
     S.seen ??= {};
     budget.payment = Infinity; budget.buy = C.maxAonChecksPerPass; budget.sale = C.maxAonChecksPerPass; lookups = 4 * C.maxAonChecksPerPass;
     let dirty = false;
     const done = (o: any) => { S.seen![String(o.objectHash).toLowerCase()] = now(); dirty = true; };
     // Sales' authorizations (payments) first, then the offers (buys and sales)
-    const targets = [...Object.values(S.trades).filter(t => t.kind === "sell" && t.aon?.auth && (t.status === "open" || now() - t.createdAt < 3600)).map(t => t.aon!.auth!),
-      ...(S.liveOffers ?? []).map(o => o.hash)];
-    for (const h of targets) {
+    const payTargets = Object.values(S.trades).filter(t => t.kind === "sell" && t.aon?.auth && (t.status === "open" || now() - t.createdAt < 3600)).map(t => t.aon!.auth!);
+    const offerTargets = (S.liveOffers ?? []).map(o => o.hash);
+    for (const h of [...payTargets, ...offerTargets]) {
+      const isOffer = !payTargets.includes(h);
+      if (isOffer && (queues.buy.size >= QUEUE_MAX.buy || queues.sale.size >= QUEUE_MAX.sale)) continue; // full: read later
       let inbound: any[] = [];
       try { inbound = await aonInbound(h); } catch { continue; }
       const t0 = Date.now();
@@ -939,19 +961,20 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         if (!k || S.seen[k] || o.namespace !== NS) continue;
         const c = await classify(o);
         if (!c) { done(o); continue; }
-        const q = queues[c.kind], prev = q.get(c.from);
-        if (prev) { if (prev.objectHash.toLowerCase() === k) continue; q.delete(c.from); done(prev); } // the newer one replaces it
-        if (q.size >= QUEUE_MAX[c.kind]) { done(o); continue; } // overloaded: dropped (the sender can retry)
-        q.set(c.from, { ...o, arrivedAt: t0 });
+        const q = queues[c.kind];
+        if (q.has(c.id) || (c.kind !== "payment" && decided.has(c.id) && !S.trades[c.id])) { done(o); continue; } // a copy
+        if ([...q.values()].filter(e => e.from === c.from).length >= PER_SENDER) { done(o); continue; }
+        q.set(c.id, { o: { ...o, arrivedAt: t0 }, from: c.from, known: c.known });
       }
     }
     for (const kind of ["payment", "buy", "sale"] as Kind[]) {
-      for (const [from, o] of [...queues[kind]]) {
+      // Known senders first, then the rest, each in arrival order
+      const all = [...queues[kind]], order = [...all.filter(([, e]) => e.known), ...all.filter(([, e]) => !e.known)];
+      for (const [id, e] of order) {
         let v: Verdict = undefined;
-        try { v = await handle(o, kind); } catch (e: any) { log(`[mm] AON ${o.objectType} ${o.objectHash}: ${e.message}`); }
+        try { v = await handle(e.o, kind); } catch (err: any) { log(`[mm] AON ${e.o.objectType} ${e.o.objectHash}: ${err.message}`); }
         if (v === "defer") continue;
-        if (queues[kind].get(from) === o) queues[kind].delete(from);
-        done(o);
+        queues[kind].delete(id); decide(id); done(e.o);
       }
     }
     const cutoff = now() - 3 * 86400;
@@ -964,16 +987,19 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // Locks of declined buys that someone submitted anyway: found from the contract's lock events
   // (one query a minute), and refunded to the buyer once they expire
   const LOCKED_EVENT = parseAbiItem("event CsdUsdcAuthorizationLocked(bytes32 indexed authHash, uint256 lockedUntil)");
-  let declinedAt = 0;
+  let declinedAt = 0, logChunk = 500;
   async function refundDeclined() {
     if (Date.now() - declinedAt < C.declinedCheckMs) return;
-    declinedAt = Date.now();
+    declinedAt = Date.now(); logChunk = Math.min(logChunk, C.logChunkBlocks);
     const rb = (S.rejectedBuys ??= {}), found = (S.declinedLocks ??= {}); // (changed in place: handle() adds to them)
     const latest = await pub.getBlockNumber({ cacheTime: 0 });
     let from = S.declinedFromBlock ? BigInt(S.declinedFromBlock) : latest > 7200n ? latest - 7200n : 0n;
     while (from <= latest) {
-      const to = from + 2000n < latest ? from + 2000n : latest;
-      for (const l of await pub.getLogs({ address: settlement, event: LOCKED_EVENT, fromBlock: from, toBlock: to })) {
+      const to = from + BigInt(logChunk) - 1n < latest ? from + BigInt(logChunk) - 1n : latest;
+      let ls: any[];
+      try { ls = await pub.getLogs({ address: settlement, event: LOCKED_EVENT, fromBlock: from, toBlock: to }); }
+      catch (e) { if (logChunk > 1) { logChunk = Math.max(1, Math.floor(logChunk / 2)); continue; } throw e; }
+      for (const l of ls) {
         const h = String(l.args.authHash).toLowerCase();
         const k = Object.keys(rb).find(x => x.toLowerCase() === h);
         if (k && !(S.trades[k] && !S.trades[k].lateLock)) found[k] = String(l.args.lockedUntil);

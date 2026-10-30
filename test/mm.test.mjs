@@ -201,11 +201,12 @@ console.log("\n[2b] Racing the bot's lock: CSD is only sent if the USDC really i
   check(tr(a.hash).status === "settled", "the copied-lock trade settles normally"); }
 
 // A sale as the site makes it: name the coins you'll pay with, sign for them, then pay with exactly those
+let saleNo = 0; // (each request differs, as each click in the site makes a new one)
 async function openSale(csdAmount, { coins, signer = uKey, recipient = user.address, minUsdcOut = 0n } = {}) {
   const all = await userNode.utxos(uKey);
   const sel = coins ?? buildPayment({ utxos: all, to: [{ value: csdAmount, addr20: "0x" + "00".repeat(20) }], change: uKey.addr20 }).spent.map(c => all.find(u => u.txid === c.txid && u.vout === c.vout));
   const validUntil = Number((await pub.getBlock()).timestamp) + 300; // the bot checks against its own clock
-  const req = { csdAmount, usdcRecipient: recipient, validUntil: Math.floor(Date.now() / 1000) + 300, coins: sel.map(c => ({ txid: c.txid, vout: c.vout })) };
+  const req = { csdAmount, usdcRecipient: recipient, validUntil: Math.floor(Date.now() / 1000) + 240 + (saleNo++ % 50), coins: sel.map(c => ({ txid: c.txid, vout: c.vout })) };
   const proofs = [csdSignDigest(signer, csdSaleRequestDigest(req))];
   const o = await post("/sell/open", { ...req, minUsdcOut, proofs, owners: [signer.addr20] });
   return { ...o, sel };
@@ -286,7 +287,13 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   await mm.watch(); await mm.watch();
   const answered = many.filter(j => [...aonNode.objects.values()].some(x => x.objectType === "response" && x.references.includes(j.objectHash.toLowerCase())));
   const mineDeclined = Object.values(mm.state().rejectedBuys ?? {}).filter(x => x.buyer.toLowerCase() === user.address.toLowerCase()).length;
-  check(answered.length === 1 && answered[0] === many[19] && mineDeclined <= 5, `20 buys from one wallet at once: only the newest is handled (answered ${answered.length}); at most 5 of its declined buys are kept (${mineDeclined})`); }
+  check(answered.length === 3 && answered.every(x => many.indexOf(x) < 3) && mineDeclined <= 5, `20 buys from one wallet at once: only 3 are looked at (answered ${answered.length}); at most 5 of its declined buys are kept (${mineDeclined})`);
+  // Republishing a copy of an earlier, already-decided authorization (new createdAt, so a new object) is ignored
+  const { objectHash: _o, ...old } = many[0];
+  const copy = finalizeObject({ ...old, createdAt: Date.now() });
+  const before = [...aonNode.objects.values()].filter(x => x.objectType === "response").length;
+  await A.put(copy); await mm.watch();
+  check([...aonNode.objects.values()].filter(x => x.objectType === "response").length === before, "a republished copy of an already-decided buy gets nothing (it can't take someone's place in the queue)"); }
 
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
@@ -309,9 +316,11 @@ let sold;
   const o = await openSale(csdAmount, { minUsdcOut: quote });
   check(o.http === 200 && o.lockTx && o.csdAddress, "bot opens the trade: locks its USDC against a fresh CSD address");
   { const { objectHash: _x, ...orig } = aonNode.objects.get(o.objectHash.toLowerCase());
-    const again = await answer(finalizeObject({ ...orig, createdAt: Date.now() }));
-    check(again.authHash === o.authHash && Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.requestDigest === tr(o.authHash).requestDigest).length === 1,
-      "the same signed request republished by someone else gets the same sale back, not a second one"); }
+    noAnswerMs = 1500;
+    const again = await answer(finalizeObject({ ...orig, createdAt: Date.now() })).catch(e => ({ error: e.message }));
+    noAnswerMs = 15_000;
+    check(again.error === "NO_RESPONSE" && Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.requestDigest === tr(o.authHash).requestDigest).length === 1,
+      "the same signed request republished by someone else is ignored: no second sale"); }
   check(midPrice(pool()) === mid0 && (await get("/market")).bestAsk === m0ask, "opening a sale doesn't move the pool or the buy price");
   check((await openSale(csdAmount - 1n, { coins: o.sel })).error === "COINS_IN_USE", "the same coins can't back a second sale");
   const others = (await userNode.utxos(uKey)).filter(c => !o.sel.some(x => x.txid === c.txid && x.vout === c.vout));
