@@ -171,6 +171,7 @@ Then the usual release (RELEASING.md): commit, `npm run release:ipfs`, pin,
   double-spent instant sale (instant sales stop by themselves at 30 USDC of losses).
 - Deepen the pool (no site release needed): send the USDC and CSD to the bot, stop it,
   `npx tsx scripts/market-maker.ts --top-up <USDC>` (prints the CSD that keeps the
-  price), rerun with `--yes`, start it. The CSD is split into coins on its own.
+  price), rerun with `--yes`, start it. Send the CSD as a few coins rather than one
+  (the bot pays buyers from separate coins, so several buys can go out in one block).
 - If CSD's difficulty falls below half of the release's reference, buys stop
   working until a release with a new reference.
