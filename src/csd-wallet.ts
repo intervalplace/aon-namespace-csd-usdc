@@ -191,10 +191,12 @@ export function csdNode(base: string, fetchImpl: typeof fetch = fetch) {
     async tip(): Promise<{ height: number; hash: Hex }> { const t = await get("/tip"); return { height: Number(t.height), hash: t.tip }; },
     async headerAt(height: number) { const b = await get(`/block/height/${height}`); return { hash: b.hash as Hex, ...b.header } as any; },
     async currentBits(): Promise<number> { const t = await this.tip(); return Number((await this.headerAt(t.height)).bits); },
-    async utxos(key: CsdKey): Promise<CsdUtxo[]> {
-      const r = await get(`/utxos/${addrHex(key.addr20)}?available=true`); // skips coins already spent in the mempool
-      return (r.utxos ?? []).map((u: any) => ({ txid: u.txid, vout: Number(u.vout), value: BigInt(u.value), key }));
+    // Confirmed coins at an address, minus those already spent in the node's mempool
+    async utxosAt(addr20: Hex): Promise<{ txid: Hex; vout: number; value: bigint }[]> {
+      const r = await get(`/utxos/${addrHex(addr20)}?available=true`);
+      return (r.utxos ?? []).map((u: any) => ({ txid: String(u.txid).toLowerCase() as Hex, vout: Number(u.vout), value: BigInt(u.value) }));
     },
+    async utxos(key: CsdKey): Promise<CsdUtxo[]> { return (await this.utxosAt(key.addr20)).map(u => ({ ...u, key })); },
     async activity(addr20: Hex, limit = 50) { return (await get(`/address/${addrHex(addr20)}/activity?limit=${limit}`)).activity ?? []; },
     async tx(txid: Hex) { return get(`/tx/${txid}`); },
     async submit(tx: CsdTx): Promise<Hex> {
