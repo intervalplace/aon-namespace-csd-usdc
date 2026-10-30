@@ -81,6 +81,8 @@ export async function startFakeCsdNode({ port, bits = 0x207fffff, clock = () => 
     blocks.push(block);
     return block;
   }
+  // Test helper: a transaction disappears from the mempool (held up somewhere)
+  function drop(txid) { const tx = mempool.get(txid); if (!tx) return; mempool.delete(txid); for (const i of tx.inputs) spentInMempool.delete(key(i.prevout.txid, i.prevout.vout)); }
   // Test helper: a conflicting spend gets mined instead (a double spend)
   function doubleSpend(tx) {
     for (const i of tx.inputs) { const id = spentInMempool.get(key(i.prevout.txid, i.prevout.vout)); if (id) mempool.delete(id); }
@@ -118,5 +120,5 @@ export async function startFakeCsdNode({ port, bits = 0x207fffff, clock = () => 
   });
   await new Promise(r => server.listen(port, "127.0.0.1", r));
   mine(); // genesis
-  return { url: `http://127.0.0.1:${port}`, mine, doubleSpend, submit, mempool, utxos, blocks, close: () => new Promise(r => server.close(r)), txToNodeJson };
+  return { url: `http://127.0.0.1:${port}`, mine, doubleSpend, drop, submit, mempool, utxos, blocks, close: () => new Promise(r => server.close(r)), txToNodeJson };
 }

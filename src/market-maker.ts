@@ -32,7 +32,7 @@ import {
 import { privateKeyToAccount, nonceManager } from "viem/accounts";
 import {
   csdNode, deriveCsdWallet, buildPayment, csdTxid, csdAddressProof, addr20ToBytes32, bitsToTarget, bytesToHex, hash160,
-  suggestedMaxTarget, txToNodeJson, txFromNodeJson, type CsdKey, type CsdTx, type CsdUtxo,
+  suggestedMaxTarget, txToNodeJson, txFromNodeJson, csdSaleRequestDigest, csdSignerAddress, type CsdKey, type CsdTx, type CsdUtxo,
 } from "./csd-wallet.js";
 import { settlementAbi, authTuple, spvProofTuple } from "./executors/evmCsdUsdcSettlement.js";
 import { csdUsdcNamespace, EARLY_RELEASE_TYPES } from "./namespace.js";
@@ -55,13 +55,16 @@ export type MarketMakerConfig = {
   maxInstantPerRecipientUsdc?: bigint; // default 30 USDC per hour per USDC recipient
   maxLossUsdc?: bigint;         // default 30 USDC: past this total loss, no more instant releases
   minUserCsdFee?: bigint;       // default 1000 base units: a seller's payment must pay at least this fee
-  buyConfirmations?: [number, number];  // accepted range for users' buys; default [3, 20]
+  buyConfirmations?: [number, number];  // accepted range for users' buys; default [10, 30]
   sellConfirmations?: number;   // what the bot signs when it buys; default 20 (it releases early anyway)
   safeConfirmations?: number;   // when a trusted payment stops counting as exposure; default 3
   priceToleranceBps?: bigint;   // how far a signed price may lag the pool; default 50 (0.5%)
   sellPayWindowSecs?: number;   // a seller must pay within this long of the lock; default 180
   maxOpenUnpaid?: number;       // sells waiting for payment at once; default 3
-  maxUnpaidPerHour?: number;    // sells left unpaid in the last hour before sells pause; default 4
+  maxUnpaidPerHour?: number;    // sells left unpaid in the last hour before sells pause; default 2
+  maxUnpaidPerDay?: number;     // ... in the last day; default 10
+  coinBanSecs?: number;         // coins named in a sale left unpaid can't open another for this long; default 86400
+  maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
   inventoryPieces?: number;     // CSD is kept split into this many coins; default 20
   pollMs?: number;              // default 5000
   rebroadcastSecs?: number;     // resend a CSD payment not mined after this long; default 900
@@ -81,6 +84,7 @@ type Trade = {
   addressProof?: any; permit?: any;                         // buy: what the lock needs
   csdTxid?: Hex; csdTx?: any; csdSentAt?: number;           // buy: our payment; sell: the user's
   keyIndex?: number; csdAddr?: Hex; ip?: string;            // sell: our receiving key, who opened it
+  coins?: string[]; poolMoved?: boolean;                    // sell: the coins the seller will pay with ("txid:vout")
   payBy?: number; unpaidAt?: number; paidAt?: number;       // sell: payment deadline; when it lapsed
   releaseTx?: Hex; settleTx?: Hex; instant?: boolean; direct?: boolean; error?: string;
 };
@@ -106,8 +110,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   const C = {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
-    buyConfirmations: [3, 20] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 4,
+    buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20,
     inventoryPieces: 20, pollMs: 5000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -140,7 +144,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     .reduce((p, t) => afterBuy(p, BigInt(t.csdAmount), BigInt(t.poolUsdc)), pool());
   // Sale quotes count sales still waiting for payment, so simultaneous sellers get the curve's next
   // price rather than all the same one. (Buy quotes don't, so opening sales can't push them down.)
-  const sellQuotePool = (): Pool => Object.values(S.trades).filter(t => t.kind === "sell" && (t.status === "opening" || t.status === "open") && !t.unpaidAt)
+  const sellQuotePool = (): Pool => Object.values(S.trades).filter(t => t.kind === "sell" && !t.poolMoved
+      && ((t.status === "opening" || t.status === "open") && !t.unpaidAt || t.status === "paid" || t.status === "released"))
     .reduce((p, t) => afterSell(p, BigInt(t.csdAmount), BigInt(t.poolUsdc)), pool());
   const addLoss = (x: bigint, why: string) => { S.lossUsdc = String(BigInt(S.lossUsdc) + x); log(`[mm] LOSS ${Number(x) / 1e6} USDC: ${why}`); };
   // USDC already released for CSD payments that aren't confirmed yet
@@ -264,7 +269,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       return;
     }
     const r = t.lockTx ? await pub.getTransactionReceipt({ hash: t.lockTx }).catch(() => null) : null;
-    if (r || now() - t.createdAt > 600) { t.status = t.kind === "buy" ? "lock_failed" : "open_failed"; save(); log(`[mm] ${t.kind} ${t.authHash}: lock didn't happen; nothing sent`); }
+    const pending = !r && t.lockTx ? await pub.getTransaction({ hash: t.lockTx }).then(() => true, () => false) : false;
+    if (r || (!pending && now() - t.createdAt > 600)) { t.status = t.kind === "buy" ? "lock_failed" : "open_failed"; save(); log(`[mm] ${t.kind} ${t.authHash}: lock didn't happen; nothing sent`); }
   }
   async function publish(t: Trade) {
     if (!C.publishToAon) return;
@@ -275,11 +281,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   }
 
   // ── user buys CSD ─────────────────────────────────────────────────────────
-  async function buy(body: any) {
+  async function buy(body: any, ip: string) {
     const a = body?.authorization; if (!a) bad("MISSING_AUTHORIZATION");
     let auth: ReturnType<typeof authTuple>; try { auth = authTuple(a); } catch { return bad("BAD_AUTHORIZATION"); }
     const authHash = authHashOf(auth);
     if (S.trades[authHash]) return tradeView(S.trades[authHash]);
+    // One buy at a time per buyer and per client, with the USDC actually there: otherwise one
+    // balance could back many locks that all but one revert, at the bot's expense
+    if (Object.values(S.trades).some(t => t.kind === "buy" && t.status === "locking" && (t.auth.buyer.toLowerCase() === auth.buyer.toLowerCase() || t.ip === ip)))
+      throw new HttpError(429, "FINISH_YOUR_OTHER_BUY");
     const t0 = await chainNow();
     if (auth.sellerUsdcRecipient !== account.address) bad("NOT_FOR_THIS_MARKET_MAKER");
     if (auth.usdc !== usdc) bad("WRONG_TOKEN");
@@ -298,13 +308,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     let price: bigint; try { price = quoteBuy(quotePool(), auth.csdAmount); } catch (e: any) { return bad(e.message); }
     if (auth.usdcAmount * 10_000n < price * (10_000n - C.priceToleranceBps)) throw new HttpError(409, `PRICE_MOVED:${price}`);
     const proof = body.addressProof; if (!proof?.pubKey || !proof?.sig) bad("MISSING_ADDRESS_PROOF");
+    const buyerBal = await pub.readContract({ address: usdc, abi: ERC20, functionName: "balanceOf", args: [auth.buyer] });
+    if (buyerBal < auth.usdcAmount + auth.executorFeeAmount) bad("NOT_ENOUGH_USDC");
     const pending = Object.values(S.trades).filter(t => t.kind === "buy" && t.status === "locking").reduce((s, t) => s + BigInt(t.csdAmount) + CSD_FEE, 0n);
     pick(await spendable(), pending + auth.csdAmount + CSD_FEE); // enough CSD for this and the buys still locking
     const permit = body.permit ? { deadline: BigInt(body.permit.deadline), v: Number(body.permit.v), r: body.permit.r, s: body.permit.s } : undefined;
     const sig = body.signature as Hex;
     // Saved before sending, so a crash can't lose track of a lock
     const t: Trade = { kind: "buy", status: "locking", authHash, createdAt: now(), auth: strAuth(auth), authSig: sig,
-      csdAmount: String(auth.csdAmount), usdcAmount: String(auth.usdcAmount), poolUsdc: String(auth.usdcAmount) };
+      csdAmount: String(auth.csdAmount), usdcAmount: String(auth.usdcAmount), poolUsdc: String(auth.usdcAmount), ip };
     S.trades[authHash] = t; save();
     try {
       t.lockTx = permit ? await send("lockCsdUsdcAuthorizationWithPermit", [auth, sig, proof, permit]) : await send("lockCsdUsdcAuthorization", [auth, sig, proof]);
@@ -324,12 +336,35 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (waiting.some(t => t.ip === ip)) throw new HttpError(429, "FINISH_YOUR_OTHER_SALE");
     if (waiting.length >= C.maxOpenUnpaid) throw new HttpError(503, "BUSY_TRY_AGAIN_SHORTLY");
     const lapsed = sells.filter(t => t.unpaidAt);
-    if (lapsed.filter(t => t.unpaidAt! > now() - 3600).length >= C.maxUnpaidPerHour) throw new HttpError(503, "SELLS_PAUSED");
-    if (lapsed.filter(t => t.ip === ip && t.unpaidAt! > now() - 86400).length >= 2) throw new HttpError(429, "TOO_MANY_UNPAID_SALES");
+    if (lapsed.filter(t => t.unpaidAt! > now() - 3600).length >= C.maxUnpaidPerHour
+      || lapsed.filter(t => t.unpaidAt! > now() - 86400).length >= C.maxUnpaidPerDay) throw new HttpError(503, "SELLS_PAUSED");
+  }
+  // The coins a sale request names: owned by its signers, confirmed, not spent in the mempool,
+  // not backing another sale, and not from a sale left unpaid recently
+  async function checkSaleCoins(body: any, csd: bigint, recipient: Hex): Promise<string[]> {
+    const coins = Array.isArray(body.coins) ? body.coins.map((c: any) => ({ txid: String(c?.txid ?? "").toLowerCase() as Hex, vout: Number(c?.vout) })) : [];
+    if (!coins.length || coins.length > 50 || coins.some((c: any) => !/^0x[0-9a-f]{64}$/.test(c.txid) || !Number.isSafeInteger(c.vout) || c.vout < 0)) bad("NAME_YOUR_COINS");
+    const validUntil = Number(body.validUntil);
+    if (!(validUntil >= now() && validUntil <= now() + 600)) bad("REQUEST_EXPIRED");
+    const ids = coins.map((c: any) => `${c.txid}:${c.vout}`);
+    if (new Set(ids).size !== ids.length) bad("NAME_YOUR_COINS");
+    const digest = csdSaleRequestDigest({ csdAmount: csd, usdcRecipient: recipient, validUntil, coins });
+    const signers = new Set((Array.isArray(body.proofs) ? body.proofs : []).slice(0, 10).map((p: any) => csdSignerAddress(digest, p?.sig)).filter(Boolean) as Hex[]);
+    let total = 0n; const covered = new Set<string>();
+    for (const owner of signers) for (const u of await node.utxosAt(owner)) { const id = `${u.txid}:${u.vout}`; if (ids.includes(id) && !covered.has(id)) { covered.add(id); total += u.value; } }
+    if (covered.size !== ids.length) bad("COINS_NOT_YOURS_OR_SPENT");
+    if (total < csd + C.minUserCsdFee) bad("NOT_ENOUGH_COINS");
+    for (const t of Object.values(S.trades)) {
+      if (t.kind !== "sell" || !t.coins?.some(c => ids.includes(c))) continue;
+      if (t.unpaidAt && t.unpaidAt > now() - C.coinBanSecs) throw new HttpError(429, "COINS_FROM_AN_UNPAID_SALE");
+      if (!t.unpaidAt && ["opening", "open", "paid"].includes(t.status)) throw new HttpError(409, "COINS_IN_USE");
+    }
+    return ids;
   }
   async function sellOpen(body: any, ip: string) {
     let csd: bigint, recipient: Hex, minOut: bigint;
     try { csd = BigInt(body.csdAmount); recipient = getAddress(body.usdcRecipient); minOut = BigInt(body.minUsdcOut ?? 0); } catch { return bad("BAD_REQUEST"); }
+    const coins = await checkSaleCoins(body, csd, recipient);
     sellOpenLimits(ip);
     let out: bigint; try { out = quoteSell(sellQuotePool(), csd); } catch (e: any) { return bad(e.message); }
     const usdcAmount = out - C.feeUsdc;
@@ -342,11 +377,11 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     // Many confirmations: the bot releases early anyway, and it makes faking a proof against its own locks expensive
     const auth = authTuple({ buyer: account.address, sellerUsdcRecipient: recipient, sellerCsdScriptHash: addr20ToBytes32(k.addr20), csdGenesisHash: C.csdGenesis,
       tradeIntentHash: keccak256(toHex("covenant market maker: sell")), csdAmount: csd, usdc, usdcAmount, minConfirmations: C.sellConfirmations,
-      csdMaxTarget: signTarget(bits), executorFeeAmount: 0n, validAfter: t0 - 60, validBefore: t0 + 4 * 3600, nonce: toHex(randomBytes(32)) });
+      csdMaxTarget: bitsToTarget(bits), executorFeeAmount: 0n, validAfter: t0 - 60, validBefore: t0 + 4 * 3600, nonce: toHex(randomBytes(32)) });
     const authHash = authHashOf(auth);
     const sig = await account.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth as any });
     const t: Trade = { kind: "sell", status: "opening", authHash, createdAt: now(), auth: strAuth(auth), authSig: sig,
-      csdAmount: String(csd), usdcAmount: String(usdcAmount), poolUsdc: String(out), keyIndex, csdAddr: k.addr20, ip };
+      csdAmount: String(csd), usdcAmount: String(usdcAmount), poolUsdc: String(out), keyIndex, csdAddr: k.addr20, ip, coins };
     S.trades[authHash] = t; save();
     try { t.lockTx = await send("lockCsdUsdcAuthorization", [auth, sig, csdAddressProof(k, authHash)]); }
     catch (e: any) { delete S.trades[authHash]; save(); return bad(`LOCK_REJECTED:${e.shortMessage ?? e.message}`); }
@@ -374,6 +409,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     }
     const outSum = tx.outputs.reduce((s, o) => s + o.value, 0n);
     if (inSum - outSum < C.minUserCsdFee) bad("CSD_FEE_TOO_LOW");
+    if (t.coins && !t.coins.every(c => seen.has(c))) bad("PAY_WITH_THE_COINS_YOU_NAMED");
   }
   // Instant only within the limits; otherwise the USDC is released after one CSD block
   function instantAllowed(t: Trade) {
@@ -391,18 +427,17 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (Number(t.lockedUntil) - (await chainNow()) < 600) bad("TRADE_EXPIRING");
     let tx: CsdTx; try { tx = txFromNodeJson(body.tx); } catch { return bad("BAD_CSD_TX"); }
     const txid = csdTxid(tx);
-    // One payment may cover several trades; if we already checked and broadcast it for another, it's fine
-    const ours = Object.values(S.trades).some(o => o.kind === "sell" && o.csdTxid === txid);
-    if (!ours) {
-      await checkUserPayment(t, tx);
-      try { await broadcast(tx); } catch (e: any) { return bad(`CSD_TX_REJECTED:${e.message}`); }
-    } else {
-      const paid = tx.outputs.filter(o => o.addr20 === t.csdAddr).reduce((s, o) => s + o.value, 0n);
-      if (paid < BigInt(t.csdAmount)) bad("CSD_PAYMENT_TOO_SMALL");
+    // One payment, one sale: a payment can't be checked once and then reused after it's been double-spent
+    if (Object.values(S.trades).some(o => o.kind === "sell" && o.csdTxid === txid)) bad("PAYMENT_ALREADY_USED");
+    await checkUserPayment(t, tx);
+    try { await broadcast(tx); } catch (e: any) { return bad(`CSD_TX_REJECTED:${e.message}`); }
+    // The pool moves once the payment is in a block (the loop), not now: a double-spent
+    // payment then never moves the price
+    t.csdTxid = txid; t.csdTx = txToNodeJson(tx); t.csdSentAt = now(); t.paidAt = now(); t.status = "paid"; save();
+    if (instantAllowed(t)) {
+      t.instant = true; save();
+      try { await release(t); } catch (e: any) { log(`[mm] sell ${t.authHash}: release failed, will retry: ${e.shortMessage ?? e.message}`); }
     }
-    t.csdTxid = txid; t.csdTx = txToNodeJson(tx); t.csdSentAt = now(); t.paidAt = now(); t.status = "paid";
-    setPool(afterSell(pool(), BigInt(t.csdAmount), BigInt(t.poolUsdc))); save();
-    if (instantAllowed(t)) { t.instant = true; await release(t); }
     log(`[mm] sell ${t.authHash}: user paid ${txid}${t.instant ? ", released instantly" : ", releasing after 1 CSD block"}`);
     return tradeView(t);
   }
@@ -411,9 +446,12 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const [locked, fin] = await Promise.all([view("usdcLocked", t.authHash), view("finalizedAuthorization", t.authHash)]);
     if (fin) { t.status = "done"; save(); return; } // the seller settled it themselves
     if (!locked) {
-      // Our lock was refunded (anyone may, once it expires) after the seller paid: pay them directly
+      // Our lock was refunded (anyone may, once it expires) after the seller paid: pay them directly.
+      // Marked first, so a crash mid-way can never pay twice (it's then left for the operator to check).
+      if (t.direct) { log(`[mm] sell ${t.authHash}: a direct payment may already have been sent; check ${t.auth.sellerUsdcRecipient} by hand`); return; }
+      t.direct = true; save();
       t.releaseTx = await wallet.writeContract({ address: usdc, abi: ERC20, functionName: "transfer", args: [getAddress(t.auth.sellerUsdcRecipient), BigInt(t.usdcAmount)] });
-      t.direct = true; t.status = "released"; save();
+      t.status = "released"; save();
       log(`[mm] sell ${t.authHash}: lock was refunded; paid the seller directly (${t.releaseTx})`);
       return;
     }
@@ -447,7 +485,13 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const tNow = await chainNow();
     await syncBlocks();
     for (const t of Object.values(S.trades)) {
-      if (FINAL.has(t.status)) continue;
+      if (FINAL.has(t.status)) {
+        // A lock that looked failed but got mined after all (someone rebroadcast it): honour it
+        if (t.kind === "buy" && t.status === "lock_failed" && now() - t.createdAt < 3 * 3600 && await view("usdcLocked", t.authHash).catch(() => false)) {
+          t.status = "locking"; await checkLock(t);
+        }
+        continue;
+      }
       try {
         if (t.status === "locking" || t.status === "opening") {
           const r = t.lockTx ? await pub.getTransactionReceipt({ hash: t.lockTx }).catch(() => null) : null;
@@ -465,11 +509,25 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
           if (!(await view("usdcLocked", t.authHash))) {
             t.status = "refunded"; setPool({ ...pool(), usdc: pool().usdc - BigInt(t.poolUsdc) });
             addLoss(BigInt(t.usdcAmount), `buy ${t.authHash} refunded before settlement`); save();
+          } else if (tNow > Number(t.lockedUntil) + 30) {
+            // Couldn't prove our payment in time: refund the buyer so their USDC doesn't sit there
+            await send("refundExpiredLock", [authTuple(t.auth)]);
           } else await settleBuy(t);
         }
         if (t.kind === "sell") {
           if (t.status === "open" && !t.unpaidAt && now() > (t.payBy ?? 0)) { t.unpaidAt = now(); save(); }
+          // The pool counts the CSD once it's in a block
+          if ((t.status === "paid" || t.status === "released") && !t.poolMoved && confirmations(t.csdTxid!) >= 1) {
+            t.poolMoved = true; setPool(afterSell(pool(), BigInt(t.csdAmount), BigInt(t.poolUsdc))); save();
+          }
           if (t.status === "paid" && confirmations(t.csdTxid!) >= 1) await release(t);
+          // Paid but never mined: once the lock expires, take the USDC back (if the payment
+          // turns up later, release() pays the seller directly); give up after a day
+          if (t.status === "paid" && confirmations(t.csdTxid!) === 0) {
+            if (now() - (t.csdSentAt ?? 0) > C.rebroadcastSecs) { try { await broadcast(txFromNodeJson(t.csdTx)); } catch {} t.csdSentAt = now(); save(); }
+            if (tNow > Number(t.lockedUntil) + 30 && await view("usdcLocked", t.authHash)) await send("refundExpiredLock", [authTuple(t.auth)]);
+            else if (tNow > Number(t.lockedUntil) + 86400 && !(await mined(t.csdTxid!, true))) { t.status = "expired"; save(); }
+          }
           if (t.status === "released" && t.releaseTx) {
             const r = await pub.getTransactionReceipt({ hash: t.releaseTx }).catch(() => null);
             if (r?.status === "reverted") { log(`[mm] release ${t.releaseTx} reverted; retrying`); t.status = "paid"; t.releaseTx = undefined; save(); }
@@ -481,7 +539,11 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
               try { await broadcast(txFromNodeJson(t.csdTx)); t.csdSentAt = now(); save(); }
               catch (e: any) {
                 if (await mined(t.csdTxid!, true)) { t.status = "done"; save(); }
-                else if (explicitlyRejected(e)) { t.status = "reversed"; addLoss(BigInt(t.usdcAmount), `sell ${t.authHash}: payment ${t.csdTxid} was double-spent (${e.message})`); save(); }
+                else if (explicitlyRejected(e)) {
+                  // The USDC is gone and the CSD never came: the pool loses the USDC
+                  t.status = "reversed"; setPool({ ...pool(), usdc: pool().usdc - BigInt(t.poolUsdc) });
+                  addLoss(BigInt(t.usdcAmount), `sell ${t.authHash}: payment ${t.csdTxid} was double-spent (${e.message})`); save();
+                }
               }
             }
           }
@@ -538,20 +600,36 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const xff = C.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",").map(s => s.trim()).filter(Boolean).at(-1) : undefined;
     return xff || req.socket.remoteAddress || "?";
   };
+  const hits = new Map<string, number[]>();
+  function limitRate(ip: string) {
+    const t = Date.now(), h = (hits.get(ip) ?? []).filter(x => x > t - 60_000);
+    if (h.length >= C.maxRequestsPerMinute) throw new HttpError(429, "SLOW_DOWN");
+    h.push(t); hits.set(ip, h);
+    if (hits.size > 10_000) hits.clear();
+  }
   async function route(req: http.IncomingMessage, body: any): Promise<any> {
     const u = new URL(req.url ?? "/", "http://x"), p = u.pathname, m = req.method;
     if (m === "GET" && p === "/api/market") return market();
     if (m === "GET" && p.startsWith("/api/trade/")) { const t = S.trades[p.slice(11)]; if (!t) throw new HttpError(404, "NO_SUCH_TRADE"); return tradeView(t); }
-    if (m === "POST" && p === "/api/buy") return serial(() => buy(body));
-    if (m === "POST" && p === "/api/sell/open") { const ip = clientIp(req); return serial(() => sellOpen(body, ip)); }
-    if (m === "POST" && p === "/api/sell/pay") return serial(() => sellPay(body));
+    if (m === "POST" && (p === "/api/buy" || p.startsWith("/api/sell/"))) {
+      const ip = clientIp(req);
+      limitRate(ip);
+      if (p === "/api/buy") return serial(() => buy(body, ip));
+      if (p === "/api/sell/open") return serial(() => sellOpen(body, ip));
+      if (p === "/api/sell/pay") return serial(() => sellPay(body));
+    }
     // CSD node, for the in-site wallet
     let g: RegExpMatchArray | null;
     if (m === "GET" && p === "/api/csd/tip") return proxy("/tip");
     if (m === "GET" && (g = p.match(/^\/api\/csd\/utxos\/([0-9a-fA-Fx]+)$/)) && HEX20.test(g[1])) return proxy(`/utxos/${g[1].replace(/^0x/, "")}?available=true`);
     if (m === "GET" && (g = p.match(/^\/api\/csd\/address\/([0-9a-fA-Fx]+)\/activity$/)) && HEX20.test(g[1])) return proxy(`/address/${g[1].replace(/^0x/, "")}/activity?limit=50`);
     if (m === "GET" && (g = p.match(/^\/api\/csd\/block\/height\/(\d{1,10})$/))) return proxy(`/block/height/${g[1]}`);
-    if (m === "GET" && (g = p.match(/^\/api\/csd\/proof\/tx\/(0x[0-9a-fA-F]{64})$/)) && HEX32.test(g[1])) return proofFor(g[1].toLowerCase());
+    if (m === "GET" && (g = p.match(/^\/api\/csd\/proof\/tx\/(0x[0-9a-fA-F]{64})$/))) {
+      // Only for sales' payments (for claiming one yourself): each lookup scans the chain on the node
+      const id = g[1].toLowerCase();
+      if (!Object.values(S.trades).some(t => t.kind === "sell" && t.csdTxid?.toLowerCase() === id)) throw new HttpError(404, "NOT_A_SALE_PAYMENT");
+      return proofFor(id);
+    }
     if (m === "POST" && p === "/api/csd/tx/submit") { let tx: CsdTx; try { tx = txFromNodeJson(body?.tx); } catch { return bad("BAD_CSD_TX"); }
       return proxy("/tx/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tx: txToNodeJson(tx) }) }); }
     throw new HttpError(404, "NOT_FOUND");

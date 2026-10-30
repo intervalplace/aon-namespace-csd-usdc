@@ -31,7 +31,8 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
    checks the contract, not its own transaction: if someone else submitted the
    same lock first it still sends; if the lock never happened it sends nothing.
    The permit lasts 5 minutes, so a signed buy can't be used later.
-3. After the user's chosen confirmations (3–20), the bot proves its payment
+3. After the user's chosen confirmations (10–30; the site uses 20, signed at
+   the live CSD difficulty so a faked proof costs more than the trade), the bot proves its payment
    with `settleCsdUsdc` and receives the USDC. If it never does, the user's
    USDC is refunded. **The user takes no risk**; only the bot waits.
 
@@ -40,10 +41,13 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
 1. `POST /api/sell/open`: the bot locks its USDC for the trade, against a fresh
    CSD address of its own (with its own address proof), requiring 20
    confirmations to prove a payment, which makes faking one expensive (it
-   releases early anyway). The price is fixed at this point but the pool only
-   moves once the CSD is paid, and the seller has 3 minutes to pay. Each client
-   can have one sale waiting, at most 3 wait at once, and if 4 go unpaid in an
-   hour sales pause, since each unpaid sale costs the bot two transactions.
+   releases early anyway). The seller names the exact confirmed coins they'll
+   pay with and signs for them with their keys; those coins can't back another
+   sale meanwhile, and if the sale is left unpaid they can't open one for a day.
+   The price is fixed at this point, the seller has 3 minutes to pay, and the
+   pool only moves once the payment is in a CSD block. At most 3 sales wait at
+   once, one per client, and if 2 go unpaid in an hour (or 10 in a day) sales
+   pause, since each unpaid sale costs the bot two transactions.
 2. The site recomputes the trade hash from the returned authorization and
    checks on-chain that the USDC is locked, paying the user, for this amount.
 3. The in-site wallet signs the CSD payment and hands it to the bot

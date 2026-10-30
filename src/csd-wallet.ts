@@ -167,6 +167,29 @@ export function csdAddressProof(key: CsdKey, authHash: Hex): { pubKey: Hex; sig:
   const s = secp256k1.sign(csdOwnershipDigest(authHash), key.priv, { lowS: true });
   return { pubKey: bytesToHex(key.pub64), sig: bytesToHex(concat(s.toCompactRawBytes(), new Uint8Array([27 + s.recovery]))) };
 }
+// A sale request: the seller names the exact coins they'll pay with and signs
+// for them with the key that owns them (one signature per owning address), so
+// opening a sale costs the opener real, confirmed coins.
+export type CsdCoinRef = { txid: Hex; vout: number };
+export function csdSaleRequestDigest(r: { csdAmount: bigint; usdcRecipient: string; validUntil: number; coins: CsdCoinRef[] }): Bytes {
+  const coins = r.coins.map(c => `${c.txid.toLowerCase()}:${c.vout}`).join(",");
+  return keccak_256(utf8(`covenant.market CSD sale request v1|${r.csdAmount}|${r.usdcRecipient.toLowerCase()}|${r.validUntil}|${coins}`));
+}
+// Signs any 32-byte digest in the same format as csdAddressProof
+export function csdSignDigest(key: CsdKey, digest: Bytes): { pubKey: Hex; sig: Hex } {
+  const s = secp256k1.sign(digest, key.priv, { lowS: true });
+  return { pubKey: bytesToHex(key.pub64), sig: bytesToHex(concat(s.toCompactRawBytes(), new Uint8Array([27 + s.recovery]))) };
+}
+// The CSD address that signed `digest`, or null
+export function csdSignerAddress(digest: Bytes, sig: Hex): Hex | null {
+  try {
+    const b = hexToBytes(sig); if (b.length !== 65 || (b[64] !== 27 && b[64] !== 28)) return null;
+    const s = secp256k1.Signature.fromCompact(b.slice(0, 64)); if (s.hasHighS()) return null;
+    const pub = s.addRecoveryBit(b[64] - 27).recoverPublicKey(digest).toRawBytes(true);
+    return bytesToHex(hash160(pub));
+  } catch { return null; }
+}
+
 // The address as the contract's bytes32 sellerCsdScriptHash (left-aligned)
 export const addr20ToBytes32 = (addr20: Hex): Hex => (addr20 + "00".repeat(12)) as Hex;
 
