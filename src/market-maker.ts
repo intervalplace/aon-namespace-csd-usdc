@@ -85,7 +85,8 @@ type Trade = {
   csdTxid?: Hex; csdTx?: any; csdSentAt?: number;           // buy: our payment; sell: the user's
   keyIndex?: number; csdAddr?: Hex; ip?: string;            // sell: our receiving key, who opened it
   coins?: string[]; poolMoved?: boolean;                    // sell: the coins the seller will pay with ("txid:vout")
-  owners?: string[]; swept?: boolean;                       // sell: the addresses that signed for them; our key emptied
+  owners?: string[]; swept?: boolean; sweepTxid?: Hex;      // sell: the addresses that signed for them; our key emptied
+  trusted?: boolean;                                        // sell: released before its payment had safeConfirmations
   payBy?: number; unpaidAt?: number; paidAt?: number;       // sell: payment deadline; when it lapsed
   releaseTx?: Hex; settleTx?: Hex; instant?: boolean; direct?: boolean; error?: string;
 };
@@ -217,11 +218,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   async function sweepFinished() {
     for (const t of Object.values(S.trades)) {
       if (t.kind !== "sell" || t.status !== "done" || t.swept || t.keyIndex === undefined) continue;
+      if (t.sweepTxid && confirmations(t.sweepTxid) > 0) { t.swept = true; save(); continue; }
       const k = key(t.keyIndex), coins = await node.utxos(k);
-      if (!coins.length) { t.swept = true; save(); continue; } // spent already (or by the sweep, now in the mempool)
+      if (!coins.length) { if (!t.sweepTxid) { t.swept = true; save(); } continue; } // spent by a trade, or the sweep is waiting for a block
       const total = coins.reduce((s, c) => s + c.value, 0n);
       if (total <= CSD_FEE) { t.swept = true; save(); continue; }
+      // (coins visible again: the sweep was dropped, so it's made again)
       const p = buildPayment({ utxos: coins, to: [{ value: total - CSD_FEE, addr20: inventory.addr20 }], change: inventory.addr20, fee: CSD_FEE });
+      t.sweepTxid = p.txid; save();
       await broadcast(p.tx);
     }
   }
@@ -351,8 +355,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const sells = Object.values(S.trades).filter(t => t.kind === "sell");
     // Waiting: not paid yet, or paid but the payment isn't in a block (it may never be)
     const waiting = sells.filter(t => ((t.status === "opening" || t.status === "open") && !t.unpaidAt) || (t.status === "paid" && confirmations(t.csdTxid!) === 0));
-    // Sellers with a completed sale in the last 30 days can sell even while sales are paused
-    const proven = owners.length > 0 && owners.every(o => sells.some(t => t.status === "done" && (t.paidAt ?? 0) > now() - 30 * 86400 && t.owners?.includes(o)));
+    const mine = (t: Trade) => !!t.owners?.some(o => owners.includes(o));
+    // One waiting sale per address; an address that left two sales unpaid in a day waits a day
+    if (waiting.some(mine)) throw new HttpError(429, "FINISH_YOUR_OTHER_SALE");
+    if (sells.filter(t => mine(t) && t.unpaidAt && t.unpaidAt > now() - 86400).length >= 2) throw new HttpError(429, "TOO_MANY_UNPAID_SALES");
+    // Sellers with a completed sale in the last 30 days, and none left unpaid in the last day,
+    // can sell even while sales are paused
+    const proven = owners.length > 0 && !sells.some(t => mine(t) && t.unpaidAt && t.unpaidAt > now() - 86400)
+      && owners.every(o => sells.some(t => t.status === "done" && (t.paidAt ?? 0) > now() - 30 * 86400 && t.owners?.includes(o)));
     if (waiting.some(t => t.ip === ip)) throw new HttpError(429, "FINISH_YOUR_OTHER_SALE");
     if (waiting.length >= C.maxOpenUnpaid) throw new HttpError(503, "BUSY_TRY_AGAIN_SHORTLY");
     const lapsed = sells.filter(t => t.unpaidAt);
@@ -442,7 +452,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   function earlyReleaseAllowed(t: Trade) {
     if (confirmations(t.csdTxid!) >= C.safeConfirmations) return true;
     const amt = BigInt(t.usdcAmount), to = t.auth.sellerUsdcRecipient.toLowerCase();
-    const recent = Object.values(S.trades).filter(o => o.kind === "sell" && o.instant && o.auth.sellerUsdcRecipient.toLowerCase() === to && (o.paidAt ?? 0) > now() - 3600)
+    const recent = Object.values(S.trades).filter(o => o.kind === "sell" && o.trusted && o.auth.sellerUsdcRecipient.toLowerCase() === to && (o.paidAt ?? 0) > now() - 3600)
       .reduce((s, o) => s + BigInt(o.usdcAmount), 0n);
     return BigInt(S.lossUsdc) < C.maxLossUsdc && exposure() + amt <= C.maxUnconfirmedUsdc && recent + amt <= C.maxInstantPerRecipientUsdc;
   }
@@ -486,6 +496,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const msg = { authHash: t.authHash, sellerUsdcRecipient: getAddress(t.auth.sellerUsdcRecipient), usdcAmount: BigInt(t.usdcAmount),
       csdTxid: t.csdTxid!, lockedAt: BigInt(t.lockedAt!), deadline: BigInt((await chainNow()) + 900) };
     const sig = await account.signTypedData({ domain, types: EARLY_RELEASE_TYPES as any, primaryType: "CsdUsdcEarlyRelease", message: msg as any });
+    if (confirmations(t.csdTxid!) < C.safeConfirmations) { t.trusted = true; save(); }
     t.releaseTx = await send("releaseEarly", [authTuple(t.auth), msg, sig]);
     t.status = "released"; save();
   }
@@ -629,14 +640,19 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   }
   const clientIp = (req: http.IncomingMessage) => {
     const xff = C.trustProxy ? String(req.headers["x-forwarded-for"] ?? "").split(",").map(s => s.trim()).filter(Boolean).at(-1) : undefined;
-    return xff || req.socket.remoteAddress || "?";
+    const ip = (xff || req.socket.remoteAddress || "?").replace(/^::ffff:/, "");
+    // IPv6 clients are grouped by /64: one connection usually has a whole /64 to rotate through
+    if (!ip.includes(":")) return ip;
+    const [head, tail] = ip.split("::"), h = head ? head.split(":") : [], t = tail !== undefined && tail ? tail.split(":") : [];
+    const full = tail === undefined ? h : [...h, ...Array(Math.max(0, 8 - h.length - t.length)).fill("0"), ...t];
+    return full.slice(0, 4).map(x => (x || "0").toLowerCase().replace(/^0+(?=.)/, "")).join(":") + "::/64";
   };
   const hits = new Map<string, number[]>();
   function limitRate(ip: string, max = C.maxRequestsPerMinute) {
     const t = Date.now(), h = (hits.get(ip) ?? []).filter(x => x > t - 60_000);
     if (h.length >= max) throw new HttpError(429, "SLOW_DOWN");
     h.push(t); hits.set(ip, h);
-    if (hits.size > 10_000) hits.clear();
+    while (hits.size > 10_000) hits.delete(hits.keys().next().value!); // oldest first
   }
   async function route(req: http.IncomingMessage, body: any): Promise<any> {
     const u = new URL(req.url ?? "/", "http://x"), p = u.pathname, m = req.method;
@@ -657,7 +673,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       const a = g[1].replace(/^0x/, "").toLowerCase(), c = utxoCache.get(a);
       if (c && Date.now() - c.at < 5000) return c.v;
       const v = await proxy(`/utxos/${a}?available=true`); utxoCache.set(a, { at: Date.now(), v });
-      if (utxoCache.size > 2000) utxoCache.clear();
+      while (utxoCache.size > 2000) utxoCache.delete(utxoCache.keys().next().value!);
       return v;
     }
     if (m === "GET" && (g = p.match(/^\/api\/csd\/block\/height\/(\d{1,10})$/))) return proxy(`/block/height/${g[1]}`);

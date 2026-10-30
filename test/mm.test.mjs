@@ -166,6 +166,9 @@ async function openSale(csdAmount, { ip, coins, signer = uKey, recipient = user.
 const payFor = (o, { from = o.sel, value = BigInt(o.csdAmount ?? 0), fee } = {}) =>
   buildPayment({ utxos: from, to: [{ value, addr20: o.csdAddress }], change: uKey.addr20, ...(fee !== undefined ? { fee } : {}) });
 
+// A seller address of its own, holding one fresh coin
+const fresh = async (i, csdAmt = 60n) => { const k = userCsd.key(i); await syncClock(); csd.mine({ rewardTo: k.addr20, reward: csdAmt * 100_000_000n }); return { signer: k, coins: await userNode.utxos(k) }; };
+
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
 { const csdAmount = 40n * 100_000_000n, quote = quoteSell(pool(), csdAmount) - 250_000n, mid0 = midPrice(pool()), m0ask = (await get("/market")).bestAsk;
@@ -202,8 +205,9 @@ let sold;
 
 console.log("\n[4] Over the instant limit, the bot waits for confirmations; one payment, one sale");
 { const a = await openSale(40n * 100_000_000n);
-  const b = await openSale(40n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => !a.sel.some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) });
-  check(a.http === 200 && b.http === 200, "two sales from different coins");
+  check((await openSale(40n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => !a.sel.some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) })).error === "FINISH_YOUR_OTHER_SALE", "one waiting sale per CSD address");
+  const b = await openSale(40n * 100_000_000n, await fresh(20));
+  check(a.http === 200 && b.http === 200, "two sales from different addresses");
   await until(() => tr(a.authHash).status === "open" && tr(b.authHash).status === "open");
   const pa = payFor(a);
   const ra = await post("/sell/pay", { authHash: a.authHash, tx: txToNodeJson(pa.tx) });
@@ -219,26 +223,28 @@ console.log("\n[4] Over the instant limit, the bot waits for confirmations; one 
 console.log("\n[5] Coins already spent, a payment too late, and a sale nobody pays for");
 { await mine(3); await mm.tick();
   const p0 = pool(); const m0 = await bal(mmEvm.address);
-  const o = await openSale(10n * 100_000_000n);
+  const o = await openSale(10n * 100_000_000n, await fresh(21));
   await until(() => tr(o.authHash).status === "open");
   const elsewhere = buildPayment({ utxos: o.sel, to: [{ value: 100_000_000n, addr20: "0x" + "cd".repeat(20) }], change: uKey.addr20 });
   csd.submit(elsewhere.tx); // the named coins get spent somewhere else
   check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o).tx) })).error === "CSD_COINS_NOT_AVAILABLE", "a payment from coins already spent in the mempool is refused");
   await mine(); await new Promise(r => setTimeout(r, 10_000));
-  const o2 = await openSale(10n * 100_000_000n);
+  const o2 = await openSale(10n * 100_000_000n, await fresh(22));
   check(o2.http === 200, "(meanwhile another sale opens fine)");
   await until(() => tr(o2.authHash).status === "open"); await mm.tick();
   check(tr(o.authHash).unpaidAt, "the first sale's payment window has passed");
   check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o, { from: await userNode.utxos(uKey) }).tx) })).error === "TOO_LATE_TO_PAY", "after the payment window the bot won't take the CSD (no free option on the price)");
   await new Promise(r => setTimeout(r, 10_000)); await mm.tick();
-  const banned = await openSale(10n * 100_000_000n, { coins: o2.sel.map(c => c) });
+  const banned = await openSale(10n * 100_000_000n, { signer: userCsd.key(22), coins: o2.sel });
   check(banned.error === "COINS_FROM_AN_UNPAID_SALE", "coins named in a sale left unpaid can't open another for a day");
   check(pool().usdc === p0.usdc && pool().csd === p0.csd, "unpaid sales never moved the pool");
   const newcomer = userCsd.key(9); await syncClock(); csd.mine({ rewardTo: newcomer.addr20, reward: 50n * 100_000_000n });
   check((await get("/market")).limits.sellsPaused === true && (await openSale(10n * 100_000_000n, { signer: newcomer, coins: await userNode.utxos(newcomer) })).error === "SELLS_PAUSED",
     "two unpaid sales in an hour pause selling for new sellers (each costs the bot two transactions)");
-  const keep = await openSale(10n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => ![...o.sel, ...o2.sel].some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) });
-  check(keep.http === 200, "a seller with completed sales can still sell while it's paused");
+  const keep = await openSale(10n * 100_000_000n);
+  check(keep.http === 200, "a seller with completed sales (and none left unpaid) can still sell while it's paused");
+  const o3 = await openSale(10n * 100_000_000n, { signer: userCsd.key(22), coins: (await userNode.utxos(userCsd.key(22))).filter(c => !o2.sel.some(x => x.txid === c.txid && x.vout === c.vout)) });
+  check(o3.error === "SELLS_PAUSED" || o3.error === "COINS_FROM_AN_UNPAID_SALE" || o3.error === "NOT_ENOUGH_COINS" || o3.http !== 200, "an address that left a sale unpaid gets no exemption");
   await until(() => tr(keep.authHash).status === "open");
   await post("/sell/pay", { authHash: keep.authHash, tx: txToNodeJson(payFor(keep).tx) });
   await rpc("evm_increaseTime", [120 * 60]); await rpc("evm_mine"); await mm.tick(); await mm.tick();
@@ -261,7 +267,6 @@ console.log("\n[6] Double spends: an instant one is a capped loss; one that wasn
   check(pool().csd === p0.csd && pool().usdc === p0.usdc - BigInt(tr(o.authHash).poolUsdc), "the pool counts the USDC as gone and no CSD as received");
   check((await get("/market")).limits.instantSells === false, "past the loss budget (1 USDC in this test) instant sales are off");
   check((await openSale(10n * 100_000_000n)).error === "ADDRESS_FROM_A_DOUBLE_SPEND", "the cheater's address can't open another sale for a day");
-  const fresh = async (i) => { const k = userCsd.key(i); await syncClock(); csd.mine({ rewardTo: k.addr20, reward: 60n * 100_000_000n }); return { signer: k, coins: await userNode.utxos(k) }; };
   // Not instant now: a double-spent payment leaves the pool (and so the price) untouched
   const d = await openSale(10n * 100_000_000n, await fresh(11));
   await until(() => tr(d.authHash).status === "open");
