@@ -32,7 +32,7 @@ import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
-  createPublicClient, createWalletClient, defineChain, getAddress, hashTypedData, http as viemHttp,
+  createPublicClient, createWalletClient, defineChain, getAddress, hashTypedData, http as viemHttp, recoverAddress,
   keccak256, maxUint256, toHex, type Hex,
 } from "viem";
 import { privateKeyToAccount, nonceManager } from "viem/accounts";
@@ -73,11 +73,13 @@ export type MarketMakerConfig = {
   maxUnpaidPerDay?: number;     // ... in the last day; default 10
   coinBanSecs?: number;         // coins named in a sale left unpaid can't open another for this long; default 86400
   maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
+  maxAonRequestsPerMinute?: number; // buys (and, separately, sale requests) handled per minute in all; default 60
+  lateLockSlackSecs?: number;    // a buy's lock may have this much less than its full window and still be paid; default 300
   inventoryPieces?: number;     // CSD is kept split into this many coins; default 20
   pollMs?: number;              // default 5000
   rebroadcastSecs?: number;     // resend a CSD payment not mined after this long; default 900
   nodeTimeoutMs?: number;       // default 10000
-  aonNodeUrl: string;           // the AON node the bot reads requests from and publishes to
+  aonNodeUrl: string;           // the AON node(s) the bot reads requests from and publishes to (comma-separated for several)
   watchMs?: number;             // how often AON is checked for new requests; default 1000
   log?: (...a: any[]) => void;
 };
@@ -94,6 +96,7 @@ type Trade = {
   csdTxid?: Hex; csdTx?: any; csdSentAt?: number;           // buy: our payment; sell: the user's
   keyIndex?: number; csdAddr?: Hex; ip?: string;            // sell: our receiving key; the client (signer) who opened it
   coins?: string[]; poolMoved?: boolean;                    // sell: the coins the seller will pay with ("txid:vout")
+  requestDigest?: Hex; lateLock?: boolean;                  // sell: the signed request it answers; buy: locked too late to pay against
   owners?: string[]; swept?: boolean; sweepTxid?: Hex;      // sell: the addresses that signed for them; our key emptied
   trusted?: boolean;                                        // sell: released before its payment had safeConfirmations
   request?: any; proofJson?: any;                           // sell: the seller's signed request; buy: the proof that settled it
@@ -127,7 +130,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonRequestsPerMinute: 60, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -297,6 +300,16 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (locked || fin) {
       t.lockedAt = String(await view("lockedAt", t.authHash)); t.lockedUntil = String(await view("lockedUntil", t.authHash));
       if (t.kind === "buy") {
+        // Only pay against a lock with (nearly) its whole window left. Anyone can submit a buyer's
+        // lock, so it may have been made long ago and be about to expire: CSD sent then could
+        // never be proven in time, and the buyer would get the USDC back as well.
+        const full = 600 + Number(t.auth.minConfirmations) * 300;
+        if (Number(t.lockedUntil) - (await chainNow()) < full - C.lateLockSlackSecs) {
+          t.status = "lock_failed"; t.lateLock = true;
+          S.rejectedBuys = { ...(S.rejectedBuys ?? {}), [t.authHash]: t.auth }; save();
+          log(`[mm] buy ${t.authHash}: locked too long ago to pay against; nothing sent (the USDC goes back once the lock expires)`);
+          return;
+        }
         t.status = "locked"; setPool(afterBuy(pool(), BigInt(t.csdAmount), BigInt(t.poolUsdc))); save();
         await sendBuyCsd(t);
         log(`[mm] buy ${t.authHash}: locked; sent ${Number(t.csdAmount) / 1e8} CSD (${t.csdTxid})`);
@@ -312,17 +325,34 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   //   sell: offer (bot), request (seller, signed with their CSD key) ← authorization (bot) ← release (bot) ← receipt
   // Objects queue up and are published in the background, so AON never slows a trade.
   const NS = "aon:csd-usdc";
-  const aonBase = C.aonNodeUrl.replace(/\/$/, "");
+  // Several nodes: requests may reach any of them first (browsers fail over between nodes)
+  const aonBases = C.aonNodeUrl.split(",").map(x => x.trim().replace(/\/$/, "")).filter(Boolean);
   async function aonPut(o: any) {
-    const r = await tfetch(`${aonBase}/v1/objects`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) });
-    const j = await r.json().catch(() => ({}));
-    if (!j.ok) throw new Error(j.error?.code ?? `AON_${r.status}`);
+    const errs: string[] = [];
+    const ok = (await Promise.all(aonBases.map(async b => {
+      try {
+        const r = await tfetch(`${b}/v1/objects`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) });
+        const j = await r.json().catch(() => ({}));
+        if (!j.ok) throw new Error(j.error?.code ?? `AON_${r.status}`);
+        return true;
+      } catch (e: any) { errs.push(e.message); return false; }
+    }))).some(Boolean);
+    if (!ok) throw new Error(errs.join("; "));
   }
+  // Objects referencing a hash, from every node (fails only if no node answers)
   async function aonInbound(hash: string): Promise<any[]> {
-    const r = await tfetch(`${aonBase}/v1/objects/${hash}/references`);
-    return (await r.json()).inbound ?? [];
+    const lists = await Promise.all(aonBases.map(b => tfetch(`${b}/v1/objects/${hash}/references`).then(r => r.json()).then(j => j.inbound ?? [], () => null)));
+    if (lists.every(l => l === null)) throw new Error("AON_UNREACHABLE");
+    const out = new Map<string, any>();
+    for (const l of lists) for (const o of l ?? []) if (o?.objectHash) out.set(String(o.objectHash).toLowerCase(), o);
+    return [...out.values()];
   }
-  const queueObject = (o: any) => { S.aonQueue = [...(S.aonQueue ?? []), o].slice(-500); save(); flushAon(); return o; };
+  // A full queue drops answers before receipts and offers
+  const queueObject = (o: any) => {
+    const q = [...(S.aonQueue ?? []), o];
+    while (q.length > 500) { const i = q.findIndex(x => x.objectType === "response"); q.splice(i >= 0 ? i : 0, 1); }
+    S.aonQueue = q; save(); flushAon(); return o;
+  };
   let flushing = false;
   async function flushAon() {
     if (flushing) return; flushing = true;
@@ -364,12 +394,18 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       t.aon = { ...t.aon, auth: o.objectHash }; save(); queueObject(o);
     } catch (e: any) { log(`[mm] AON authorization for ${t.authHash}: ${e.message}`); }
   }
-  function publishReceipt(t: Trade, extra: Record<string, unknown>) {
-    if (t.aon?.receipt) return;
-    const o = finalizeObject({ objectType: "receipt", schemaVersion: "1", namespace: NS, createdAt: Date.now(),
+  // Receipts are signed, so nobody else's "receipt" can pass for one
+  const receipting = new Set<string>();
+  async function publishReceipt(t: Trade, extra: Record<string, unknown>) {
+    if (t.aon?.receipt || receipting.has(t.authHash)) return;
+    receipting.add(t.authHash);
+    try { await publishReceiptNow(t, extra); } finally { receipting.delete(t.authHash); }
+  }
+  async function publishReceiptNow(t: Trade, extra: Record<string, unknown>) {
+    const o = await signed({ objectType: "receipt", schemaVersion: "1", namespace: NS, createdAt: Date.now(),
       references: ref(t.aon?.auth, t.aon?.proof, t.aon?.release, t.aon?.request),
       payload: { receiptType: "authorized_state_transition_completed", settlementContract: settlement, authHash: t.authHash,
-        csdTxid: t.csdTxid, csdAmount: t.csdAmount, usdcAmount: t.usdcAmount, buyer: t.auth.buyer, sellerUsdcRecipient: t.auth.sellerUsdcRecipient, ...extra } } as any);
+        csdTxid: t.csdTxid, csdAmount: t.csdAmount, usdcAmount: t.usdcAmount, buyer: t.auth.buyer, sellerUsdcRecipient: t.auth.sellerUsdcRecipient, ...extra } });
     t.aon = { ...t.aon, receipt: o.objectHash }; save(); queueObject(o);
   }
 
@@ -391,6 +427,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (conf < C.buyConfirmations[0] || conf > C.buyConfirmations[1]) bad("CONFIRMATIONS_OUT_OF_RANGE");
     if (Number(auth.validAfter) > t0) bad("NOT_YET_VALID");
     if (Number(auth.validBefore) < t0 + 600 + conf * 300 + 900) bad("VALID_BEFORE_TOO_SOON");
+    if (Number(auth.validBefore) > t0 + 86400) bad("VALID_BEFORE_TOO_LATE");
     if (auth.executorFeeAmount < C.feeUsdc) bad("FEE_TOO_LOW");
     if (auth.usdcAmount + auth.executorFeeAmount > C.maxTradeUsdc || auth.usdcAmount < C.minTradeUsdc) bad("TRADE_SIZE");
     // The difficulty the user signed must let real blocks count, or the bot could never prove the payment
@@ -422,7 +459,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     // The buyer's own published authorization is the graph's authorization
     t.aon = { offer, auth: aonObj?.objectHash }; save();
     if (!aonObj) publishAuth(t, ref(offer));
-    if (alreadyLocked) await checkLock(t); else watchLock(t);
+    if (alreadyLocked) { await checkLock(t); if (t.status === "lock_failed") throw new HttpError(409, "LOCK_TOO_OLD"); } else watchLock(t);
     log(`[mm] buy ${authHash}: ${Number(auth.csdAmount) / 1e8} CSD for ${Number(auth.usdcAmount) / 1e6} USDC, lock ${t.lockTx ?? "(already locked)"}`);
     return tradeView(t);
   }
@@ -451,6 +488,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   }
   // The coins a sale request names: owned by its signers, confirmed, not spent in the mempool,
   // not backing another sale, and not from a sale left unpaid recently
+  const saleDigest = (body: any, csd: bigint, recipient: Hex) => {
+    try { return bytesToHex(csdSaleRequestDigest({ csdAmount: csd, usdcRecipient: recipient, validUntil: Number(body.validUntil),
+      coins: body.coins.map((c: any) => ({ txid: String(c?.txid ?? "").toLowerCase() as Hex, vout: Number(c?.vout) })) })) as Hex; } catch { return undefined; }
+  };
   async function checkSaleCoins(body: any, csd: bigint, recipient: Hex): Promise<{ ids: string[]; owners: string[] }> {
     const coins = Array.isArray(body.coins) ? body.coins.map((c: any) => ({ txid: String(c?.txid ?? "").toLowerCase() as Hex, vout: Number(c?.vout) })) : [];
     if (!coins.length || coins.length > 50 || coins.some((c: any) => !/^0x[0-9a-f]{64}$/.test(c.txid) || !Number.isSafeInteger(c.vout) || c.vout < 0)) bad("NAME_YOUR_COINS");
@@ -480,6 +521,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   async function sellOpen(body: any, ip: string, aonObj?: any) {
     let csd: bigint, recipient: Hex, minOut: bigint;
     try { csd = BigInt(body.csdAmount); recipient = getAddress(body.usdcRecipient); minOut = BigInt(body.minUsdcOut ?? 0); } catch { return bad("BAD_REQUEST"); }
+    // A request answered once (or republished by someone else) gets the same sale back, never a second one
+    const requestDigest = saleDigest(body, csd, recipient);
+    const prior = requestDigest && Object.values(S.trades).find(t => t.kind === "sell" && t.requestDigest === requestDigest);
+    if (prior) return tradeView(prior);
     const { ids: coins, owners } = await checkSaleCoins(body, csd, recipient);
     sellOpenLimits(ip, owners);
     let out: bigint; try { out = quoteSell(sellQuotePool(), csd); } catch (e: any) { return bad(e.message); }
@@ -497,7 +542,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const authHash = authHashOf(auth);
     const sig = await account.signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: auth as any });
     const t: Trade = { kind: "sell", status: "opening", authHash, createdAt: now(), auth: strAuth(auth), authSig: sig,
-      csdAmount: String(csd), usdcAmount: String(usdcAmount), poolUsdc: String(out), keyIndex, csdAddr: k.addr20, ip, coins, owners };
+      csdAmount: String(csd), usdcAmount: String(usdcAmount), poolUsdc: String(out), keyIndex, csdAddr: k.addr20, ip, coins, owners, requestDigest };
     S.trades[authHash] = t; save();
     try { t.lockTx = await send("lockCsdUsdcAuthorization", [auth, sig, csdAddressProof(k, authHash)]); }
     catch (e: any) { delete S.trades[authHash]; save(); return bad(`LOCK_REJECTED:${e.shortMessage ?? e.message}`); }
@@ -515,6 +560,17 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // The seller's payment: confirmed coins (not already spent in the mempool),
   // a real fee, and enough paid to the trade's address
   async function checkUserPayment(t: Trade, tx: CsdTx) {
+    // Cheap checks first: it must spend exactly the coins named in the request, from the addresses
+    // that signed it, so a junk payment can't make the bot look up hundreds of addresses
+    if (t.coins) {
+      const ins = tx.inputs.map(i => `${i.prevout.txid.toLowerCase()}:${i.prevout.vout}`);
+      if (ins.length !== t.coins.length || new Set(ins).size !== ins.length || !ins.every(x => t.coins!.includes(x))) bad("PAY_WITH_THE_COINS_YOU_NAMED");
+      for (const i of tx.inputs) {
+        const sc = i.scriptSig;
+        if (sc.length !== 99 || sc[0] !== 64 || sc[65] !== 33) bad("BAD_CSD_TX");
+        if (t.owners && !t.owners.includes(bytesToHex(hash160(sc.slice(66))))) bad("PAY_WITH_THE_COINS_YOU_NAMED");
+      }
+    }
     const paid = tx.outputs.filter(o => o.addr20 === t.csdAddr).reduce((s, o) => s + o.value, 0n);
     if (paid < BigInt(t.csdAmount)) bad("CSD_PAYMENT_TOO_SMALL");
     const seen = new Set<string>(), coins = new Map<string, { txid: Hex; vout: number; value: bigint }[]>();
@@ -547,7 +603,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (t.csdTxid) return tradeView(t);
     if (t.status === "opening") { await checkLock(t); if (t.status === "opening") throw new HttpError(409, "LOCK_NOT_MINED_YET"); }
     if (t.status !== "open") bad(`TRADE_${t.status.toUpperCase()}`);
-    if (t.unpaidAt || now() > (t.payBy ?? 0)) bad("TOO_LATE_TO_PAY");
+    // On time if it reached AON in time (it may wait behind other objects to be processed)
+    if (t.unpaidAt || Math.min(now(), Number(body.arrivedAt ?? Infinity)) > (t.payBy ?? 0)) bad("TOO_LATE_TO_PAY");
     if (Number(t.lockedUntil) - (await chainNow()) < 600) bad("TRADE_EXPIRING");
     let tx: CsdTx; try { tx = txFromNodeJson(body.tx); } catch { return bad("BAD_CSD_TX"); }
     const txid = csdTxid(tx);
@@ -621,7 +678,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     for (const t of Object.values(S.trades)) {
       if (FINAL.has(t.status) && !(t.status === "done" && t.releaseTx && !t.aon?.receipt)) {
         // A lock that looked failed but got mined after all (someone rebroadcast it): honour it
-        if (t.kind === "buy" && t.status === "lock_failed" && now() - t.createdAt < 3 * 3600 && await view("usdcLocked", t.authHash).catch(() => false)) {
+        if (t.kind === "buy" && t.status === "lock_failed" && !t.lateLock && now() - t.createdAt < 3 * 3600 && await view("usdcLocked", t.authHash).catch(() => false)) {
           t.status = "locking"; await checkLock(t);
         }
         continue;
@@ -641,7 +698,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
                 const pr = finalizeObject({ objectType: "proof", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(t.aon?.auth),
                   payload: { proofType: "csd_payment", txid: t.csdTxid, minConfirmations: Number(t.auth.minConfirmations), proof: t.proofJson } } as any);
                 t.aon = { ...t.aon, proof: pr.objectHash }; t.proofJson = undefined; save(); queueObject(pr);
-                publishReceipt(t, { executionTx: t.settleTx, method: "settleCsdUsdc", executorFeeAmount: t.auth.executorFeeAmount });
+                await publishReceipt(t, { executionTx: t.settleTx, method: "settleCsdUsdc", executorFeeAmount: t.auth.executorFeeAmount });
               }
               continue;
             }
@@ -674,7 +731,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
           if ((t.status === "released" || t.status === "done") && t.releaseTx && !t.aon?.receipt) {
             const r = await pub.getTransactionReceipt({ hash: t.releaseTx }).catch(() => null);
             if (r?.status === "reverted") { log(`[mm] release ${t.releaseTx} reverted; retrying`); t.status = "paid"; t.releaseTx = undefined; save(); }
-            else if (r?.status === "success") publishReceipt(t, { executionTx: t.releaseTx, method: t.direct ? "direct_transfer" : "releaseEarly" });
+            else if (r?.status === "success") await publishReceipt(t, { executionTx: t.releaseTx, method: t.direct ? "direct_transfer" : "releaseEarly" });
           }
           if (t.status === "released") {
             const c = confirmations(t.csdTxid!);
@@ -726,17 +783,28 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       const a = P.authorization ?? {};
       if (String(a.sellerUsdcRecipient ?? "").toLowerCase() !== account.address.toLowerCase()) return; // for someone else
       const client = `buyer:${String(a.buyer).toLowerCase()}`;
+      // Nothing is done for an authorization its buyer didn't sign (no state, no answer)
+      let h: Hex;
+      try {
+        h = authHashOf(authTuple(a));
+        if ((await recoverAddress({ hash: h, signature: o.signature?.signature })).toLowerCase() !== String(a.buyer).toLowerCase()) return;
+      } catch { return; }
+      // Past the overall limit, requests are dropped unanswered (answering a flood is work too)
+      try { limitRate("aon:buys", C.maxAonRequestsPerMinute); } catch { return; }
       try {
         limitRate(client);
         const v = await serial(() => buy({ authorization: a, signature: o.signature?.signature, addressProof: P.csdAddressProof, permit: P.usdcPermit }, client, o));
         await respond(o, { accepted: true, ...v });
       } catch (e: any) {
         // If someone locks it anyway with the public permit, the buyer gets their USDC back once the lock expires
-        try { const h = authHashOf(authTuple(a)); S.rejectedBuys = { ...(S.rejectedBuys ?? {}), [h]: strAuth(a) }; save(); } catch {}
+        // (only ones that could still be locked; bounded, so it can't be flooded)
+        const rb = S.rejectedBuys ?? {};
+        if (!S.trades[h] && Number(a.validBefore) <= now() + 2 * 86400 && Object.keys(rb).length < 300) { S.rejectedBuys = { ...rb, [h]: strAuth(a) }; save(); }
         await respond(o, asError(e));
       }
     } else if (o.objectType === "request" && P.requestType === "csd_usdc_sale") {
       const client = `seller:${String(P.usdcRecipient ?? "").toLowerCase()}`;
+      try { limitRate("aon:sells", C.maxAonRequestsPerMinute); } catch { return; }
       try {
         limitRate(client);
         const v = await serial(() => sellOpen({ csdAmount: P.csdAmount, usdcRecipient: P.usdcRecipient, minUsdcOut: P.minUsdcOut, validUntil: P.validUntil,
@@ -747,24 +815,35 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       const t = Object.values(S.trades).find(x => x.kind === "sell" && x.aon?.auth && o.references.map((r: string) => r.toLowerCase()).includes(x.aon.auth.toLowerCase()));
       if (!t) return;
       try {
-        const v = await serial(() => sellPay({ authHash: t.authHash, tx: P.csdTx }));
+        // Only the trade's own seller can pay it, but anyone can publish junk: a few attempts per sale
+        limitRate(`pay:${t.authHash}`, 10);
+        const v = await serial(() => sellPay({ authHash: t.authHash, tx: P.csdTx, arrivedAt: Math.floor(Number(o.arrivedAt ?? Date.now()) / 1000) }));
         await respond(o, { accepted: true, ...v });
       } catch (e: any) { await respond(o, asError(e)); }
     }
   }
+  let dirty = false;
   async function watch() {
     S.seen ??= {};
     const targets = [...(S.liveOffers ?? []).map(o => o.hash),
-      ...Object.values(S.trades).filter(t => t.kind === "sell" && t.status === "open" && t.aon?.auth).map(t => t.aon!.auth!)];
+      ...Object.values(S.trades).filter(t => t.kind === "sell" && t.aon?.auth && (t.status === "open" || now() - t.createdAt < 3600)).map(t => t.aon!.auth!)];
+    // Fetched first, then handled: an object's arrival time is when the bot first saw it
+    const fresh: any[] = [], t0 = Date.now();
     for (const h of targets) {
       let inbound: any[] = [];
       try { inbound = await aonInbound(h); } catch { continue; }
-      for (const o of inbound.sort((a, b) => a.createdAt - b.createdAt)) {
-        const k = String(o.objectHash).toLowerCase();
-        if (S.seen[k] || o.namespace !== NS) continue;
-        S.seen[k] = now(); save();
-        try { await handle(o); } catch (e: any) { log(`[mm] AON ${o.objectType} ${k}: ${e.message}`); }
+      for (const o of inbound) {
+        const k = String(o?.objectHash ?? "").toLowerCase();
+        if (!k || S.seen[k] || o.namespace !== NS) continue;
+        S.seen[k] = now(); dirty = true;
+        // Dated in the future: junk trying to jump the queue
+        if (!(Number(o.createdAt) <= t0 + 120_000)) continue;
+        fresh.push({ ...o, arrivedAt: t0 });
       }
+    }
+    if (dirty) { save(); dirty = false; }
+    for (const o of fresh.sort((a, b) => a.createdAt - b.createdAt)) {
+      try { await handle(o); } catch (e: any) { log(`[mm] AON ${o.objectType} ${o.objectHash}: ${e.message}`); }
     }
     const cutoff = now() - 3 * 86400;
     for (const [k, t] of Object.entries(S.seen)) if (t < cutoff) delete S.seen[k];
@@ -775,7 +854,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // Locks of declined buys that someone submitted anyway: refunded to the buyer once they expire
   async function refundDeclined() {
     for (const [h, a] of Object.entries(S.rejectedBuys ?? {})) {
-      if (S.trades[h]) { delete S.rejectedBuys![h]; continue; }
+      if (S.trades[h] && !S.trades[h].lateLock) { delete S.rejectedBuys![h]; save(); continue; }
       try {
         const [locked, until] = await Promise.all([view("usdcLocked", h as Hex), view("lockedUntil", h as Hex)]);
         if (Number(a.validBefore) < now() - 86400 && !locked) { delete S.rejectedBuys![h]; save(); continue; }

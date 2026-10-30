@@ -70,16 +70,34 @@ export function aonApi(base: string, fetchImpl: typeof fetch = fetch) {
       const r = await fetchImpl(`${url}/v1/objects?namespace=${encodeURIComponent(NS)}&objectType=${objectType}&limit=${limit}`);
       return (await r.json()).objects ?? [];
     },
-    // The newest valid offers from the given market makers (signature checked)
-    async offers(marketMakers: string[]) {
+    async get(hash: string): Promise<any | null> {
+      const r = await fetchImpl(`${url}/v1/objects/${hash}`);
+      return r.ok ? ((await r.json()).object ?? null) : null;
+    },
+    // The newest valid offers from the given market makers (signature checked). `hints` are
+    // offer hashes to try first (the market maker lists its current ones), since anyone can
+    // bury the real offers in a listing under junk ones.
+    async offers(marketMakers: string[], hints: string[] = []) {
       const mm = marketMakers.map(a => a.toLowerCase()), out: { sell?: any; buy?: any } = {};
-      for (const o of await this.list("offer", 40)) {
-        const side = o.payload?.offerType === "csd_usdc_sell_csd" ? "sell" : o.payload?.offerType === "csd_usdc_buy_csd" ? "buy" : null;
-        if (!side || out[side] || Number(o.payload?.validBefore) < Date.now() / 1000) continue;
+      const consider = async (o: any) => {
+        const side = o?.payload?.offerType === "csd_usdc_sell_csd" ? "sell" : o?.payload?.offerType === "csd_usdc_buy_csd" ? "buy" : null;
+        if (!side || out[side] || Number(o.payload?.validBefore) < Date.now() / 1000 || !(Number(o.createdAt) <= Date.now() + 120_000)) return;
         const signer = await objectSigner(o);
         if (signer && mm.includes(signer.toLowerCase()) && signer.toLowerCase() === String(o.payload.marketMaker).toLowerCase()) out[side] = o;
-      }
+      };
+      for (const h of hints) if (/^0x[0-9a-fA-F]{64}$/.test(h)) await consider(await this.get(h).catch(() => null));
+      if (!out.sell || !out.buy) for (const o of await this.list("offer", 40)) await consider(o);
       return out;
+    },
+    // The market maker's signed receipt for a trade (references the trade's authorization object)
+    async receipt(authObjectHash: string, authHash: string, marketMakers: string[]): Promise<any | null> {
+      const mm = marketMakers.map(a => a.toLowerCase());
+      for (const o of await this.inbound(authObjectHash)) {
+        if (o.objectType !== "receipt" || String(o.payload?.authHash).toLowerCase() !== authHash.toLowerCase()) continue;
+        const signer = await objectSigner(o);
+        if (signer && mm.includes(signer.toLowerCase())) return o;
+      }
+      return null;
     },
     // Waits for the market maker's signed response to one of our objects
     async response(toHash: string, marketMaker: string, timeoutMs = 45_000): Promise<any> {

@@ -97,7 +97,7 @@ POOL_USDC=150
 POOL_CSD=1000
 STATE_FILE=/var/lib/covenant-mm/state.json
 ALLOWED_ORIGINS=https://covenant.market
-AON_NODE_URL=http://127.0.0.1:8080    # optional: publish trades to AON
+AON_NODE_URL=http://127.0.0.1:8787    # AON node(s), comma-separated: trades are requested and answered there
 ```
 
 ```bash

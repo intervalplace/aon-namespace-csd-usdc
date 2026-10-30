@@ -63,7 +63,8 @@ let mm = await startMarketMaker(mmCfg);
 const API = "http://127.0.0.1:18990/api";
 const get = async (p) => { const r = await fetch(API + p); return { ...(await r.json()), http: r.status }; };
 // Trading goes over AON: publish an object, let the market maker look, read its signed response
-const offers = () => A.offers([privateKeyToAccount(MM_KEY).address]);
+let useHints = false;
+const offers = async () => { const m = useHints ? await get("/market") : null; return A.offers([privateKeyToAccount(MM_KEY).address], m ? [m.offers.sell, m.offers.buy] : []); };
 const answer = async (o) => { await A.put(o); await mm.watch(); const r = await A.response(o.objectHash, privateKeyToAccount(MM_KEY).address, 15_000); return { ...r, http: r.accepted ? 200 : r.code, objectHash: o.objectHash }; };
 async function post(p, b) {
   if (p === "/buy") {
@@ -100,9 +101,15 @@ await mm.tick(); await mine(); await mm.tick(); // splits the inventory into coi
   check(r.headers.get("access-control-allow-origin") === "https://covenant.market", "CORS for covenant.market");
   const r2 = await fetch(API + "/market", { headers: { origin: "https://evil.example" } });
   check(!r2.headers.get("access-control-allow-origin"), "no CORS for other sites");
-  const off = await offers();
+  const off = await offers(); useHints = true;
   check(off.sell && off.buy && await objectSigner(off.sell) === mmEvm.address && off.sell.payload.poolUsdc === "150000000" && off.sell.payload.poolCsd === "100000000000",
-    "the market maker's offers are on AON, signed, with its pool (the site draws the book from them)"); }
+    "the market maker's offers are on AON, signed, with its pool (the site draws the book from them)");
+  // Anyone can bury the real offers in a listing under junk dated in the future
+  for (let i = 0; i < 45; i++) await A.put(finalizeObject({ objectType: "offer", schemaVersion: "1", namespace: "aon:csd-usdc", createdAt: Date.now() + 86400_000 + i, references: [],
+    payload: { offerType: "csd_usdc_sell_csd", marketMaker: mmEvm.address, validBefore: 9e9, n: i } }));
+  check(!(await A.offers([mmEvm.address])).sell, "45 junk offers push the real ones out of a plain listing");
+  const hinted = await A.offers([mmEvm.address], [m.offers.sell, m.offers.buy]);
+  check(hinted.sell?.objectHash === off.sell.objectHash && hinted.buy?.objectHash === off.buy.objectHash, "but the market maker names its current offers, and those are fetched and checked by hash"); }
 
 // A buy as the site would build it: authorization + permit + CSD address proof, all gasless
 async function signBuy({ csdAmount, usdcAmount, conf = 10, maxTarget = bitsToTarget(BITS), fee = 250_000n, key = uKey, proofKey = key }) {
@@ -157,6 +164,9 @@ console.log("\n[2] User buys 50 CSD: CSD sent once the USDC is locked, no ETH ne
   check(proof.references.includes(auth.objectHash.toLowerCase()) && proof.payload.txid === tr(b.hash).csdTxid, "the CSD payment proof references the authorization");
   check(receipt.objectType === "receipt" && receipt.references.includes(auth.objectHash.toLowerCase()) && receipt.references.includes(proof.objectHash.toLowerCase())
     && receipt.payload.executionTx === tr(b.hash).settleTx, "the receipt references both and names the settlement transaction");
+  check(await objectSigner(receipt) === mmEvm.address && (await A.receipt(auth.objectHash, b.hash, [mmEvm.address]))?.objectHash === receipt.objectHash, "the receipt is signed by the market maker");
+  await A.put(finalizeObject({ objectType: "receipt", schemaVersion: "1", namespace: "aon:csd-usdc", createdAt: Date.now() - 1, references: [auth.objectHash.toLowerCase()], payload: { authHash: b.hash, executionTx: "0x" + "66".repeat(32) } }));
+  check((await A.receipt(auth.objectHash, b.hash, [mmEvm.address]))?.objectHash === receipt.objectHash, "a fake unsigned receipt is ignored");
   check((await get(`/trade/${b.hash}`)).aon.receipt === receipt.objectHash, "the site can look up the receipt"); }
 
 console.log("\n[2b] Racing the bot's lock: CSD is only sent if the USDC really is locked");
@@ -230,7 +240,25 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   check(await bal(user.address) < u0, "someone locked the declined buy anyway with its public permit");
   await mine(10); await mm.tick(); await mm.tick();
   await rpc("evm_increaseTime", [200 * 60]); await rpc("evm_mine"); await mm.tick();
-  check(await bal(user.address) === u0, "the market maker refunded it to the buyer once the lock expired"); }
+  check(await bal(user.address) === u0, "the market maker refunded it to the buyer once the lock expired");
+  // Someone locks a buy themselves and only publishes it when the lock is about to expire:
+  // CSD sent then could never be proven in time, so the bot sends nothing
+  const c = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount), key: userCsd.key(32) });
+  const u1 = await bal(user.address), R = c.body.permit;
+  await send(deployer, settlement, "TestCsdUsdcSettlement", "lockCsdUsdcAuthorizationWithPermit", [c.body.authorization, c.body.signature, c.body.addressProof, { deadline: R.deadline, v: R.v, r: R.r, s: R.s }]);
+  await rpc("evm_increaseTime", [55 * 60]); await rpc("evm_mine");
+  const rc = await post("/buy", c.body);
+  check(rc.accepted === false && rc.error === "LOCK_TOO_OLD" && tr(c.hash).status === "lock_failed" && !tr(c.hash).csdTxid,
+    "a lock made 55 minutes earlier (5 of its 60 left) is declined, and no CSD is sent");
+  await rpc("evm_increaseTime", [10 * 60]); await rpc("evm_mine"); await mm.tick(); await mm.tick();
+  check(await bal(user.address) === u1 && tr(c.hash).status === "lock_failed", "when it expires the bot refunds the buyer, and never honours it later");
+  // An authorization its buyer didn't sign gets no answer at all
+  const d = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount), key: userCsd.key(33) });
+  const forged = await privateKeyToAccount(generatePrivateKey()).signTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: d.body.authorization });
+  const fo = buyAuthorizationObject({ offerHash: (await offers()).sell.objectHash, authorization: d.body.authorization, signature: forged, domain, types: AUTH_TYPES, addressProof: d.body.addressProof, permit: d.body.permit });
+  await A.put(fo); await mm.watch();
+  check(await A.response(fo.objectHash, mmEvm.address, 1500).then(() => false, e => e.message === "NO_RESPONSE") && !tr(d.hash) && !mm.state().rejectedBuys?.[d.hash],
+    "an authorization not signed by its buyer is ignored: no trade, no answer, nothing kept"); }
 
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
@@ -239,8 +267,12 @@ let sold;
   check((await openSale(csdAmount, { signer: thief })).error === "COINS_NOT_YOURS_OR_SPENT", "a sale backed by someone else's coins is refused");
   const o = await openSale(csdAmount, { minUsdcOut: quote });
   check(o.http === 200 && o.lockTx && o.csdAddress, "bot opens the trade: locks its USDC against a fresh CSD address");
+  { const { objectHash: _x, ...orig } = aonNode.objects.get(o.objectHash.toLowerCase());
+    const again = await answer(finalizeObject({ ...orig, createdAt: Date.now() }));
+    check(again.authHash === o.authHash && Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.requestDigest === tr(o.authHash).requestDigest).length === 1,
+      "the same signed request republished by someone else gets the same sale back, not a second one"); }
   check(midPrice(pool()) === mid0 && (await get("/market")).bestAsk === m0ask, "opening a sale doesn't move the pool or the buy price");
-  check((await openSale(csdAmount, { coins: o.sel })).error === "COINS_IN_USE", "the same coins can't back a second sale");
+  check((await openSale(csdAmount - 1n, { coins: o.sel })).error === "COINS_IN_USE", "the same coins can't back a second sale");
   const others = (await userNode.utxos(uKey)).filter(c => !o.sel.some(x => x.txid === c.txid && x.vout === c.vout));
   check((await openSale(csdAmount, { coins: others.slice(0, 1) })).http === 429, "the same USDC recipient can't open a second sale while one waits for payment");
   const h = hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: authArgs(o.authorization) });
