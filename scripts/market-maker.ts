@@ -9,7 +9,6 @@
 import { randomBytes } from "node:crypto";
 import { getAddress, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { AonNodeClient } from "@intervalplace/aon-sdk";
 import { deriveCsdWallet } from "../src/csd-wallet.js";
 import { startMarketMaker } from "../src/market-maker.js";
 
@@ -68,8 +67,8 @@ const mm = await startMarketMaker({
   spreadBps:     BigInt(env("SPREAD_BPS", "300")),
   feeUsdc:       usdcUnits(env("FEE_USDC", "0.25")),
   maxUnconfirmedUsdc: usdcUnits(env("MAX_INSTANT_USDC", "60")),
-  // Trades are also published to AON, so they show up on the explorer
-  publishToAon:  process.env.AON_NODE_URL ? async (obj) => { await new AonNodeClient(process.env.AON_NODE_URL!).putObject(obj); } : undefined,
+  // Requests arrive over AON and every trade is published there
+  aonNodeUrl:    env("AON_NODE_URL", "http://127.0.0.1:8787"),
 });
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, async () => { await mm.stop(); process.exit(0); });

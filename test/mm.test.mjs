@@ -4,11 +4,13 @@ import { readFileSync, rmSync } from "fs";
 import { createPublicClient, createWalletClient, http, defineChain, hashTypedData, keccak256, toHex } from "viem";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { startFakeCsdNode } from "./fake-csd-node.mjs";
+import { startFakeAonNode } from "./fake-aon-node.mjs";
+import { buyAuthorizationObject, saleRequestObject, salePaymentObject, aonApi, objectSigner } from "../src/aon-client.ts";
 import { deriveCsdWallet, csdNode, buildPayment, csdAddressProof, addr20ToBytes32, bitsToTarget, txToNodeJson, CSD_WALLET_MESSAGE, csdSaleRequestDigest, csdSignDigest } from "../src/csd-wallet.ts";
 import { startMarketMaker } from "../src/market-maker.ts";
 import { quoteBuy, quoteSell, midPrice } from "../src/pool.ts";
 import { csdUsdcNamespace } from "../src/namespace.ts";
-import { hashObject } from "@intervalplace/aon-sdk";
+import { hashObject, finalizeObject } from "@intervalplace/aon-sdk";
 import { recoverMessageAddress } from "viem";
 const obj = (h) => published.find(o => o.objectHash?.toLowerCase() === h?.toLowerCase());
 
@@ -50,16 +52,34 @@ const uKey = userCsd.key(0);
 for (let i = 0; i < 4; i++) csd.mine({ rewardTo: uKey.addr20, reward: 150n * 100_000_000n }); // CSD the user already had, in a few coins
 
 const STATE = "/tmp/claude-0/mm-test-state.json"; rmSync(STATE, { force: true });
-const logs = [], published = [];
+const logs = [];
+const aonNode = await startFakeAonNode({ port: 18993 }), A = aonApi(aonNode.url);
+const published = { find: (f) => [...aonNode.objects.values()].find(f) };
 const mmCfg = { rpcUrl: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: MM_SEED,
   stateFile: STATE, port: 18990, allowedOrigins: ["https://covenant.market"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n },
   maxUnconfirmedUsdc: 10_000_000n, maxLossUsdc: 1_000_000n, sellPayWindowSecs: 8, trustProxy: true,
-  pollMs: 60_000, rebroadcastSecs: 1, log: (...a) => logs.push(a.join(" ")), publishToAon: async (o) => { published.push(o); } };
+  pollMs: 60_000, watchMs: 600_000, rebroadcastSecs: 1, log: (...a) => logs.push(a.join(" ")), aonNodeUrl: aonNode.url };
 let mm = await startMarketMaker(mmCfg);
 const API = "http://127.0.0.1:18990/api";
 const get = async (p) => { const r = await fetch(API + p); return { ...(await r.json()), http: r.status }; };
-let clientN = 0; const nextClient = () => `10.0.0.${++clientN}`; // each sale from its own client unless a test says otherwise
-const post = async (p, b, ip = nextClient()) => { const r = await fetch(API + p, { method: "POST", headers: { "content-type": "application/json", origin: "https://covenant.market", "x-forwarded-for": ip }, body: JSON.stringify(b, (_, v) => typeof v === "bigint" ? String(v) : v) }); return { ...(await r.json()), http: r.status }; };
+// Trading goes over AON: publish an object, let the market maker look, read its signed response
+const offers = () => A.offers([privateKeyToAccount(MM_KEY).address]);
+const answer = async (o) => { await A.put(o); await mm.watch(); const r = await A.response(o.objectHash, privateKeyToAccount(MM_KEY).address, 15_000); return { ...r, http: r.accepted ? 200 : r.code, objectHash: o.objectHash }; };
+async function post(p, b) {
+  if (p === "/buy") {
+    const off = (await offers()).sell;
+    return answer(buyAuthorizationObject({ offerHash: off.objectHash, authorization: b.authorization, signature: b.signature, domain, types: AUTH_TYPES, addressProof: b.addressProof, permit: b.permit }));
+  }
+  if (p === "/sell/open") {
+    const off = (await offers()).buy;
+    return answer(saleRequestObject({ offerHash: off.objectHash, csdAmount: BigInt(b.csdAmount), usdcRecipient: b.usdcRecipient, minUsdcOut: BigInt(b.minUsdcOut ?? 0), validUntil: b.validUntil, coins: b.coins, proofs: b.proofs, owners: b.owners ?? [] }));
+  }
+  if (p === "/sell/pay") {
+    const authObj = mm.state().trades[b.authHash]?.aon?.auth;
+    return answer(salePaymentObject({ authorizationObjectHash: authObj, csdTxid: "0x", csdTx: b.tx }));
+  }
+  throw new Error(p);
+}
 const domain = { name: "AON CSD/USDC", version: "4", chainId: 31337, verifyingContract: settlement };
 const AUTH_TYPES = csdUsdcNamespace.types();
 const bal = (a) => read(usdc, "MockUSDC", "balanceOf", [a]);
@@ -79,7 +99,10 @@ await mm.tick(); await mine(); await mm.tick(); // splits the inventory into coi
   const r = await fetch(API + "/market", { headers: { origin: "https://covenant.market" } });
   check(r.headers.get("access-control-allow-origin") === "https://covenant.market", "CORS for covenant.market");
   const r2 = await fetch(API + "/market", { headers: { origin: "https://evil.example" } });
-  check(!r2.headers.get("access-control-allow-origin"), "no CORS for other sites"); }
+  check(!r2.headers.get("access-control-allow-origin"), "no CORS for other sites");
+  const off = await offers();
+  check(off.sell && off.buy && await objectSigner(off.sell) === mmEvm.address && off.sell.payload.poolUsdc === "150000000" && off.sell.payload.poolCsd === "100000000000",
+    "the market maker's offers are on AON, signed, with its pool (the site draws the book from them)"); }
 
 // A buy as the site would build it: authorization + permit + CSD address proof, all gasless
 async function signBuy({ csdAmount, usdcAmount, conf = 10, maxTarget = bitsToTarget(BITS), fee = 250_000n, key = uKey, proofKey = key }) {
@@ -167,13 +190,13 @@ console.log("\n[2b] Racing the bot's lock: CSD is only sent if the USDC really i
   check(tr(a.hash).status === "settled", "the copied-lock trade settles normally"); }
 
 // A sale as the site makes it: name the coins you'll pay with, sign for them, then pay with exactly those
-async function openSale(csdAmount, { ip, coins, signer = uKey, recipient = user.address, minUsdcOut = 0n } = {}) {
+async function openSale(csdAmount, { coins, signer = uKey, recipient = user.address, minUsdcOut = 0n } = {}) {
   const all = await userNode.utxos(uKey);
   const sel = coins ?? buildPayment({ utxos: all, to: [{ value: csdAmount, addr20: "0x" + "00".repeat(20) }], change: uKey.addr20 }).spent.map(c => all.find(u => u.txid === c.txid && u.vout === c.vout));
   const validUntil = Number((await pub.getBlock()).timestamp) + 300; // the bot checks against its own clock
   const req = { csdAmount, usdcRecipient: recipient, validUntil: Math.floor(Date.now() / 1000) + 300, coins: sel.map(c => ({ txid: c.txid, vout: c.vout })) };
   const proofs = [csdSignDigest(signer, csdSaleRequestDigest(req))];
-  const o = await post("/sell/open", { ...req, minUsdcOut, proofs }, ip);
+  const o = await post("/sell/open", { ...req, minUsdcOut, proofs, owners: [signer.addr20] });
   return { ...o, sel };
 }
 const payFor = (o, { from = o.sel, value = BigInt(o.csdAmount ?? 0), fee } = {}) =>
@@ -182,17 +205,44 @@ const payFor = (o, { from = o.sel, value = BigInt(o.csdAmount ?? 0), fee } = {})
 // A seller address of its own, holding one fresh coin
 const fresh = async (i, csdAmt = 60n) => { const k = userCsd.key(i); await syncClock(); csd.mine({ rewardTo: k.addr20, reward: csdAmt * 100_000_000n }); return { signer: k, coins: await userNode.utxos(k) }; };
 
+console.log("\n[2c] Over AON the permit is public: locks by others, and fake responses");
+{ const csdAmount = 10n * 100_000_000n;
+  // Someone submits the buyer's lock before the market maker even looks: it sends the CSD all the same
+  const a = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount), key: userCsd.key(30) });
+  const off = (await offers()).sell;
+  const ao = buyAuthorizationObject({ offerHash: off.objectHash, authorization: a.body.authorization, signature: a.body.signature, domain, types: AUTH_TYPES, addressProof: a.body.addressProof, permit: a.body.permit });
+  await A.put(ao);
+  const P = a.body.permit;
+  await send(deployer, settlement, "TestCsdUsdcSettlement", "lockCsdUsdcAuthorizationWithPermit", [a.body.authorization, a.body.signature, a.body.addressProof, { deadline: P.deadline, v: P.v, r: P.r, s: P.s }]);
+  // A fake "response" from someone else is ignored by the site
+  const fake = finalizeObject({ objectType: "response", schemaVersion: "1", namespace: "aon:csd-usdc", createdAt: Date.now(), references: [ao.objectHash.toLowerCase()], payload: { accepted: false, error: "GO_AWAY" } });
+  await A.put(fake);
+  await mm.watch();
+  const r = await A.response(ao.objectHash, mmEvm.address, 10_000);
+  check(r.accepted === true && r.error === undefined, "a fake response from someone else is ignored; the market maker's own says accepted");
+  check(tr(a.hash).status === "locked" && tr(a.hash).csdTxid && !tr(a.hash).lockTx, "the lock was already there (someone used the public permit), so the bot just sent the CSD");
+  // A buy the market maker declines, locked anyway by someone: refunded to the buyer when the lock expires
+  const b = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount) * 9n / 10n, key: userCsd.key(31) });
+  const rb = await post("/buy", b.body);
+  check(rb.accepted === false && rb.error.startsWith("PRICE_MOVED"), "a buy below the price is declined, with the reason, on AON");
+  const u0 = await bal(user.address), Q = b.body.permit;
+  await send(deployer, settlement, "TestCsdUsdcSettlement", "lockCsdUsdcAuthorizationWithPermit", [b.body.authorization, b.body.signature, b.body.addressProof, { deadline: Q.deadline, v: Q.v, r: Q.r, s: Q.s }]);
+  check(await bal(user.address) < u0, "someone locked the declined buy anyway with its public permit");
+  await mine(10); await mm.tick(); await mm.tick();
+  await rpc("evm_increaseTime", [200 * 60]); await rpc("evm_mine"); await mm.tick();
+  check(await bal(user.address) === u0, "the market maker refunded it to the buyer once the lock expired"); }
+
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
 { const csdAmount = 40n * 100_000_000n, quote = quoteSell(pool(), csdAmount) - 250_000n, mid0 = midPrice(pool()), m0ask = (await get("/market")).bestAsk;
   const thief = deriveCsdWallet("0x" + "77".repeat(65)).key(0);
   check((await openSale(csdAmount, { signer: thief })).error === "COINS_NOT_YOURS_OR_SPENT", "a sale backed by someone else's coins is refused");
-  const o = await openSale(csdAmount, { ip: "10.9.9.9", minUsdcOut: quote });
+  const o = await openSale(csdAmount, { minUsdcOut: quote });
   check(o.http === 200 && o.lockTx && o.csdAddress, "bot opens the trade: locks its USDC against a fresh CSD address");
   check(midPrice(pool()) === mid0 && (await get("/market")).bestAsk === m0ask, "opening a sale doesn't move the pool or the buy price");
-  check((await openSale(csdAmount, { ip: "10.9.9.10", coins: o.sel })).error === "COINS_IN_USE", "the same coins can't back a second sale");
+  check((await openSale(csdAmount, { coins: o.sel })).error === "COINS_IN_USE", "the same coins can't back a second sale");
   const others = (await userNode.utxos(uKey)).filter(c => !o.sel.some(x => x.txid === c.txid && x.vout === c.vout));
-  check((await openSale(csdAmount, { ip: "10.9.9.9", coins: others.slice(0, 1) })).http === 429, "the same client can't open a second sale while one waits for payment");
+  check((await openSale(csdAmount, { coins: others.slice(0, 1) })).http === 429, "the same USDC recipient can't open a second sale while one waits for payment");
   const h = hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: authArgs(o.authorization) });
   check(h === o.authHash && await read(settlement, "TestCsdUsdcSettlement", "usdcLocked", [h]), "the site recomputes the trade hash and sees the USDC locked on-chain");
   check(o.authorization.sellerUsdcRecipient === user.address && BigInt(o.authorization.usdcAmount) === quote && BigInt(o.authorization.csdAmount) === csdAmount && o.authorization.minConfirmations === "20",
@@ -227,7 +277,7 @@ let sold;
 console.log("\n[4] Over the instant limit, the bot waits for confirmations; one payment, one sale");
 { const a = await openSale(40n * 100_000_000n);
   check((await openSale(40n * 100_000_000n, { coins: (await userNode.utxos(uKey)).filter(c => !a.sel.some(x => x.txid === c.txid && x.vout === c.vout)).slice(0, 1) })).error === "FINISH_YOUR_OTHER_SALE", "one waiting sale per CSD address");
-  const b = await openSale(40n * 100_000_000n, await fresh(20));
+  const b = await openSale(40n * 100_000_000n, { ...(await fresh(20)), recipient: deployer.address }); // another seller
   check(a.http === 200 && b.http === 200, "two sales from different addresses");
   await until(() => tr(a.authHash).status === "open" && tr(b.authHash).status === "open");
   const pa = payFor(a);
@@ -250,6 +300,7 @@ console.log("\n[5] Coins already spent, a payment too late, and a sale nobody pa
   csd.submit(elsewhere.tx); // the named coins get spent somewhere else
   check((await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o).tx) })).error === "CSD_COINS_NOT_AVAILABLE", "a payment from coins already spent in the mempool is refused");
   await mine(); await new Promise(r => setTimeout(r, 10_000));
+  await mm.tick(); // the first sale's payment window is over
   const o2 = await openSale(10n * 100_000_000n, await fresh(22));
   check(o2.http === 200, "(meanwhile another sale opens fine)");
   await until(() => tr(o2.authHash).status === "open"); await mm.tick();
@@ -298,17 +349,17 @@ console.log("\n[6] Double spends: an instant one is a capped loss; one that wasn
   await mine(2); await mm.tick();
   check(tr(d.authHash).status === "paid" && pool().usdc === pd.usdc && pool().csd === pd.csd && (await get("/market")).bestAsk === ask0, "its payment was double-spent: nothing released, the price didn't move");
   // A paid sale whose lock expires before its payment confirms: the bot takes its lock back, and pays directly when the CSD arrives
-  const e = await openSale(10n * 100_000_000n, await fresh(12));
+  const e = await openSale(10n * 100_000_000n, { ...(await fresh(12)), recipient: deployer.address }); // (the user's other sale still waits)
   await until(() => tr(e.authHash).status === "open");
   const pe = payFor(e);
   await post("/sell/pay", { authHash: e.authHash, tx: txToNodeJson(pe.tx) });
   csd.drop(pe.txid); // held up somewhere
   await rpc("evm_increaseTime", [120 * 60]); await rpc("evm_mine"); await mm.tick();
   check(!(await read(settlement, "TestCsdUsdcSettlement", "usdcLocked", [e.authHash])), "the lock expired with the payment unconfirmed; the bot refunded it");
-  csd.submit(pe.tx); const u0 = await bal(user.address);
+  csd.submit(pe.tx); const u0 = await bal(deployer.address);
   await mine(3); await mm.tick(); // (past the loss budget, release waits for 3 confirmations)
-  await until(async () => await bal(user.address) === u0 + BigInt(e.usdcAmount));
-  check(await bal(user.address) === u0 + BigInt(e.usdcAmount), "when the payment confirmed later, the bot paid the seller directly"); }
+  await until(async () => await bal(deployer.address) === u0 + BigInt(e.usdcAmount));
+  check(await bal(deployer.address) === u0 + BigInt(e.usdcAmount), "when the payment confirmed later, the bot paid the seller directly"); }
 
 console.log("\n[6b] CSD received for finished sales is swept into the bot's main address");
 { await mine(3); await mm.tick(); await mine(); await mm.tick(); await mm.tick();
@@ -329,6 +380,7 @@ console.log("\n[7] Restart: state survives, CSD proxy works for the in-site wall
   const send2 = buildPayment({ utxos: coins, to: [{ value: 100_000_000n, addr20: "0x" + "ab".repeat(20) }], change: uKey.addr20 });
   check((await userNode.submit(send2.tx)) === send2.txid, "the in-site wallet sends CSD through the proxy"); }
 
-await mm.stop(); await csd.close();
+await mm.stop(); await csd.close(); await aonNode.close();
 if (logs.some(l => l.includes("INTERNAL"))) console.log(logs.join("\n"));
 console.log(`\nAll ${pass} market-maker checks passed.`);
+process.exit(0); // (open keep-alive connections would otherwise hold the process)

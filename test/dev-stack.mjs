@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, rmSync } from "node:fs";
 import { createPublicClient, createWalletClient, http, defineChain, keccak256, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { startFakeCsdNode } from "./fake-csd-node.mjs";
+import { startFakeAonNode } from "./fake-aon-node.mjs";
 import { deriveCsdWallet } from "../src/csd-wallet.ts";
 import { startMarketMaker } from "../src/market-maker.ts";
 
@@ -42,11 +43,12 @@ const SEED = "0x" + "5e".repeat(32);
 csd.mine({ rewardTo: deriveCsdWallet(SEED).key(0).addr20, reward: 1000n * 100_000_000n });
 setInterval(() => csd.mine(), Number(process.env.CSD_BLOCK_SECS ?? 20) * 1000);
 
+const aon = await startFakeAonNode({ port: 18993 });
 const STATE = "/tmp/claude-0/dev-mm-state.json"; rmSync(STATE, { force: true });
 await startMarketMaker({ rpcUrl: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: SEED,
-  stateFile: STATE, port: 18990, allowedOrigins: ["*"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n }, pollMs: 3000 });
+  stateFile: STATE, port: 18990, allowedOrigins: ["*"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n }, pollMs: 3000, aonNodeUrl: aon.url, watchMs: 500 });
 
-const info = { rpc: RPC, usdc, settlement, genesis: GENESIS, mm: "http://127.0.0.1:18990", csdNode: csd.url, user: USER };
+const info = { rpc: RPC, usdc, settlement, genesis: GENESIS, mm: "http://127.0.0.1:18990", mmAddress: privateKeyToAccount(MM_KEY).address, aon: aon.url, csdNode: csd.url, user: USER };
 writeFileSync(new URL("./dev-stack.json", import.meta.url), JSON.stringify(info, null, 2));
 console.log(JSON.stringify(info));
 // gives the user some CSD too, for selling: POST /fund {addr20, csd}
