@@ -1095,7 +1095,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // page references it and includes the maker's signed authorization), and every candidate payment
   // is kept, so a fake one can't crowd out the real one. The seller can always claim it themselves too.
   const towerLocks = new Map<string, number>(); // authHash → lockedUntil
-  const towerPays = new Map<string, Map<string, { auth: Record<string, string>; sig: Hex; tx: CsdTx }>>(); // authHash → txid → payment
+  const towerPays = new Map<string, Map<string, { auth: Record<string, string>; sig: Hex; tx: CsdTx }>>(); // authHash → txid → payment (in a block)
+  // Payments not in a block yet, per lock: kept only if they spend coins that really exist (unspent,
+  // owned by their signers), at most a few per coin, so made-up payments can't crowd out the real one
+  const pending = new Map<string, Map<string, { w: { auth: Record<string, string>; sig: Hex; tx: CsdTx }; coin: string }>>();
   let towerAt = 0, towerFrom: bigint | undefined;
   async function watchtower(force = false) {
     if (!C.watchtowerMs || (!force && Date.now() - towerAt < C.watchtowerMs)) return;
@@ -1112,34 +1115,53 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     }
     while (towerLocks.size > 5000) towerLocks.delete(towerLocks.keys().next().value!);
     const tNow = await chainNow();
-    let checked = 0;
-    for (const [h, until] of [...towerLocks]) {
-      if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); continue; }
-      if (until - tNow > 1800) continue; // the maker still has time to release it
-      if (checked++ >= 20) break;
+    for (const [h, until] of [...towerLocks]) if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); pending.delete(h); }
+    // Soonest to expire first; a lock costs a contract read, and only those with a payment in a
+    // CSD block cost more (so locks opened just to crowd the queue get nowhere)
+    const due = [...towerLocks].filter(([, u]) => u - tNow <= 1800).sort((a, b) => a[1] - b[1]).slice(0, 200);
+    for (const [h] of due) {
       try {
-        if (!(await view("usdcLocked", h as Hex))) { towerLocks.delete(h); towerPays.delete(h); continue; } // released, settled or refunded
-        // Every payment published for this trade that pays it in full under the maker's signed authorization
+        if (!(await view("usdcLocked", h as Hex))) { towerLocks.delete(h); towerPays.delete(h); pending.delete(h); continue; } // released, settled or refunded
+        // Every payment published for this trade that pays it in full under the maker's signed
+        // authorization. Only one that is in a CSD block can ever be proven, so that's checked
+        // before anything is kept: made-up payments (spending coins that don't exist) never are.
         const pays = towerPays.get(h) ?? new Map(); towerPays.set(h, pays);
+        const pend = pending.get(h) ?? new Map(); pending.set(h, pend);
+        const coinsOf = new Map<string, Set<string>>();
         for (const o of await aonInbound(h).catch(() => [])) {
           try {
-            if (o.objectType !== "payment" || o.namespace !== NS || pays.size >= 20) continue;
+            if (o.objectType !== "payment" || o.namespace !== NS) continue;
             const a = o.payload?.authorization, sig = o.payload?.authorizationSignature as Hex;
             const auth = authTuple(a);
             if (authHashOf(auth).toLowerCase() !== h || auth.usdc !== usdc || auth.executorFeeAmount < C.sellExecutorFeeUsdc) continue;
             if ((await recoverAddress({ hash: h as Hex, signature: sig })).toLowerCase() !== auth.buyer.toLowerCase()) continue;
             const tx = txFromNodeJson(o.payload?.csdTx), to = auth.sellerCsdScriptHash.slice(0, 42).toLowerCase();
-            if (!csdInputSigners(tx) || tx.outputs.filter(x => x.addr20.toLowerCase() === to).reduce((x, y) => x + y.value, 0n) < auth.csdAmount) continue;
-            const txid = csdTxid(tx);
-            if (!pays.has(txid)) { pays.set(txid, { auth: strAuth(a), sig, tx }); broadcast(tx).catch(() => {}); }
+            const signers = csdInputSigners(tx);
+            if (!signers || tx.outputs.filter(x => x.addr20.toLowerCase() === to).reduce((x, y) => x + y.value, 0n) < auth.csdAmount) continue;
+            const txid = csdTxid(tx), w = { auth: strAuth(a), sig, tx };
+            if (pays.has(txid) || pend.has(txid)) continue;
+            if (confirmations(txid) > 0) { pays.set(txid, w); continue; }
+            // Not mined yet: its coins must exist, unspent, owned by its signers
+            let real = true;
+            for (let i = 0; i < tx.inputs.length && real; i++) {
+              const owner = signers[i], op = `${tx.inputs[i].prevout.txid.toLowerCase()}:${tx.inputs[i].prevout.vout}`;
+              if (!coinsOf.has(owner)) coinsOf.set(owner, new Set((await node.utxosAt(owner as Hex)).map(u => `${u.txid}:${u.vout}`)));
+              real = coinsOf.get(owner)!.has(op);
+            }
+            const coin = `${tx.inputs[0]?.prevout.txid.toLowerCase()}:${tx.inputs[0]?.prevout.vout}`;
+            if (!real || [...pend.values()].filter(x => x.coin === coin).length >= 3 || pend.size >= 500) continue;
+            pend.set(txid, { w, coin });
+            broadcast(tx).catch(() => {}); // (helps a real one along)
           } catch {}
         }
+        // Payments seen earlier that are now in a block
+        for (const [txid, x] of pend) if (confirmations(txid as Hex) > 0) { pays.set(txid, x.w); pend.delete(txid); }
         // Settled with whichever candidate is in the chain deep enough to prove
         for (const [txid, w] of pays) {
           if (confirmations(txid as Hex) < Number(w.auth.minConfirmations)) continue;
           const fake: Trade = { kind: "buy", status: "locked", authHash: h as Hex, createdAt: now(), auth: w.auth, authSig: w.sig, csdAmount: w.auth.csdAmount, usdcAmount: w.auth.usdcAmount, poolUsdc: "0", csdTxid: txid as Hex };
           const tx = await settleWith(fake);
-          if (tx) { log(`[mm] watchtower: settled ${h} for its seller (${tx}); the maker never released it`); towerLocks.delete(h); towerPays.delete(h); break; }
+          if (tx) { log(`[mm] watchtower: settled ${h} for its seller (${tx}); the maker never released it`); towerLocks.delete(h); towerPays.delete(h); pending.delete(h); break; }
         }
       } catch (e: any) { log(`[mm] watchtower ${h}: ${e.shortMessage ?? e.message}`); }
     }

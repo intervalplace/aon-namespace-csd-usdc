@@ -114,9 +114,11 @@ several) to read and publish on, Node 20, and your own funds:
 What the site checks, since it doesn't trust any maker:
 
 - **Proven makers get the orders.** A maker counts once a trade of theirs has
-  settled on Ethereum (the site checks their signed receipt against the
-  settlement transaction's own event: the trade, its amounts and that the
-  maker was a party to it) or if the site lists it. While any proven maker quotes a side, only
+  settled on Ethereum with a proof of its CSD payment (the site checks their
+  signed receipt against the settlement transaction's own event: the trade,
+  its amounts and that the maker was a party to it), or if the site lists it.
+  A browser remembers proven makers for 30 days and forgets one as soon as it
+  declines or doesn't answer. While any proven maker quotes a side, only
   proven makers are used there; so after starting, do one real trade with your
   maker (from another wallet), and it starts receiving orders.
 - **Every sale's lock carries an executor fee** (2 USDC, the bot's
@@ -129,8 +131,9 @@ What the site checks, since it doesn't trust any maker:
 **Watchtower.** The bot also watches other makers' sales (`WATCHTOWER_MS`,
 on by default). It finds every lock from the contract's events, and the
 seller's payment on AON by the trade's hash (the site's payment object carries
-the maker's signed authorization). If a maker never releases a sale its seller
-has paid, the bot settles it for the seller with a proof of the payment 30
+the maker's signed authorization). Payments count once they're in a CSD block; until then only ones spending
+coins that really exist are kept, a few per coin, so forged ones can't crowd
+out the real one. If a maker never releases a sale its seller has paid, the bot settles it for the seller with a proof of the payment 30
 minutes before the lock runs out, and earns that sale's executor fee. Running more bots means
 more watchtowers.
 

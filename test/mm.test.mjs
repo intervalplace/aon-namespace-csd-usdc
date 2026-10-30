@@ -512,9 +512,12 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   check(o.http === 200 && o.authorization.executorFeeAmount === "2000000", "each sale's lock carries a 2 USDC executor fee (back to the maker when it releases)");
   await until(() => tr(o.authHash).status === "open");
   // The maker publishes a fake "payment" for the trade first (signed by a key of its own, from coins that don't exist)
-  const fakeKey = deriveCsdWallet("0x" + "66".repeat(65)).key(0);
-  const fakeTx = buildPayment({ utxos: [{ txid: "0x" + "ab".repeat(32), vout: 0, value: 20n * 100_000_000n, key: fakeKey }], to: [{ value: 10n * 100_000_000n, addr20: o.csdAddress }], change: fakeKey.addr20 }).tx;
-  await A.put(payObject(o.authHash, txToNodeJson(fakeTx)));
+  // (25 of them, more than any small cap, each signed by a throwaway key spending a coin that doesn't exist)
+  for (let i = 0; i < 25; i++) {
+    const fakeKey = deriveCsdWallet(keccak256(toHex("fake" + i)) + "00").key(0);
+    const fakeTx = buildPayment({ utxos: [{ txid: keccak256(toHex("nocoin" + i)), vout: 0, value: 20n * 100_000_000n, key: fakeKey }], to: [{ value: 10n * 100_000_000n, addr20: o.csdAddress }], change: fakeKey.addr20 }).tx;
+    await A.put(payObject(o.authHash, txToNodeJson(fakeTx)));
+  }
   const r = await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o).tx) });
   check(r.status === "paid" && !r.releaseTx, "the seller paid; the maker hasn't released (instant sales are off here)");
   await mm.stop(); // the maker disappears
@@ -528,7 +531,7 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   await until(async () => await bal(user.address) > u0, 10_000);
   check(await bal(user.address) === u0 + BigInt(o.usdcAmount) && await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o.authHash]),
     "15 minutes before the lock runs out, another bot settles the sale with a proof of the seller's payment: the seller gets the USDC");
-  check(await bal(tower.address) === t0 + 2_000_000n, "and earns the sale's executor fee for it (a fake payment published first didn't stop it)");
+  check(await bal(tower.address) === t0 + 2_000_000n, "and earns the sale's executor fee for it (25 forged payments published first didn't stop it)");
   { const bn = await pub.getBlockNumber(); let gas = 0n;
     for (let i = 0n; i < 6n && !gas; i++) for (const h of (await pub.getBlock({ blockNumber: bn - i })).transactions) {
       const tx = await pub.getTransaction({ hash: h }); if (tx.from.toLowerCase() === tower.address.toLowerCase()) { gas = (await pub.getTransactionReceipt({ hash: h })).gasUsed; break; } }
