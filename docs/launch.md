@@ -84,7 +84,7 @@ STATE_FILE=/var/lib/covenant-mm/state.json
 ALLOWED_ORIGINS=https://covenant.market
 CSD_API_URL=http://127.0.0.1:8887
 CSD_BROADCAST_APIS=https://csd.aon.network
-AON_NODE_URL=http://127.0.0.1:8080        # optional: trades also published to AON
+AON_NODE_URL=http://127.0.0.1:8787        # the AON node on spill1: trades are published to AON
 ```
 
 ```bash
