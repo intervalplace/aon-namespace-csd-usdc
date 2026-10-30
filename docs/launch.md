@@ -78,8 +78,8 @@ AON_EVM_RPC_URL=https://…                 # a mainnet RPC (Alchemy/Infura/your
 MM_PRIVATE_KEY=0x…
 MM_CSD_SEED=0x…
 SETTLEMENT_CONTRACT=0x…                   # from step 3
-POOL_USDC=172                             # = POOL_CSD × the current price (safe.trade)
-POOL_CSD=1000
+POOL_USDC=150                             # half of the total you start with
+POOL_CSD=870                              # = POOL_USDC ÷ the current price (safe.trade; 150 ÷ 0.1726 ≈ 870)
 STATE_FILE=/var/lib/covenant-mm/state.json
 ALLOWED_ORIGINS=https://covenant.market
 CSD_API_URL=http://127.0.0.1:8887
@@ -93,7 +93,9 @@ npx tsx scripts/market-maker.ts --addresses
 ```
 
 Fund it:
-- the Ethereum address: the POOL_USDC amount of USDC, and ~0.02 ETH for gas;
+- the Ethereum address: the POOL_USDC amount of USDC plus ~10 USDC spare (each open
+  sale also locks a 2 USDC executor fee, returned when the bot releases it),
+  and 0.05–0.1 ETH for gas (below MIN_ETH, 0.005, the bot stops taking trades);
 - the CSD address: the POOL_CSD amount of CSD (from your CSD wallet, e.g.
   `csd wallet spend --privkey … --auto-input --output <address>:1000 --fee …`).
   Wait for one CSD block.
@@ -120,7 +122,7 @@ WantedBy=multi-user.target
 
 ```bash
 systemctl daemon-reload && systemctl enable --now covenant-mm
-journalctl -u covenant-mm -f        # "listening on 127.0.0.1:8890; pool …", then "split 1000 CSD into 20 coins"
+journalctl -u covenant-mm -f        # "listening on 127.0.0.1:8890; pool …", then "split 870 CSD into 20 coins"
 ```
 
 Caddy on spill1, add:
@@ -151,11 +153,14 @@ NEXT_PUBLIC_CSD_MM_URL=https://mm.covenant.market
 NEXT_PUBLIC_CSD_SETTLEMENT=0x<contract>
 NEXT_PUBLIC_CSD_NODE_URL=https://csd.aon.network
 NEXT_PUBLIC_CSD_TARGET_REF=0x<from above>
-NEXT_PUBLIC_CSD_MARKET_MAKERS=0x71cDFF394fD19cfA97946E6BAA08232cF357abD0
 ```
 
-The page only trades with offers and responses signed by the addresses in
-`NEXT_PUBLIC_CSD_MARKET_MAKERS` (the bot's Ethereum address).
+No list of market makers: the market is open, and the page finds every maker's
+signed offers on AON (your bot's first, through `NEXT_PUBLIC_CSD_MM_URL`). Your
+bot becomes "proven" like anyone else, with its first trade settled on Ethereum
+with a CSD proof; until a side has a proven maker, the page uses any maker
+there. (`NEXT_PUBLIC_CSD_MARKET_MAKERS` exists for a site that wants to vouch
+for makers; we don't.)
 
 Then the usual release (RELEASING.md): commit, `npm run release:ipfs`, pin,
 `publish-site.sh`, `check-site`, RELEASES.md, tag.
@@ -164,6 +169,8 @@ Then the usual release (RELEASING.md): commit, `npm run release:ipfs`, pin,
 
 - `journalctl -u covenant-mm` shows every trade; any `LOSS` line is a
   double-spent instant sale (instant sales stop by themselves at 30 USDC of losses).
-- Deepen the pool: stop the bot, `--top-up <USDC>` (see market-maker.md), start it.
+- Deepen the pool (no site release needed): send the USDC and CSD to the bot, stop it,
+  `npx tsx scripts/market-maker.ts --top-up <USDC>` (prints the CSD that keeps the
+  price), rerun with `--yes`, start it. The CSD is split into coins on its own.
 - If CSD's difficulty falls below half of the release's reference, buys stop
   working until a release with a new reference.
