@@ -4,6 +4,22 @@ CSD/USDC cross-system settlement namespace for the Authorization Object Network.
 
 Implements the `aon:csd-usdc` namespace: atomic settlement between CSD on Compute Substrate and USDC on EVM.
 
+**Live:** trade at [covenant.market/csd](https://covenant.market/csd). Settlement contract on Ethereum mainnet:
+[`0x8863f0c477a30bb5a2077c813f42250d7fbefcb9`](https://etherscan.io/address/0x8863f0c477a30bb5a2077c813f42250d7fbefcb9)
+(no owner, no admin, no upgrades; 1–30 USDC per trade, 300 USDC open in total).
+
+CSD has no smart contracts and no scripts. Nothing changes on the CSD side: the
+Ethereum contract checks CSD's proof of work itself. No bridge, no custody, no
+fork, no oracle.
+
+**An open market.** There is no list of approved market makers. Anyone with
+CSD or USDC can run [`scripts/market-maker.ts`](docs/market-maker.md#run-your-own)
+(or their own), publish signed offers on AON, and interfaces route each trade to
+the best price. A user never has to trust a maker: a buyer's USDC only reaches
+one with a proof that the CSD was paid, and a seller's CSD only leaves their
+wallet once the maker's USDC is locked for them. Every bot is also a watchtower
+that settles other makers' unreleased sales for their sellers.
+
 ## Install
 
 ```bash
@@ -91,6 +107,14 @@ await runExecutor({
 
 ## Waiting less: early release and market makers
 
+Trading happens on AON, with no private channel: a maker's signed `offer`, the
+buyer's `authorization` (or the seller's `request` and later `payment`), the
+maker's signed `response`s, and the `receipt`. See
+[docs/market-maker.md](docs/market-maker.md#trading-happens-on-aon) for the
+objects and what an interface must check, since the maker on the other side
+may be anyone.
+
+
 The confirmation wait only protects the buyer (who locked the USDC). The
 buyer can waive it for a single locked trade by signing a
 `CsdUsdcEarlyRelease`: it names the recipient and amount, the CSD payment
@@ -116,9 +140,10 @@ Settlement is self-contained, so it runs on Ethereum mainnet next to the
 ETH market with nothing to keep running: no header oracle, no relayer.
 
 - The buyer signs `csdMaxTarget` in the authorization: every block in the
-  proof must be at least that hard. Interfaces and bots set it to about 3/4
-  of CSD's current difficulty (`suggestedMaxTarget()` in
-  `scripts/csd-headers.mjs`: current target × 4/3).
+  proof must be at least that hard. This is the buyer's protection: an
+  interface sets it from CSD's real difficulty read from a node of its own,
+  not from the market maker (covenant.market allows at most 10% easier than
+  the live difficulty).
 - `settleCsdUsdc` gets the payment transaction (parsed strictly, every byte
   accounted for), its merkle path, the payment block and the next blocks
   (`minConfirmations` or more). It checks they link up by hash, each has
@@ -127,7 +152,8 @@ ETH market with nothing to keep running: no header oracle, no relayer.
   least `minConfirmations` blocks' worth of work at the signed difficulty.
   If difficulty eases, the seller just includes more blocks.
 - So faking k confirmations means mining k blocks' worth of work at that
-  difficulty, however the fake chain is built. About 166k gas per settlement.
+  difficulty, however the fake chain is built. About 170k gas with 3
+  confirmations, about 320k with 20.
 - The seller checks the signed difficulty isn't above the real one before
   paying (otherwise real blocks wouldn't qualify); `checkHeaderChain` lets
   anyone pre-check a run of real headers.
@@ -208,16 +234,20 @@ import {
 
 | Type | Description |
 |---|---|
+| `offer` | A market maker's signed quote (its pool, spread, fee, limits) for selling or buying CSD. References the maker's previous offer on that side. |
+| `request` | A seller's sale request, signed by the CSD keys that own the coins it names. References an offer. |
+| `response` | A market maker's signed answer to an authorization, request or payment. |
+| `payment` | A seller's signed CSD transaction for a sale, with the maker's signed authorization. References the maker's authorization object and the trade's hash. |
 | `authorization` | Buyer's signed USDC release authorization. Defines amounts, recipient, CSD script hash, validity window. |
 | `reserve` | USDC locked on-chain by executor pending proof. Namespace-specific type. |
 | `proof` | CSD payment txid with confirmation count. References the reserve. |
-| `receipt` | USDC released to seller. References the proof. |
+| `receipt` | The trade's outcome, signed by the market maker; names the settlement transaction (interfaces check it against that transaction's event). |
 | `revocation` | Cancels an authorization before it is reserved. |
 | `release` | The buyer's signed early release for one locked trade. References the authorization. |
 
 ## Settlement contract
 
-`src/contracts/CsdUsdcSettlement.sol` — the on-chain contract that holds USDC in escrow and releases on verified proof.
+`src/contracts/CsdUsdcSettlement.sol`: holds USDC in escrow and releases it on a verified CSD proof (or the buyer's signed early release), refunding the buyer otherwise. Deployed at `0x8863f0c477a30bb5a2077c813f42250d7fbefcb9` on Ethereum mainnet; it has no owner.
 
 ## Node and SDK
 
