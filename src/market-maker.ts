@@ -798,7 +798,18 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // Buyers' authorizations and sellers' requests reference one of the bot's
   // offers; sellers' payments reference the bot's authorization for their sale.
   // Each one gets a signed response object referencing it.
+  // The answer given for each request (an authorization's hash, a sale request's digest), so that
+  // every copy of a request gets the same answer as the original
+  const answers = new Map<string, { body: Record<string, unknown>; copies: number }>();
+  let answering: string | undefined;
   async function respond(to: any, body: Record<string, unknown>) {
+    if (answering) {
+      answers.delete(answering); answers.set(answering, { body, copies: 0 });
+      while (answers.size > 20_000) answers.delete(answers.keys().next().value!);
+    }
+    await respondRaw(to, body);
+  }
+  async function respondRaw(to: any, body: Record<string, unknown>) {
     const o = await signed({ objectType: "response", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(to.objectHash),
       payload: { responseType: "csd_usdc_market_maker", to: to.objectHash, ...body } });
     try { await aonPut(o); } catch { queueObject(o); }
@@ -935,13 +946,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     }
   }
   // Waiting objects, per kind, keyed by request (an authorization's hash, a sale request's digest),
-  // in the order the bot first saw them. A sender has at most a few waiting; a request already
-  // waiting or already decided isn't queued again. When a queue is full, reading stops (nothing
-  // read is dropped; the rest is read later from where it stopped).
-  type Entry = { o: any; from: string; known: boolean };
+  // in the order the bot first saw them. Copies of a request (republished with another date, so
+  // another object) are answered with the request's answer, never handled twice. A sender has at
+  // most a few requests waiting. Known senders always get a place; unknown ones wait in an
+  // overflow list when the queue is full, so nothing read is lost.
+  type Entry = { o: any; from: string; known: boolean; copies: any[] };
   const queues: Record<Kind, Map<string, Entry>> = { payment: new Map(), buy: new Map(), sale: new Map() };
+  const overflow: Record<Kind, Entry[]> = { payment: [], buy: [], sale: [] };
   const QUEUE_MAX: Record<Kind, number> = { payment: 2000, buy: 500, sale: 500 };
-  const PER_SENDER = 3;
+  const PER_SENDER = 3, OVERFLOW_MAX = 5000, COPIES_ANSWERED = 5;
   async function watch() {
     S.seen ??= {};
     budget.payment = Infinity; budget.buy = C.maxAonChecksPerPass; budget.sale = C.maxAonChecksPerPass; lookups = 4 * C.maxAonChecksPerPass;
@@ -950,9 +963,9 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     // Sales' authorizations (payments) first, then the offers (buys and sales)
     const payTargets = Object.values(S.trades).filter(t => t.kind === "sell" && t.aon?.auth && (t.status === "open" || now() - t.createdAt < 3600)).map(t => t.aon!.auth!);
     const offerTargets = (S.liveOffers ?? []).map(o => o.hash);
+    const pending = (kind: Kind) => [...queues[kind].values(), ...overflow[kind]];
     for (const h of [...payTargets, ...offerTargets]) {
-      const isOffer = !payTargets.includes(h);
-      if (isOffer && (queues.buy.size >= QUEUE_MAX.buy || queues.sale.size >= QUEUE_MAX.sale)) continue; // full: read later
+      if (overflow.buy.length >= OVERFLOW_MAX || overflow.sale.length >= OVERFLOW_MAX) break; // (read later from where it stopped)
       let inbound: any[] = [];
       try { inbound = await aonInbound(h); } catch { continue; }
       const t0 = Date.now();
@@ -961,25 +974,47 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         if (!k || S.seen[k] || o.namespace !== NS) continue;
         const c = await classify(o);
         if (!c) { done(o); continue; }
-        const q = queues[c.kind];
-        if (q.has(c.id) || (c.kind !== "payment" && decided.has(c.id) && !S.trades[c.id])) { done(o); continue; } // a copy
-        if ([...q.values()].filter(e => e.from === c.from).length >= PER_SENDER) { done(o); continue; }
-        q.set(c.id, { o: { ...o, arrivedAt: t0 }, from: c.from, known: c.known });
+        const obj = { ...o, arrivedAt: t0 };
+        // A copy of a request already decided: the same answer (for a few copies at most)
+        // (the trade as it is now, if there is one)
+        const prior = c.kind !== "payment" ? answers.get(c.id) : undefined;
+        if (prior) { if (prior.copies++ < COPIES_ANSWERED) await respondRaw(obj, currentAnswer(c.id, prior.body)).catch(() => {}); done(o); continue; }
+        // A copy of a request still waiting: answered along with it
+        const waiting = queues[c.kind].get(c.id) ?? overflow[c.kind].find(e => e.o && classifyId(e) === c.id);
+        if (waiting) { if (waiting.copies.length < COPIES_ANSWERED) waiting.copies.push(obj); done(o); continue; }
+        if (c.kind !== "payment" && decided.has(c.id) && !S.trades[c.id]) { done(o); continue; } // decided, answer forgotten
+        if (pending(c.kind).filter(e => e.from === c.from).length >= PER_SENDER) { done(o); continue; }
+        const e: Entry = { o: obj, from: c.from, known: c.known, copies: [] };
+        (e as any).id = c.id;
+        if (queues[c.kind].size < QUEUE_MAX[c.kind] || c.known) queues[c.kind].set(c.id, e);
+        else overflow[c.kind].push(e);
       }
     }
     for (const kind of ["payment", "buy", "sale"] as Kind[]) {
+      // Room freed last pass goes to the overflow, in arrival order
+      while (overflow[kind].length && queues[kind].size < QUEUE_MAX[kind]) { const e = overflow[kind].shift()!; queues[kind].set((e as any).id, e); }
       // Known senders first, then the rest, each in arrival order
       const all = [...queues[kind]], order = [...all.filter(([, e]) => e.known), ...all.filter(([, e]) => !e.known)];
       for (const [id, e] of order) {
         let v: Verdict = undefined;
+        answering = kind === "payment" ? undefined : id;
         try { v = await handle(e.o, kind); } catch (err: any) { log(`[mm] AON ${e.o.objectType} ${e.o.objectHash}: ${err.message}`); }
+        finally { answering = undefined; }
         if (v === "defer") continue;
         queues[kind].delete(id); decide(id); done(e.o);
+        const a = answers.get(id);
+        for (const c of e.copies) { if (a) await respondRaw(c, currentAnswer(id, a.body)).catch(() => {}); done(c); }
+        if (a) a.copies += e.copies.length;
       }
     }
     const cutoff = now() - 3 * 86400;
     for (const [k, t] of Object.entries(S.seen)) if (t < cutoff) { delete S.seen[k]; dirty = true; }
     if (dirty) save();
+  }
+  const classifyId = (e: any) => e.id;
+  function currentAnswer(id: string, body: Record<string, unknown>) {
+    const t = S.trades[id] ?? Object.values(S.trades).find(x => x.kind === "sell" && x.requestDigest === id);
+    return t && body.accepted ? { accepted: true, ...tradeView(t) } : body;
   }
   let watching: Promise<unknown> = Promise.resolve();
   const watchLoop = () => { if (stopped) return; watching = watch().catch(e => log(`[mm] watch: ${e.message}`)).finally(() => { if (!stopped) setTimeout(watchLoop, C.watchMs); }); };

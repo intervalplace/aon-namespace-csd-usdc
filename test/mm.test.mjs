@@ -242,6 +242,7 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   check(await bal(user.address) < u0, "someone locked the declined buy anyway with its public permit");
   await mine(10); await mm.tick(); await mm.tick();
   await rpc("evm_increaseTime", [200 * 60]); await rpc("evm_mine"); await mm.tick();
+  if (await bal(user.address) !== u0) { await new Promise(r => setTimeout(r, 1500)); console.log("DEBUGR", String(await bal(user.address) - u0), b.hash, await read(settlement, "TestCsdUsdcSettlement", "usdcLocked", [b.hash]), JSON.stringify(mm.state().rejectedBuys?.[b.hash] ? "kept" : "gone"), JSON.stringify(mm.state().declinedLocks), mm.state().declinedFromBlock, logs.filter(l => /declined|refund/i.test(l)).slice(-5).join("|")); }
   check(await bal(user.address) === u0, "the market maker refunded it to the buyer once the lock expired");
   // Someone locks a buy themselves and only publishes it when the lock is about to expire:
   // CSD sent then could never be proven in time, so the bot sends nothing
@@ -291,9 +292,10 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   // Republishing a copy of an earlier, already-decided authorization (new createdAt, so a new object) is ignored
   const { objectHash: _o, ...old } = many[0];
   const copy = finalizeObject({ ...old, createdAt: Date.now() });
-  const before = [...aonNode.objects.values()].filter(x => x.objectType === "response").length;
   await A.put(copy); await mm.watch();
-  check([...aonNode.objects.values()].filter(x => x.objectType === "response").length === before, "a republished copy of an already-decided buy gets nothing (it can't take someone's place in the queue)"); }
+  const ra0 = await A.response(many[0].objectHash, mmEvm.address, 2000), rcp = await A.response(copy.objectHash, mmEvm.address, 2000).catch(() => null);
+  const strip = (x) => JSON.stringify({ ...x, to: undefined });
+  check(rcp && rcp.to === copy.objectHash && strip(rcp) === strip(ra0), "a republished copy of an already-decided buy gets the same answer, and isn't handled again"); }
 
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
@@ -316,11 +318,9 @@ let sold;
   const o = await openSale(csdAmount, { minUsdcOut: quote });
   check(o.http === 200 && o.lockTx && o.csdAddress, "bot opens the trade: locks its USDC against a fresh CSD address");
   { const { objectHash: _x, ...orig } = aonNode.objects.get(o.objectHash.toLowerCase());
-    noAnswerMs = 1500;
-    const again = await answer(finalizeObject({ ...orig, createdAt: Date.now() })).catch(e => ({ error: e.message }));
-    noAnswerMs = 15_000;
-    check(again.error === "NO_RESPONSE" && Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.requestDigest === tr(o.authHash).requestDigest).length === 1,
-      "the same signed request republished by someone else is ignored: no second sale"); }
+    const again = await answer(finalizeObject({ ...orig, createdAt: Date.now() }));
+    check(again.authHash === o.authHash && Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.requestDigest === tr(o.authHash).requestDigest).length === 1,
+      "the same signed request republished by someone else gets the same answer, not a second sale"); }
   check(midPrice(pool()) === mid0 && (await get("/market")).bestAsk === m0ask, "opening a sale doesn't move the pool or the buy price");
   check((await openSale(csdAmount - 1n, { coins: o.sel })).error === "COINS_IN_USE", "the same coins can't back a second sale");
   const others = (await userNode.utxos(uKey)).filter(c => !o.sel.some(x => x.txid === c.txid && x.vout === c.vout));
@@ -361,7 +361,18 @@ let sold;
   check(rel.references.includes(auth.objectHash.toLowerCase()) && rel.payload.release.csdTxid === tr(o.authHash).csdTxid, "the release references it and names the seller's CSD payment");
   check(receipt.references.includes(auth.objectHash.toLowerCase()) && receipt.references.includes(rel.objectHash.toLowerCase()) && receipt.references.includes(req.objectHash.toLowerCase())
     && receipt.payload.executionTx === tr(o.authHash).releaseTx, "the receipt ties request, authorization and release to the release transaction");
-  sold = o; }
+  sold = o;
+  { // Someone copies a seller's request (new date, so another object) before the bot looks: both get the answer
+    const k = (await fresh(25)), req = { csdAmount: 10n * 100_000_000n, usdcRecipient: user.address, validUntil: Math.floor(Date.now() / 1000) + 290, coins: k.coins.map(c => ({ txid: c.txid, vout: c.vout })) };
+    const ro = saleRequestObject({ offerHash: (await offers()).buy.objectHash, ...req, minUsdcOut: 0n, proofs: [csdSignDigest(k.signer, csdSaleRequestDigest(req))], owners: [k.signer.addr20] });
+    const { objectHash: _c, ...rest } = ro, cp = finalizeObject({ ...rest, createdAt: ro.createdAt - 1000 });
+    await A.put(cp); await A.put(ro); await mm.watch();
+    const r1 = await A.response(ro.objectHash, mmEvm.address, 3000).catch(() => null), r2 = await A.response(cp.objectHash, mmEvm.address, 3000).catch(() => null);
+    check(r1?.accepted && r2?.accepted && r1.authHash === r2.authHash, "a seller's request copied by someone else: both get the same answer, so the seller isn't left waiting");
+    await until(() => tr(r1.authHash).status === "open");
+    await post("/sell/pay", { authHash: r1.authHash, tx: txToNodeJson(buildPayment({ utxos: k.coins, to: [{ value: req.csdAmount, addr20: r1.csdAddress }], change: k.signer.addr20 }).tx) });
+    await mine(3); await mm.tick(); }
+}
 
 console.log("\n[4] Over the instant limit, the bot waits for confirmations; one payment, one sale");
 { const a = await openSale(40n * 100_000_000n);
