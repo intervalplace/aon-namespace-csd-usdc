@@ -48,11 +48,16 @@ export function saleRequestObject(r: { offerHash: string; csdAmount: bigint; usd
   } as any);
 }
 
-// The seller's signed CSD payment for their sale (references the market maker's authorization)
-export function salePaymentObject(p: { authorizationObjectHash: string; csdTxid: Hex; csdTx: unknown }) {
+// The seller's signed CSD payment for their sale. It references the market maker's authorization
+// object and the trade's hash itself, and carries the maker's signed authorization: so anyone
+// (a watchtower) holding just the trade's hash from Ethereum can find it and settle the sale for
+// the seller with a proof of this payment, whatever the maker publishes or doesn't.
+export function salePaymentObject(p: { authorizationObjectHash?: string; authHash: string; authorization: Record<string, unknown>; authorizationSignature: Hex;
+  csdTxid: Hex; csdTx: unknown }) {
   return finalizeObject({
-    objectType: "payment", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: [p.authorizationObjectHash.toLowerCase()],
-    payload: { paymentType: "csd_usdc_sale_payment", csdTxid: p.csdTxid, csdTx: p.csdTx },
+    objectType: "payment", schemaVersion: "1", namespace: NS, createdAt: Date.now(),
+    references: [p.authorizationObjectHash, p.authHash].filter(Boolean).map(x => String(x).toLowerCase()),
+    payload: { paymentType: "csd_usdc_sale_payment", csdTxid: p.csdTxid, csdTx: p.csdTx, authorization: strings(p.authorization), authorizationSignature: p.authorizationSignature },
   } as any);
 }
 

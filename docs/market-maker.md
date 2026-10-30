@@ -114,21 +114,24 @@ several) to read and publish on, Node 20, and your own funds:
 What the site checks, since it doesn't trust any maker:
 
 - **Proven makers get the orders.** A maker counts once a trade of theirs has
-  settled on Ethereum (the site checks their signed receipts against the
-  contract) or if the site lists it. While any proven maker quotes a side, only
+  settled on Ethereum (the site checks their signed receipt against the
+  settlement transaction's own event: the trade, its amounts and that the
+  maker was a party to it) or if the site lists it. While any proven maker quotes a side, only
   proven makers are used there; so after starting, do one real trade with your
   maker (from another wallet), and it starts receiving orders.
-- **Every sale's lock carries an executor fee** (1 USDC, the bot's
-  `sellExecutorFeeUsdc`). When you release the sale yourself it comes back to
+- **Every sale's lock carries an executor fee** (2 USDC, the bot's
+  `sellExecutorFeeUsdc`; settling with a proof is about 320k gas). When you release the sale yourself it comes back to
   you; if you ever don't, whoever settles the sale for the seller with a proof
   of their payment earns it. The site won't pay into a lock without it.
 - **Your signature over the sale's authorization** must check out, and the
   site marks a trade done only once Ethereum says so.
 
 **Watchtower.** The bot also watches other makers' sales (`WATCHTOWER_MS`,
-on by default): if one never releases a sale its seller has paid, the bot
-settles it for the seller with a proof of the payment 30 minutes before the
-lock runs out, and earns that sale's executor fee. Running more bots means
+on by default). It finds every lock from the contract's events, and the
+seller's payment on AON by the trade's hash (the site's payment object carries
+the maker's signed authorization). If a maker never releases a sale its seller
+has paid, the bot settles it for the seller with a proof of the payment 30
+minutes before the lock runs out, and earns that sale's executor fee. Running more bots means
 more watchtowers.
 
 Follow "Running it" below with your own keys. Your offers appear on the site

@@ -67,6 +67,9 @@ let useHints = false;
 const offers = async () => { const m = useHints ? await get("/market") : null; return A.offers([privateKeyToAccount(MM_KEY).address], m ? [m.offers.sell, m.offers.buy] : []); };
 let noAnswerMs = 15_000;
 const answer = async (o) => { await A.put(o); await mm.watch(); const r = await A.response(o.objectHash, privateKeyToAccount(MM_KEY).address, noAnswerMs); return { ...r, http: r.accepted ? 200 : r.code, objectHash: o.objectHash }; };
+// The seller's payment as the site publishes it (with the maker's signed authorization)
+const payObject = (authHash, tx) => { const t = mm.state().trades[authHash];
+  return salePaymentObject({ authorizationObjectHash: t?.aon?.auth, authHash, authorization: t?.auth ?? {}, authorizationSignature: t?.authSig ?? "0x", csdTxid: "0x", csdTx: tx }); };
 async function post(p, b) {
   if (p === "/buy") {
     const off = (await offers()).sell;
@@ -78,7 +81,7 @@ async function post(p, b) {
   }
   if (p === "/sell/pay") {
     const authObj = mm.state().trades[b.authHash]?.aon?.auth;
-    return answer(salePaymentObject({ authorizationObjectHash: authObj, csdTxid: "0x", csdTx: b.tx }));
+    return answer(payObject(b.authHash, b.tx));
   }
   throw new Error(p);
 }
@@ -344,7 +347,7 @@ let sold;
   // Ten forged payments (not signed by the seller's keys) first: they don't use up the seller's attempts
   for (let i = 0; i < 10; i++) {
     const f = payFor(o); f.tx.inputs = f.tx.inputs.map(x => ({ ...x, scriptSig: new Uint8Array([64, ...new Uint8Array(64).fill(i + 1), 33, ...x.scriptSig.slice(66)]) }));
-    await A.put(salePaymentObject({ authorizationObjectHash: tr(o.authHash).aon.auth, csdTxid: "0x", csdTx: txToNodeJson(f.tx) }));
+    await A.put(payObject(o.authHash, txToNodeJson(f.tx)));
   }
   await mm.watch();
   check(tr(o.authHash).status === "open" && !tr(o.authHash).csdTxid, "ten forged payments for the sale are ignored");
@@ -390,7 +393,7 @@ console.log("\n[4] Over the instant limit, the bot waits for confirmations; one 
   const pa = payFor(a);
   const ra = await post("/sell/pay", { authHash: a.authHash, tx: txToNodeJson(pa.tx) });
   check(ra.instant, `first ~${Number(a.usdcAmount) / 1e6} USDC: instant (limit 10 USDC in flight)`);
-  { const dup = salePaymentObject({ authorizationObjectHash: tr(b.authHash).aon.auth, csdTxid: "0x", csdTx: txToNodeJson(pa.tx) });
+  { const dup = payObject(b.authHash, txToNodeJson(pa.tx));
     await A.put(dup); await mm.watch();
     check(!tr(b.authHash).csdTxid && await A.response(dup.objectHash, mmEvm.address, 1500).then(() => false, () => true),
       "the same payment can't be used for a second sale (it isn't signed by that sale's seller, so it's ignored)"); }
@@ -506,8 +509,12 @@ console.log("\n[7] Restart: state survives, CSD proxy works for the in-site wall
 
 console.log("\n[8] Watchtower: a maker that never releases a paid sale; another bot settles it for the seller");
 { const o = await openSale(10n * 100_000_000n, await fresh(71));
-  check(o.http === 200 && o.authorization.executorFeeAmount === "1000000", "each sale's lock carries a 1 USDC executor fee (back to the maker when it releases)");
+  check(o.http === 200 && o.authorization.executorFeeAmount === "2000000", "each sale's lock carries a 2 USDC executor fee (back to the maker when it releases)");
   await until(() => tr(o.authHash).status === "open");
+  // The maker publishes a fake "payment" for the trade first (signed by a key of its own, from coins that don't exist)
+  const fakeKey = deriveCsdWallet("0x" + "66".repeat(65)).key(0);
+  const fakeTx = buildPayment({ utxos: [{ txid: "0x" + "ab".repeat(32), vout: 0, value: 20n * 100_000_000n, key: fakeKey }], to: [{ value: 10n * 100_000_000n, addr20: o.csdAddress }], change: fakeKey.addr20 }).tx;
+  await A.put(payObject(o.authHash, txToNodeJson(fakeTx)));
   const r = await post("/sell/pay", { authHash: o.authHash, tx: txToNodeJson(payFor(o).tx) });
   check(r.status === "paid" && !r.releaseTx, "the seller paid; the maker hasn't released (instant sales are off here)");
   await mm.stop(); // the maker disappears
@@ -521,7 +528,11 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
   await until(async () => await bal(user.address) > u0, 10_000);
   check(await bal(user.address) === u0 + BigInt(o.usdcAmount) && await read(settlement, "TestCsdUsdcSettlement", "finalizedAuthorization", [o.authHash]),
     "15 minutes before the lock runs out, another bot settles the sale with a proof of the seller's payment: the seller gets the USDC");
-  check(await bal(tower.address) === t0 + 1_000_000n, "and earns the sale's executor fee for it");
+  check(await bal(tower.address) === t0 + 2_000_000n, "and earns the sale's executor fee for it (a fake payment published first didn't stop it)");
+  { const bn = await pub.getBlockNumber(); let gas = 0n;
+    for (let i = 0n; i < 6n && !gas; i++) for (const h of (await pub.getBlock({ blockNumber: bn - i })).transactions) {
+      const tx = await pub.getTransaction({ hash: h }); if (tx.from.toLowerCase() === tower.address.toLowerCase()) { gas = (await pub.getTransactionReceipt({ hash: h })).gasUsed; break; } }
+    console.log(`    (settling with a proof of ${o.authorization.minConfirmations} confirmations used ${gas} gas)`); }
   await tower.stop(); rmSync(STATE + ".tower", { force: true }); }
 
 await mm.stop(); await csd.close(); await aonNode.close();

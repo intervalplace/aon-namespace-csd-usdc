@@ -75,7 +75,7 @@ export type MarketMakerConfig = {
   maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
   maxAonChecksPerPass?: number;  // new buys and sales checked against the chain per look at AON (the rest wait); default 10
   newBuysPerMinute?: number;     // new buys checked per buyer per minute (more get SLOW_DOWN); default 6
-  sellExecutorFeeUsdc?: bigint;  // locked with each sale, paid to whoever settles or releases it (the bot itself when it releases); default 1 USDC
+  sellExecutorFeeUsdc?: bigint;  // locked with each sale, paid to whoever settles or releases it (the bot itself when it releases); default 2 USDC (a settlement is ~320k gas)
   watchtowerMs?: number;         // how often to look for other makers' paid but unreleased sales to settle for their sellers (0: off); default 60000
   sides?: ("sell" | "buy")[];    // what the bot quotes: "sell" = sells CSD (people buy from it), "buy" = buys CSD; default both
   minEthWei?: bigint;            // below this ETH balance no new trades are taken (the rest finishes open ones); default 0.005 ETH
@@ -138,7 +138,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, sides: ["sell", "buy"] as ("sell" | "buy")[], sellExecutorFeeUsdc: 1_000_000n, watchtowerMs: 60_000, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, sides: ["sell", "buy"] as ("sell" | "buy")[], sellExecutorFeeUsdc: 2_000_000n, watchtowerMs: 60_000, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -1089,52 +1089,58 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
 
   // ── watchtower ────────────────────────────────────────────────────────────
   // The market is open, so a seller's counterparty may be any maker. If one never releases a sale
-  // its seller has paid, the bot settles it for the seller with a proof of their CSD payment
-  // before the lock runs out (the sale's executor fee pays the bot for it). Found from recent
-  // payment objects on AON; the seller can always claim it themselves too.
-  const watched = new Map<string, { auth: Record<string, string>; sig: Hex; txid: Hex; tx: CsdTx }>();
-  let towerAt = 0;
+  // its seller has paid, the bot settles it for the seller with a proof of their CSD payment before
+  // the lock runs out (the sale's executor fee pays the bot for it). Locks come from the contract's
+  // events, so a maker can't hide one; payments are found on AON by the trade's hash (the seller's
+  // page references it and includes the maker's signed authorization), and every candidate payment
+  // is kept, so a fake one can't crowd out the real one. The seller can always claim it themselves too.
+  const towerLocks = new Map<string, number>(); // authHash → lockedUntil
+  const towerPays = new Map<string, Map<string, { auth: Record<string, string>; sig: Hex; tx: CsdTx }>>(); // authHash → txid → payment
+  let towerAt = 0, towerFrom: bigint | undefined;
   async function watchtower(force = false) {
     if (!C.watchtowerMs || (!force && Date.now() - towerAt < C.watchtowerMs)) return;
     towerAt = Date.now();
-    let payments: any[] = [];
-    for (const b of aonBases) {
-      for (let page = 0; page < 3; page++) {
-        const j = await tfetch(`${b}/v1/objects?namespace=${encodeURIComponent(NS)}&objectType=payment&limit=100&offset=${page * 100}`).then(r => r.json()).catch(() => null);
-        payments.push(...(j?.objects ?? [])); if ((j?.objects ?? []).length < 100) break;
-      }
+    const latest = await pub.getBlockNumber({ cacheTime: 0 });
+    let from = towerFrom ?? (latest > 7200n ? latest - 7200n : 0n), chunk = BigInt(Math.max(1, Math.min(logChunk, C.logChunkBlocks)));
+    while (from <= latest) {
+      const to = from + chunk - 1n < latest ? from + chunk - 1n : latest;
+      let ls: any[];
+      try { ls = await pub.getLogs({ address: settlement, event: LOCKED_EVENT, fromBlock: from, toBlock: to }); }
+      catch (e) { if (chunk > 1n) { chunk = chunk / 2n; continue; } throw e; }
+      for (const l of ls) { const h = String(l.args.authHash).toLowerCase(); if (!S.trades[h]) towerLocks.set(h, Number(l.args.lockedUntil)); }
+      from = to + 1n; towerFrom = from;
     }
-    const seenAuth = new Set<string>();
-    for (const p of payments) {
-      try {
-        const authObjHash = String(p.references?.[0] ?? "").toLowerCase();
-        if (!/^0x[0-9a-f]{64}$/.test(authObjHash) || seenAuth.has(authObjHash) || p.namespace !== NS) continue;
-        seenAuth.add(authObjHash);
-        const ao = await tfetch(`${aonBases[0]}/v1/objects/${authObjHash}`).then(r => r.json()).then(j => j.object).catch(() => null);
-        const a = ao?.payload?.authorization, sig = ao?.signature?.signature as Hex;
-        if (ao?.objectType !== "authorization" || !a || !sig) continue;
-        const auth = authTuple(a), h = authHashOf(auth);
-        if (watched.has(h) || S.trades[h] || auth.buyer === account.address) continue; // (the bot's own trades are handled already)
-        if (auth.executorFeeAmount < C.sellExecutorFeeUsdc || auth.usdc !== usdc || auth.csdGenesisHash.toLowerCase() !== C.csdGenesis.toLowerCase()) continue;
-        if ((await recoverAddress({ hash: h, signature: sig })).toLowerCase() !== auth.buyer.toLowerCase()) continue;
-        const tx = txFromNodeJson(p.payload?.csdTx), to = auth.sellerCsdScriptHash.slice(0, 42).toLowerCase();
-        if (tx.outputs.filter(o => o.addr20.toLowerCase() === to).reduce((x, o) => x + o.value, 0n) < auth.csdAmount) continue;
-        if (!(await view("usdcLocked", h))) continue;
-        watched.set(h, { auth: strAuth(a), sig, txid: csdTxid(tx), tx });
-        broadcast(tx).catch(() => {}); // (helps the seller's payment along)
-        while (watched.size > 200) watched.delete(watched.keys().next().value!);
-      } catch {}
-    }
+    while (towerLocks.size > 5000) towerLocks.delete(towerLocks.keys().next().value!);
     const tNow = await chainNow();
-    for (const [h, w] of watched) {
+    let checked = 0;
+    for (const [h, until] of [...towerLocks]) {
+      if (tNow > until || S.trades[h]) { towerLocks.delete(h); towerPays.delete(h); continue; }
+      if (until - tNow > 1800) continue; // the maker still has time to release it
+      if (checked++ >= 20) break;
       try {
-        if (!(await view("usdcLocked", h as Hex))) { watched.delete(h); continue; } // released, settled or refunded
-        const until = Number(await view("lockedUntil", h as Hex));
-        if (tNow > until) { watched.delete(h); continue; }
-        if (until - tNow > 1800) continue; // the maker still has time to release it
-        const fake: Trade = { kind: "buy", status: "locked", authHash: h as Hex, createdAt: now(), auth: w.auth, authSig: w.sig, csdAmount: w.auth.csdAmount, usdcAmount: w.auth.usdcAmount, poolUsdc: "0", csdTxid: w.txid };
-        const proofTx = await settleWith(fake);
-        if (proofTx) { log(`[mm] watchtower: settled ${h} for its seller (${proofTx}); the maker never released it`); watched.delete(h); }
+        if (!(await view("usdcLocked", h as Hex))) { towerLocks.delete(h); towerPays.delete(h); continue; } // released, settled or refunded
+        // Every payment published for this trade that pays it in full under the maker's signed authorization
+        const pays = towerPays.get(h) ?? new Map(); towerPays.set(h, pays);
+        for (const o of await aonInbound(h).catch(() => [])) {
+          try {
+            if (o.objectType !== "payment" || o.namespace !== NS || pays.size >= 20) continue;
+            const a = o.payload?.authorization, sig = o.payload?.authorizationSignature as Hex;
+            const auth = authTuple(a);
+            if (authHashOf(auth).toLowerCase() !== h || auth.usdc !== usdc || auth.executorFeeAmount < C.sellExecutorFeeUsdc) continue;
+            if ((await recoverAddress({ hash: h as Hex, signature: sig })).toLowerCase() !== auth.buyer.toLowerCase()) continue;
+            const tx = txFromNodeJson(o.payload?.csdTx), to = auth.sellerCsdScriptHash.slice(0, 42).toLowerCase();
+            if (!csdInputSigners(tx) || tx.outputs.filter(x => x.addr20.toLowerCase() === to).reduce((x, y) => x + y.value, 0n) < auth.csdAmount) continue;
+            const txid = csdTxid(tx);
+            if (!pays.has(txid)) { pays.set(txid, { auth: strAuth(a), sig, tx }); broadcast(tx).catch(() => {}); }
+          } catch {}
+        }
+        // Settled with whichever candidate is in the chain deep enough to prove
+        for (const [txid, w] of pays) {
+          if (confirmations(txid as Hex) < Number(w.auth.minConfirmations)) continue;
+          const fake: Trade = { kind: "buy", status: "locked", authHash: h as Hex, createdAt: now(), auth: w.auth, authSig: w.sig, csdAmount: w.auth.csdAmount, usdcAmount: w.auth.usdcAmount, poolUsdc: "0", csdTxid: txid as Hex };
+          const tx = await settleWith(fake);
+          if (tx) { log(`[mm] watchtower: settled ${h} for its seller (${tx}); the maker never released it`); towerLocks.delete(h); towerPays.delete(h); break; }
+        }
       } catch (e: any) { log(`[mm] watchtower ${h}: ${e.shortMessage ?? e.message}`); }
     }
   }
