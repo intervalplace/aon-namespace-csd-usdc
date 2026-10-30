@@ -58,14 +58,15 @@ const published = { find: (f) => [...aonNode.objects.values()].find(f) };
 const mmCfg = { rpcUrl: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: MM_SEED,
   stateFile: STATE, port: 18990, allowedOrigins: ["https://covenant.market"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n },
   maxUnconfirmedUsdc: 10_000_000n, maxLossUsdc: 1_000_000n, sellPayWindowSecs: 8, trustProxy: true,
-  pollMs: 60_000, watchMs: 600_000, rebroadcastSecs: 1, log: (...a) => logs.push(a.join(" ")), aonNodeUrl: aonNode.url };
+  pollMs: 60_000, watchMs: 600_000, rebroadcastSecs: 1, declinedCheckMs: 0, newBuysPerMinute: 1000, log: (...a) => logs.push(a.join(" ")), aonNodeUrl: aonNode.url };
 let mm = await startMarketMaker(mmCfg);
 const API = "http://127.0.0.1:18990/api";
 const get = async (p) => { const r = await fetch(API + p); return { ...(await r.json()), http: r.status }; };
 // Trading goes over AON: publish an object, let the market maker look, read its signed response
 let useHints = false;
 const offers = async () => { const m = useHints ? await get("/market") : null; return A.offers([privateKeyToAccount(MM_KEY).address], m ? [m.offers.sell, m.offers.buy] : []); };
-const answer = async (o) => { await A.put(o); await mm.watch(); const r = await A.response(o.objectHash, privateKeyToAccount(MM_KEY).address, 15_000); return { ...r, http: r.accepted ? 200 : r.code, objectHash: o.objectHash }; };
+let noAnswerMs = 15_000;
+const answer = async (o) => { await A.put(o); await mm.watch(); const r = await A.response(o.objectHash, privateKeyToAccount(MM_KEY).address, noAnswerMs); return { ...r, http: r.accepted ? 200 : r.code, objectHash: o.objectHash }; };
 async function post(p, b) {
   if (p === "/buy") {
     const off = (await offers()).sell;
@@ -274,13 +275,37 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   check(rr.accepted === true && tr(real.hash), "after 30 signed buys from wallets with no USDC, a real buyer is answered and served");
   check(junk.every(j => ![...aonNode.objects.values()].some(x => x.objectType === "response" && x.references.includes(j.objectHash.toLowerCase())))
     && Object.keys(mm.state().rejectedBuys ?? {}).length <= 2, "the junk got no answers and isn't kept anywhere");
-  await until(() => tr(real.hash).status === "locked"); await mine(10); await mm.tick(); await mm.tick(); }
+  await until(() => tr(real.hash).status === "locked"); await mine(10); await mm.tick(); await mm.tick();
+  // One funded wallet publishing many buys at once: only its newest is looked at, and it can't fill the declined list
+  const many = [];
+  for (let i = 0; i < 20; i++) {
+    const x = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount) / 2n, key: userCsd.key(40 + i) });
+    const xo = buyAuthorizationObject({ offerHash: (await offers()).sell.objectHash, authorization: x.body.authorization, signature: x.body.signature, domain, types: AUTH_TYPES, addressProof: x.body.addressProof, permit: x.body.permit });
+    await A.put(xo); many.push(xo);
+  }
+  await mm.watch(); await mm.watch();
+  const answered = many.filter(j => [...aonNode.objects.values()].some(x => x.objectType === "response" && x.references.includes(j.objectHash.toLowerCase())));
+  const mineDeclined = Object.values(mm.state().rejectedBuys ?? {}).filter(x => x.buyer.toLowerCase() === user.address.toLowerCase()).length;
+  check(answered.length === 1 && answered[0] === many[19] && mineDeclined <= 5, `20 buys from one wallet at once: only the newest is handled (answered ${answered.length}); at most 5 of its declined buys are kept (${mineDeclined})`); }
 
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
 { const csdAmount = 40n * 100_000_000n, quote = quoteSell(pool(), csdAmount) - 250_000n, mid0 = midPrice(pool()), m0ask = (await get("/market")).bestAsk;
   const thief = deriveCsdWallet("0x" + "77".repeat(65)).key(0);
-  check((await openSale(csdAmount, { signer: thief })).error === "COINS_NOT_YOURS_OR_SPENT", "a sale backed by someone else's coins is refused");
+  // Sale requests signed by throwaway keys that own nothing: ignored before any budget is spent
+  const so = (await offers()).buy.objectHash, junkSales = [];
+  for (let i = 0; i < 30; i++) {
+    const k = deriveCsdWallet(keccak256(toHex("junk-seller" + i)) + "00").key(0);
+    const jr = { csdAmount: csdAmount, usdcRecipient: user.address, validUntil: Math.floor(Date.now() / 1000) + 300, coins: [{ txid: "0x" + "ee".repeat(32), vout: i }] };
+    const jo = saleRequestObject({ offerHash: so, ...jr, minUsdcOut: 0n, proofs: [csdSignDigest(k, csdSaleRequestDigest(jr))], owners: [k.addr20] });
+    await A.put(jo); junkSales.push(jo);
+  }
+  await mm.watch();
+  check(junkSales.every(j => ![...aonNode.objects.values()].some(x => x.objectType === "response" && x.references.includes(j.objectHash.toLowerCase())))
+    && !Object.values(mm.state().trades).some(t => t.kind === "sell" && t.status === "opening"), "30 sale requests signed by keys that own nothing are ignored");
+  noAnswerMs = 1500;
+  check((await openSale(csdAmount, { signer: thief }).catch(e => ({ error: e.message }))).error === "NO_RESPONSE", "a sale signed by keys that don't own its coins is ignored (no answer, nothing kept)");
+  noAnswerMs = 15_000;
   const o = await openSale(csdAmount, { minUsdcOut: quote });
   check(o.http === 200 && o.lockTx && o.csdAddress, "bot opens the trade: locks its USDC against a fresh CSD address");
   { const { objectHash: _x, ...orig } = aonNode.objects.get(o.objectHash.toLowerCase());
@@ -373,8 +398,10 @@ console.log("\n[5] Coins already spent, a payment too late, and a sale nobody pa
     "two unpaid sales in an hour pause selling for new sellers (each costs the bot two transactions)");
   const keep = await openSale(10n * 100_000_000n);
   check(keep.http === 200, "a seller with completed sales (and none left unpaid) can still sell while it's paused");
-  const o3 = await openSale(10n * 100_000_000n, { signer: userCsd.key(22), coins: (await userNode.utxos(userCsd.key(22))).filter(c => !o2.sel.some(x => x.txid === c.txid && x.vout === c.vout)) });
-  check(o3.error === "SELLS_PAUSED" || o3.error === "COINS_FROM_AN_UNPAID_SALE" || o3.error === "NOT_ENOUGH_COINS" || o3.http !== 200, "an address that left a sale unpaid gets no exemption");
+  noAnswerMs = 1500;
+  const o3 = await openSale(10n * 100_000_000n, { signer: userCsd.key(22), coins: (await userNode.utxos(userCsd.key(22))).filter(c => !o2.sel.some(x => x.txid === c.txid && x.vout === c.vout)) }).catch(e => ({ error: e.message }));
+  noAnswerMs = 15_000;
+  check(o3.error === "SELLS_PAUSED" || o3.error === "COINS_FROM_AN_UNPAID_SALE" || o3.error === "NOT_ENOUGH_COINS" || o3.error === "NO_RESPONSE" || o3.http !== 200, "an address that left a sale unpaid gets no exemption");
   await until(() => tr(keep.authHash).status === "open");
   await post("/sell/pay", { authHash: keep.authHash, tx: txToNodeJson(payFor(keep).tx) });
   await rpc("evm_increaseTime", [120 * 60]); await rpc("evm_mine"); await mm.tick(); await mm.tick();
