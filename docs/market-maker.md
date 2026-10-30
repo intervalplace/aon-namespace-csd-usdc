@@ -1,7 +1,8 @@
 # Market maker: instant CSD ↔ USDC
 
 `src/market-maker.ts` is an always-available counterparty for the CSD/USDC
-market on covenant.market. With it, trades feel like an ordinary swap: about
+market on covenant.market, and **anyone can run one**: the market is open
+(see "Run your own" below). With it, trades feel like an ordinary swap: about
 one Ethereum block (~12 s) in either direction, with no CSD confirmations to
 wait for and no ETH needed by the user. No consensus change and no custody of
 user funds: the bot is a trader with a key, CSD and USDC.
@@ -25,7 +26,8 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
    - a USDC **permit** (EIP-2612), so no approval transaction and no ETH;
    - an **address proof**: the user's CSD key signs the authorization hash, so
      nobody can open trades on someone else's address.
-2. `POST /api/buy`. The bot checks the price against its pool, submits
+2. The site publishes this on AON as an `authorization` object referencing
+   the bot's signed offer; the bot answers with a signed `response`. The bot checks the price against its pool, submits
    `lockCsdUsdcAuthorizationWithPermit` (paying the gas) and sends the CSD
    **as soon as the USDC is locked on-chain** (about one Ethereum block). It
    checks the contract, not its own transaction: if someone else submitted the
@@ -38,7 +40,8 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
 
 ### User sells CSD
 
-1. `POST /api/sell/open`: the bot locks its USDC for the trade, against a fresh
+1. The seller's `request` object on AON (referencing the bot's offer, signed
+   with the CSD keys that own the coins): the bot locks its USDC for the trade, against a fresh
    CSD address of its own (with its own address proof), requiring 20
    confirmations to prove a payment, which makes faking one expensive (it
    releases early anyway). The seller names the exact confirmed coins they'll
@@ -50,8 +53,9 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
    pause, since each unpaid sale costs the bot two transactions.
 2. The site recomputes the trade hash from the returned authorization and
    checks on-chain that the USDC is locked, paying the user, for this amount.
-3. The in-site wallet signs the CSD payment and hands it to the bot
-   (`POST /api/sell/pay`), and broadcasts it itself too. The bot checks it
+3. The in-site wallet signs the CSD payment and publishes it on AON as a
+   `payment` object (referencing the bot's authorization for the sale), and
+   broadcasts it itself too. The bot checks it
    spends confirmed coins not already spent in the mempool and pays a real
    fee, broadcasts it and immediately submits `releaseEarly`: **the user has
    USDC after about one Ethereum block**, with no CSD block mined. If the bot
@@ -65,16 +69,54 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
    more of your CSD nodes in `CSD_BROADCAST_APIS` so payments reach the
    network from several places.
 
-## API
+## Trading happens on AON
 
-| | |
-|---|---|
-| `GET /api/market` | pool, mid/bid/ask, an 8-level order book from the curve, limits, recent trades, contract addresses |
-| `POST /api/buy` | `{ authorization, signature, addressProof, permit }` |
-| `POST /api/sell/open` | `{ csdAmount, usdcRecipient, minUsdcOut }` |
-| `POST /api/sell/pay` | `{ authHash, tx }` (the node's `/tx/submit` JSON) |
-| `GET /api/trade/:authHash` | trade status |
-| `GET /api/csd/tip`, `/utxos/:addr`, `/address/:addr/activity`, `/tx/:id`, `/block/height/:h`; `POST /api/csd/tx/submit` | the CSD node, for the in-site wallet |
+Every step is a public object in the `aon:csd-usdc` namespace
+(`src/aon-client.ts` builds and reads them):
+
+| object | from | references |
+|---|---|---|
+| `offer` (sell CSD / buy CSD) | market maker, signed | the maker's previous offer on that side |
+| `authorization` (a buy) | buyer, EIP-712 | the offer |
+| `request` (a sale) | seller, signed by the coins' CSD keys | the offer |
+| `authorization` (the sale's lock) | market maker | the request |
+| `payment` (the seller's CSD transaction) | seller | the maker's authorization |
+| `response` | market maker, signed | the object it answers |
+| `release`, `proof`, `receipt` | market maker (receipts signed) | the trade's objects |
+
+Anyone can publish anything to AON, so the bot only spends effort on objects
+that prove something for free first (signatures; for sales, keys that own the
+coins; for payments, the sale's own seller), keeps separate queues for
+payments, buys and sales, and serves known traders first.
+
+The bot's small HTTP API is read-only: `GET /api/market` (pool, book, recent
+trades, its current offer hashes) and `GET /api/trade/:authHash`, plus a proxy
+to its CSD node for the in-site wallet (`/api/csd/tip`, `/utxos/:addr`,
+`/block/height/:h`, `/proof/tx/:txid` for sales' payments, `POST /api/csd/tx/submit`).
+
+## Run your own
+
+The market is open: there is no list of approved market makers. covenant.market
+finds every maker's signed offers on AON, merges them into one order book and
+sends each trade to the best price. A user never has to trust a maker: a buyer's
+USDC only reaches the maker with a proof that the CSD was paid, and a seller's
+CSD only leaves their wallet once the maker's USDC is locked for them.
+
+To be a market maker you need a CSD node, an Ethereum RPC, an AON node (or
+several) to read and publish on, Node 20, and your own funds:
+
+- **Both sides** (default): CSD and USDC, and the pool ratio is your price.
+- **Sell only** (`SIDES=sell`), e.g. a miner selling what they mine: just CSD
+  (and ETH for gas). `POOL_USDC` is then only a price setting (POOL_USDC ÷
+  POOL_CSD is your starting price); USDC arrives as you sell.
+- **Buy only** (`SIDES=buy`): just USDC.
+
+Follow "Running it" below with your own keys. Your offers appear on the site
+on their own; each new offer references your previous one, so a browser that
+has seen any of your offers follows the chain to your current price. Price
+carefully: with several makers, anyone can buy from the cheapest and sell to
+the dearest. Note that the contract caps all open locks together
+(`maxTotalLocked`, 300 USDC), shared by every maker.
 
 ## Running it
 
@@ -98,6 +140,8 @@ POOL_CSD=1000
 STATE_FILE=/var/lib/covenant-mm/state.json
 ALLOWED_ORIGINS=https://covenant.market
 AON_NODE_URL=http://127.0.0.1:8787    # AON node(s), comma-separated: trades are requested and answered there
+SIDES=sell,buy                        # or just "sell" (only sell CSD) or "buy"
+MIN_ETH=0.005                         # below this ETH balance no new trades are taken
 ```
 
 ```bash

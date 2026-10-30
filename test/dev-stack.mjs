@@ -44,9 +44,16 @@ csd.mine({ rewardTo: deriveCsdWallet(SEED).key(0).addr20, reward: 1000n * 100_00
 setInterval(() => csd.mine(), Number(process.env.CSD_BLOCK_SECS ?? 20) * 1000);
 
 const aon = await startFakeAonNode({ port: 18993 });
-const STATE = "/tmp/claude-0/dev-mm-state.json"; rmSync(STATE, { force: true });
+const STATE = "/tmp/claude-0/dev-mm-state.json"; rmSync(STATE, { force: true }); rmSync(STATE + ".m2", { force: true });
 await startMarketMaker({ rpcUrl: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: SEED,
   stateFile: STATE, port: 18990, allowedOrigins: ["*"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n }, pollMs: 3000, aonNodeUrl: aon.url, watchMs: 500 });
+
+// A second, independent market maker: a "miner" that only sells CSD, a little cheaper
+const M2_KEY = "0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba", M2_SEED = "0x" + "6f".repeat(32);
+csd.mine({ rewardTo: deriveCsdWallet(M2_SEED).key(0).addr20, reward: 500n * 100_000_000n });
+await startMarketMaker({ rpcUrl: RPC, chainId: 31337, privateKey: M2_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: M2_SEED,
+  stateFile: STATE + ".m2", port: 18994, allowedOrigins: ["*"], initialPool: { usdc: 70_000_000n, csd: 500n * 100_000_000n }, pollMs: 3000, aonNodeUrl: aon.url, watchMs: 500,
+  sides: ["sell"], log: (...a) => console.log("[m2]", ...a) });
 
 const info = { rpc: RPC, usdc, settlement, genesis: GENESIS, mm: "http://127.0.0.1:18990", mmAddress: privateKeyToAccount(MM_KEY).address, aon: aon.url, csdNode: csd.url, user: USER };
 writeFileSync(new URL("./dev-stack.json", import.meta.url), JSON.stringify(info, null, 2));

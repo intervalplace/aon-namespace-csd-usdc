@@ -75,6 +75,7 @@ export type MarketMakerConfig = {
   maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
   maxAonChecksPerPass?: number;  // new buys and sales checked against the chain per look at AON (the rest wait); default 10
   newBuysPerMinute?: number;     // new buys checked per buyer per minute (more get SLOW_DOWN); default 6
+  sides?: ("sell" | "buy")[];    // what the bot quotes: "sell" = sells CSD (people buy from it), "buy" = buys CSD; default both
   minEthWei?: bigint;            // below this ETH balance no new trades are taken (the rest finishes open ones); default 0.005 ETH
   declinedCheckMs?: number;
   logChunkBlocks?: number;       // blocks per log query (some RPC providers allow few); default 500, halved on errors      // how often declined buys are checked for locks someone made anyway; default 60000
@@ -135,7 +136,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, sides: ["sell", "buy"] as ("sell" | "buy")[], logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -408,9 +409,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     // A new offer whenever the pool changes (so the book on AON is always the real price), or every 30 minutes
     const stale = (o?: Offer) => !o || t - o.at > 1800 || o.poolKey !== poolKey;
     S.offers ??= {};
-    for (const side of ["sell", "buy"] as const) {
+    for (const side of C.sides) {
       if (!stale(S.offers[side])) continue;
-      const o = await signed({ objectType: "offer", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: [],
+      // Each offer references the one it replaces, so anyone holding an old one can find the newest
+      const o = await signed({ objectType: "offer", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(S.offers[side]?.hash),
         payload: { offerType: side === "sell" ? "csd_usdc_sell_csd" : "csd_usdc_buy_csd", marketMaker: account.address, settlementContract: settlement, usdc,
           csdGenesisHash: C.csdGenesis, pricing: "pool", poolUsdc: String(p.usdc), poolCsd: String(p.csd), midUsdcPerCsd: String(mid),
           spreadBps: String(C.spreadBps), feeUsdc: String(C.feeUsdc), minTradeUsdc: String(C.minTradeUsdc), maxTradeUsdc: String(C.maxTradeUsdc), validBefore: t + 3600 } });
@@ -868,9 +870,11 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         const h = authHashOf(auth);
         if ((await recoverAddress({ hash: h, signature: o.signature?.signature })).toLowerCase() !== auth.buyer.toLowerCase()) return null;
         const b = auth.buyer.toLowerCase();
+        if (!C.sides.includes("sell")) return null; // not selling CSD
         return { kind: "buy", from: b, id: h, known: isKnown(b) };
       }
       if (o.objectType === "request" && P.requestType === "csd_usdc_sale") {
+        if (!C.sides.includes("buy")) return null; // not buying CSD
         const signers = saleSigners(o); if (!signers) return null;
         const id = saleDigest(P, BigInt(P.csdAmount), getAddress(P.usdcRecipient))!;
         return { kind: "sale", from: signers.join(","), id, known: signers.some(isKnown) };

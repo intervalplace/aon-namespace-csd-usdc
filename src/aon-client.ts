@@ -66,8 +66,8 @@ export function aonApi(base: string, fetchImpl: typeof fetch = fetch) {
       return o.objectHash as string;
     },
     async inbound(hash: string): Promise<any[]> { const r = await fetchImpl(`${url}/v1/objects/${hash}/references`); return (await r.json()).inbound ?? []; },
-    async list(objectType: string, limit = 30): Promise<any[]> {
-      const r = await fetchImpl(`${url}/v1/objects?namespace=${encodeURIComponent(NS)}&objectType=${objectType}&limit=${limit}`);
+    async list(objectType: string, limit = 30, offset = 0): Promise<any[]> {
+      const r = await fetchImpl(`${url}/v1/objects?namespace=${encodeURIComponent(NS)}&objectType=${objectType}&limit=${limit}&offset=${offset}`);
       return (await r.json()).objects ?? [];
     },
     async get(hash: string): Promise<any | null> {
@@ -87,6 +87,55 @@ export function aonApi(base: string, fetchImpl: typeof fetch = fetch) {
       };
       for (const h of hints) if (/^0x[0-9a-fA-F]{64}$/.test(h)) await consider(await this.get(h).catch(() => null));
       if (!out.sell || !out.buy) for (const o of await this.list("offer", 40)) await consider(o);
+      return out;
+    },
+    // Every market maker's current offers: anyone can be one, so nothing here is a list of
+    // approved makers. An offer counts if it's signed by the market maker it names, unexpired,
+    // and not dated in the future; the newest per maker and side wins. Offers are found two ways:
+    //   - from `hints` (offer hashes the page already knows), following each maker's chain of
+    //     offers (each new offer references the one it replaces) to the newest
+    //   - by listing recent offers (a few pages), for makers the page hasn't seen yet
+    async allOffers(hints: string[] = [], pages = 3): Promise<Map<string, { sell?: any; buy?: any }>> {
+      const out = new Map<string, { sell?: any; buy?: any }>(), now = Date.now();
+      const sideOf = (o: any) => o?.objectType !== "offer" ? null : o.payload?.offerType === "csd_usdc_sell_csd" ? "sell" : o.payload?.offerType === "csd_usdc_buy_csd" ? "buy" : null;
+      const fresh = (o: any) => !(Number(o.payload?.validBefore) < now / 1000) && Number(o.createdAt) <= now + 120_000;
+      const consider = async (o: any) => {
+        const side = sideOf(o); if (!side || !fresh(o)) return false;
+        const mm = String(o.payload?.marketMaker ?? "").toLowerCase(), cur = out.get(mm)?.[side];
+        if (cur && Number(cur.createdAt) >= Number(o.createdAt)) return false;
+        const signer = await objectSigner(o);
+        if (!signer || signer.toLowerCase() !== mm) return false;
+        out.set(mm, { ...out.get(mm), [side]: o });
+        return true;
+      };
+      for (const h of [...new Set(hints.filter(x => /^0x[0-9a-fA-F]{64}$/.test(x)).map(x => x.toLowerCase()))].slice(0, 40)) {
+        let o = await this.get(h).catch(() => null);
+        for (let hop = 0; o && hop < 30; hop++) {
+          const side = sideOf(o), mm = String(o?.payload?.marketMaker ?? "").toLowerCase();
+          if (!side || (await objectSigner(o))?.toLowerCase() !== mm) break;
+          await consider(o);
+          // the newest offer from the same maker and side that references this one
+          const next = (await this.inbound(o.objectHash).catch(() => []))
+            .filter(x => sideOf(x) === side && String(x.payload?.marketMaker ?? "").toLowerCase() === mm && Number(x.createdAt) > Number(o.createdAt) && Number(x.createdAt) <= now + 120_000)
+            .sort((a, b) => Number(b.createdAt) - Number(a.createdAt))[0];
+          if (!next || (await objectSigner(next))?.toLowerCase() !== mm) break;
+          o = next;
+        }
+      }
+      for (let p = 0; p < pages; p++) {
+        const page = await this.list("offer", 100, p * 100).catch(() => []);
+        for (const o of page) await consider(o);
+        if (page.length < 100) break;
+      }
+      return out;
+    },
+    // Recent trades from market makers' signed receipts (only from the given makers)
+    async receipts(marketMakers: string[], limit = 50): Promise<any[]> {
+      const mm = new Set(marketMakers.map(a => a.toLowerCase())), out: any[] = [];
+      for (const o of await this.list("receipt", limit).catch(() => [])) {
+        const signer = (await objectSigner(o))?.toLowerCase();
+        if (signer && mm.has(signer)) out.push({ ...o, signer });
+      }
       return out;
     },
     // The market maker's signed receipt for a trade (references the trade's authorization object)

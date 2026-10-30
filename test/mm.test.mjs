@@ -478,6 +478,18 @@ console.log("\n[6b] CSD received for finished sales is swept into the bot's main
   const done = Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.status === "done");
   check(done.length >= 3 && done.every(t => t.swept), `all ${done.length} finished sales' addresses are emptied and no longer looked up`); }
 
+console.log("\n[6c] Open market: any maker's offers are found, even under junk, by following its chain of offers");
+{ const first = [...aonNode.objects.values()].filter(o => o.objectType === "offer" && o.payload?.marketMaker === mmEvm.address && o.payload.offerType === "csd_usdc_sell_csd")
+    .sort((a, b) => a.createdAt - b.createdAt)[0];
+  for (let i = 0; i < 320; i++) await A.put(finalizeObject({ objectType: "offer", schemaVersion: "1", namespace: "aon:csd-usdc", createdAt: Date.now() + 3600_000 + i, references: [],
+    payload: { offerType: "csd_usdc_sell_csd", marketMaker: "0x" + (i + 1).toString(16).padStart(40, "0"), validBefore: 9e9 } }));
+  const listed = await A.allOffers([]);
+  const chained = await A.allOffers([first.objectHash]);
+  const cur = mm.state().offers.sell.hash;
+  check(!listed.get(mmEvm.address.toLowerCase())?.sell, "320 junk offers bury the real ones in a plain listing");
+  check(first.objectHash !== cur && chained.get(mmEvm.address.toLowerCase())?.sell?.objectHash === cur && chained.size === 1,
+    "from an old offer the page follows the maker's chain to its current one (and none of the unsigned junk counts)"); }
+
 console.log("\n[7] Restart: state survives, CSD proxy works for the in-site wallet");
 { const before = JSON.stringify(mm.state()); await mm.stop();
   mm = await startMarketMaker(mmCfg);
