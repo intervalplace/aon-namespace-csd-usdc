@@ -26,8 +26,11 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
    - an **address proof**: the user's CSD key signs the authorization hash, so
      nobody can open trades on someone else's address.
 2. `POST /api/buy`. The bot checks the price against its pool, submits
-   `lockCsdUsdcAuthorizationWithPermit` (paying the gas) and **in the same
-   moment** sends the CSD. The site shows it as incoming immediately.
+   `lockCsdUsdcAuthorizationWithPermit` (paying the gas) and sends the CSD
+   **as soon as the USDC is locked on-chain** (about one Ethereum block). It
+   checks the contract, not its own transaction: if someone else submitted the
+   same lock first it still sends; if the lock never happened it sends nothing.
+   The permit lasts 5 minutes, so a signed buy can't be used later.
 3. After the user's chosen confirmations (3–20), the bot proves its payment
    with `settleCsdUsdc` and receives the USDC. If it never does, the user's
    USDC is refunded. **The user takes no risk**; only the bot waits.
@@ -35,18 +38,28 @@ price: 150 USDC + 1,000 CSD starts at 0.15 USDC per CSD.
 ### User sells CSD
 
 1. `POST /api/sell/open`: the bot locks its USDC for the trade, against a fresh
-   CSD address of its own (with its own address proof).
+   CSD address of its own (with its own address proof), requiring 20
+   confirmations to prove a payment, which makes faking one expensive (it
+   releases early anyway). The price is fixed at this point but the pool only
+   moves once the CSD is paid, and the seller has 3 minutes to pay. Each client
+   can have one sale waiting, at most 3 wait at once, and if 4 go unpaid in an
+   hour sales pause, since each unpaid sale costs the bot two transactions.
 2. The site recomputes the trade hash from the returned authorization and
    checks on-chain that the USDC is locked, paying the user, for this amount.
 3. The in-site wallet signs the CSD payment and hands it to the bot
-   (`POST /api/sell/pay`). The bot broadcasts it and immediately submits
-   `releaseEarly`: **the user has USDC after one Ethereum block**, with no CSD
-   block mined. If the bot disappears instead, the user can still settle with a
-   proof after 3 confirmations, so the user takes no risk here either.
-4. The bot carries the risk that the CSD payment is double-spent. Trades it
-   trusts before CSD confirms are capped (`MAX_INSTANT_USDC`, default 60 USDC
-   at once); above that it waits for one CSD block before releasing. A
-   double-spend is detected and recorded as a loss in the state file.
+   (`POST /api/sell/pay`), and broadcasts it itself too. The bot checks it
+   spends confirmed coins not already spent in the mempool and pays a real
+   fee, broadcasts it and immediately submits `releaseEarly`: **the user has
+   USDC after about one Ethereum block**, with no CSD block mined. If the bot
+   disappears instead, the site's "Claim" button settles the sale with a proof
+   of the payment, so the user takes no risk here either.
+4. The bot carries the risk that the CSD payment is double-spent. Instant
+   releases are limited: 60 USDC in flight (`MAX_INSTANT_USDC`), 30 USDC per
+   hour per recipient, and none at all once recorded losses reach
+   `MAX_LOSS_USDC` (default 30). Otherwise it waits for one CSD block. A
+   double-spend is detected and recorded as a loss in the state file. List
+   more of your CSD nodes in `CSD_BROADCAST_APIS` so payments reach the
+   network from several places.
 
 ## API
 
@@ -119,6 +132,12 @@ mm.covenant.market {
     reverse_proxy 127.0.0.1:8890
 }
 ```
+
+## Deepening the pool
+
+Stop the bot, then `npx tsx scripts/market-maker.ts --top-up 500`: it prints
+the CSD that goes with 500 USDC at the current price. Send both to the bot's
+addresses, rerun with `--yes`, and start the bot again. The price doesn't move.
 
 ## Costs and limits
 
