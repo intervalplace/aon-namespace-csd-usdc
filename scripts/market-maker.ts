@@ -67,6 +67,7 @@ const mm = await startMarketMaker({
   spreadBps:     BigInt(env("SPREAD_BPS", "300")),
   feeUsdc:       usdcUnits(env("FEE_USDC", "0.25")),
   maxUnconfirmedUsdc: usdcUnits(env("MAX_INSTANT_USDC", "60")),
+  minEthWei:     BigInt(Math.round(Number(env("MIN_ETH", "0.005")) * 1e6)) * 10n ** 12n, // new trades stop below this
   // Requests arrive over AON and every trade is published there
   aonNodeUrl:    env("AON_NODE_URL", "http://127.0.0.1:8787"),
 });

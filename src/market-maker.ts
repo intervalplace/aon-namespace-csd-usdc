@@ -75,6 +75,7 @@ export type MarketMakerConfig = {
   maxRequestsPerMinute?: number; // per client, for the trading endpoints; default 20
   maxAonChecksPerPass?: number;  // new buys and sales checked against the chain per look at AON (the rest wait); default 10
   newBuysPerMinute?: number;     // new buys checked per buyer per minute (more get SLOW_DOWN); default 6
+  minEthWei?: bigint;            // below this ETH balance no new trades are taken (the rest finishes open ones); default 0.005 ETH
   declinedCheckMs?: number;
   logChunkBlocks?: number;       // blocks per log query (some RPC providers allow few); default 500, halved on errors      // how often declined buys are checked for locks someone made anyway; default 60000
   lateLockSlackSecs?: number;    // a buy's lock may have this much less than its full window and still be paid; default 300
@@ -134,7 +135,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
-    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
+    sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
@@ -184,6 +185,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // The difficulty to sign: 3/4 of the current one, and never stricter than the blocks being mined
   const signTarget = (bits: number) => { const s = suggestedMaxTarget(bits), t = bitsToTarget(bits); return s > t ? s : t; };
   const chainNow = async () => Number((await pub.getBlock()).timestamp);
+  // Every open trade still needs the bot's gas to finish (settling a buy, releasing a sale, refunds).
+  // Below the reserve, new trades are declined so what's left goes to those.
+  let lowGasLogged = 0;
+  async function needGas() {
+    const eth = await pub.getBalance({ address: account.address });
+    if (eth >= C.minEthWei) return;
+    if (Date.now() - lowGasLogged > 600_000) { lowGasLogged = Date.now(); log(`[mm] LOW GAS: ${Number(eth) / 1e18} ETH; not taking new trades until topped up`); }
+    throw new HttpError(503, "MARKET_MAKER_PAUSED");
+  }
   const authHashOf = (auth: any) => hashTypedData({ domain, types: AUTH_TYPES, primaryType: "CsdUsdcAuthorization", message: authTuple(auth) });
   const strAuth = (a: any) => Object.fromEntries(Object.entries(authTuple(a)).map(([k, v]) => [k, String(v)]));
   const view = (fn: any, h: Hex) => pub.readContract({ address: settlement, abi: VIEWS, functionName: fn, args: [h] }) as Promise<any>;
@@ -469,6 +479,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (buyerBal < auth.usdcAmount + auth.executorFeeAmount) bad("NOT_ENOUGH_USDC");
     const pending = Object.values(S.trades).filter(t => t.kind === "buy" && t.status === "locking").reduce((s, t) => s + BigInt(t.csdAmount) + CSD_FEE, 0n);
     pick(await spendable(), pending + auth.csdAmount + CSD_FEE); // enough CSD for this and the buys still locking
+    await needGas();
     const permit = body.permit ? { deadline: BigInt(body.permit.deadline), v: Number(body.permit.v), r: body.permit.r, s: body.permit.s } : undefined;
     const sig = body.signature as Hex;
     // Its permit is public on AON, so anyone may already have submitted the lock: then there's nothing to send
@@ -560,6 +571,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (usdcAmount > C.maxTradeUsdc || usdcAmount < C.minTradeUsdc) bad("TRADE_SIZE");
     const bal = await pub.readContract({ address: usdc, abi: ERC20, functionName: "balanceOf", args: [account.address] });
     if (bal < usdcAmount) throw new HttpError(503, "NOT_ENOUGH_USDC_RIGHT_NOW");
+    await needGas();
     const tip = await node.tip(); const bits = Number((await node.headerAt(tip.height)).bits);
     const keyIndex = S.nextKey++; const k = key(keyIndex); const t0 = await chainNow();
     // Many confirmations: the bot releases early anyway, and it makes faking a proof against its own locks expensive

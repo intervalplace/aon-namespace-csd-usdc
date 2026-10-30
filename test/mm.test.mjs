@@ -297,6 +297,13 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   const strip = (x) => JSON.stringify({ ...x, to: undefined });
   check(rcp && rcp.to === copy.objectHash && strip(rcp) === strip(ra0), "a republished copy of an already-decided buy gets the same answer, and isn't handled again"); }
 
+console.log("\n[2d] Low on ETH: no new trades, so what's left finishes the open ones");
+{ const eth = await pub.getBalance({ address: mmEvm.address });
+  await rpc("anvil_setBalance", [mmEvm.address, "0x" + (10n ** 15n).toString(16)]); // 0.001 ETH
+  const x = await signBuy({ csdAmount: 10n * 100_000_000n, usdcAmount: quoteBuy(pool(), 10n * 100_000_000n), key: userCsd.key(60) });
+  check((await post("/buy", x.body)).error === "MARKET_MAKER_PAUSED" && !tr(x.hash) && logs.some(l => l.includes("LOW GAS")), "below the ETH reserve a new buy is declined (nothing locked) and the operator is warned");
+  await rpc("anvil_setBalance", [mmEvm.address, "0x" + eth.toString(16)]); }
+
 console.log("\n[3] User sells 40 CSD: USDC released before any CSD block");
 let sold;
 { const csdAmount = 40n * 100_000_000n, quote = quoteSell(pool(), csdAmount) - 250_000n, mid0 = midPrice(pool()), m0ask = (await get("/market")).bestAsk;
