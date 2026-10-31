@@ -9,7 +9,7 @@
 //
 // Env: FILM_KEY_FILE (/root/film-key), FILM_BUY (20 CSD), FILM_SELL ("max", or an amount of CSD), FILM_OUT (/root/film),
 // FILM_SITE (https://covenant.market/csd), FILM_RPC (https://ethereum-rpc.publicnode.com),
-// FILM_W/FILM_H (1600x900)
+// FILM_W/FILM_H (1600x900), FILM_FAST (8: waits play 8x faster, marked on screen; 1: real time)
 
 import { chromium } from "playwright";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
@@ -22,6 +22,7 @@ const RPC = process.env.FILM_RPC ?? "https://ethereum-rpc.publicnode.com";
 const OUT = process.env.FILM_OUT ?? "/root/film";
 const BUY = process.env.FILM_BUY ?? "20", SELL = process.env.FILM_SELL ?? "max"; // "max": sells all of it
 const CHAIN = Number(process.env.FILM_CHAIN ?? 1);
+const FAST = Number(process.env.FILM_FAST ?? 8); // waits (Ethereum blocks) play this many times faster, with a badge saying so
 const W = Number(process.env.FILM_W ?? 1600), H = Number(process.env.FILM_H ?? 900);
 const log = (...a) => console.log(new Date().toISOString().slice(11, 19), ...a);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -92,11 +93,30 @@ async function done(ctx, record) {
   renameSync(`${dir}/${f}`, `${OUT}/${record}.webm`); rmSync(dir, { recursive: true, force: true });
   log(`clip ${record} saved`);
 }
+// Where each clip starts (after the page has loaded) and which stretches are waits to fast-forward
+const cuts = {}; let cur = null;
+const at = () => (Date.now() - cur.t0) / 1000;
+async function fastOn(page, what) {
+  if (FAST <= 1) return;
+  await page.evaluate(([what, k]) => {
+    const b = document.createElement("div"); b.id = "__fast";
+    b.textContent = `⏩ ${k}× speed · ${what}`;
+    b.style.cssText = "position:fixed;left:50%;bottom:28px;transform:translateX(-50%);padding:10px 18px;border-radius:999px;background:rgba(17,24,39,.86);color:#fff;font:600 17px/1.2 system-ui,sans-serif;z-index:2147483646;pointer-events:none";
+    document.body.appendChild(b);
+  }, [what, FAST]).catch(() => {});
+  await sleep(500); cur.fast.push([at(), null]);
+}
+async function fastOff(page) {
+  if (FAST <= 1 || !cur.fast.length || cur.fast.at(-1)[1] !== null) return;
+  cur.fast.at(-1)[1] = at();
+  await page.evaluate(() => document.getElementById("__fast")?.remove()).catch(() => {});
+}
 // Films one clip; a failed take (say, the market maker is busy) is thrown away and filmed again
 async function take(name, fn, tries = 4) {
   for (let i = 1; ; i++) {
     const ctx = await context(name), page = await ctx.newPage();
-    try { await fn(page); await done(ctx, name); return; }
+    cur = { t0: Date.now(), start: 0, fast: [] };
+    try { await fn(page); cur.end = at(); cuts[name] = cur; await done(ctx, name); return; }
     catch (e) {
       await ctx.close().catch(() => {}); rmSync(`${OUT}/raw-${name}`, { recursive: true, force: true });
       if (i >= tries) throw e;
@@ -119,7 +139,8 @@ async function open(page) {
   await page.goto(SITE, { waitUntil: "networkidle" }).catch(() => {});
   await page.mouse.move(W / 2, H / 3);
   await page.getByText(/Price/).first().waitFor({ timeout: 30_000 });
-  await sleep(2500);
+  await sleep(1200); if (cur) cur.start = at(); // (the clip starts here: no blank page loading)
+  await sleep(1800);
   const connect = page.getByRole("button", { name: "Connect wallet to trade" });
   if (await connect.isVisible().catch(() => false)) { await glide(page, connect); await sleep(1500); }
   const openWallet = page.getByRole("button", { name: "Open CSD wallet" });
@@ -144,8 +165,12 @@ async function trade(page, side, amount, done) {
     throw new Error(`the ${side} button stays disabled: ${(await page.locator("section").first().innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 600)} (see ${OUT}/stuck.png)`);
   }
   await glide(page, btn);
+  { const b = await btn.boundingBox(); if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height + 40, { steps: 15 }); } // (off the button's text)
+  await sleep(1500); // (the first steps play at normal speed)
+  await fastOn(page, "waiting for Ethereum");
   const banner = page.locator(".banner[role=status]");
   await banner.filter({ hasText: done }).waitFor({ timeout: 180_000 }).catch(async () => { throw new Error(`no "${done}": ${await banner.textContent().catch(() => "no banner")}`); });
+  await fastOff(page);
   log(`${side}: ${(await banner.textContent())?.replace("Dismiss", "").trim()}`);
 }
 
@@ -157,7 +182,11 @@ try {
     await trade(page, "buy", BUY, /Bought/);
     await sleep(1500);
     await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
-    await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
+    if (!(await page.getByText(/unconfirmed/).isVisible().catch(() => false))) {
+      await fastOn(page, "waiting for the CSD payment");
+      await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
+      await fastOff(page);
+    }
     { const b = await page.getByText(/unconfirmed/).first().boundingBox().catch(() => null); // the pointer beside it, not over it
       if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
     await sleep(4500);
@@ -189,11 +218,12 @@ try {
   log("waiting for the sale's receipt…");
   let receiptUrl = null;
   { const ctx = await context(), page = await ctx.newPage();
-    for (let i = 0; i < 60 && !receiptUrl; i++) {
+    // (stays on the page: it looks for the receipt on AON every 10 s; reloading would cut that short)
+    for (let round = 0; round < 3 && !receiptUrl; round++) {
       await page.goto(SITE, { waitUntil: "networkidle" }).catch(() => {}); await sleep(5000);
       const c = page.getByRole("button", { name: "Connect wallet to trade" }); if (await c.isVisible().catch(() => false)) { await c.click(); await sleep(4000); }
       const a = page.getByRole("region", { name: "Your trades" }).getByRole("link", { name: /Receipt/ }).first();
-      if (await a.isVisible().catch(() => false)) receiptUrl = await a.getAttribute("href"); else await sleep(10_000);
+      if (await a.waitFor({ timeout: 6 * 60_000 }).then(() => true, () => false)) receiptUrl = await a.getAttribute("href");
     }
     await done(ctx); }
 
@@ -210,10 +240,24 @@ try {
   }, 2); else log("no receipt within the wait; filmed the buy and the sell only");
 } finally { await browser.close(); }
 
-// One mp4 for posting (H.264, plays everywhere)
+// One mp4 for posting (H.264, plays everywhere): each clip from where the page has loaded, with
+// the waits fast-forwarded (they carry the on-screen badge)
 const clips = ["1-buy", "2-sell", "3-receipt"].filter(c => existsSync(`${OUT}/${c}.webm`));
 try {
-  writeFileSync(`${OUT}/list.txt`, clips.map(c => `file '${OUT}/${c}.webm'`).join("\n"));
-  execFileSync("ffmpeg", ["-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", `${OUT}/list.txt`, "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p", "-r", "30", "-movflags", "+faststart", `${OUT}/covenant-live.mp4`]);
+  const parts = [];
+  clips.forEach((c, i) => {
+    const k = cuts[c] ?? { start: 0, fast: [], end: null };
+    let t = k.start;
+    for (const [a, b] of k.fast) {
+      if (b === null || a < t) continue;
+      if (a > t) parts.push({ i, a: t, b: a, speed: 1 });
+      parts.push({ i, a, b, speed: FAST }); t = b;
+    }
+    parts.push({ i, a: t, b: null, speed: 1 });
+  });
+  const f = parts.map((p, n) => `[${p.i}:v]trim=start=${p.a.toFixed(3)}${p.b !== null ? `:end=${p.b.toFixed(3)}` : ""},setpts=(PTS-STARTPTS)/${p.speed},fps=30[v${n}]`).join(";")
+    + ";" + parts.map((_, n) => `[v${n}]`).join("") + `concat=n=${parts.length}:v=1:a=0[out]`;
+  execFileSync("ffmpeg", ["-y", "-loglevel", "error", ...clips.flatMap(c => ["-i", `${OUT}/${c}.webm`]), "-filter_complex", f, "-map", "[out]",
+    "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-pix_fmt", "yuv420p", "-movflags", "+faststart", `${OUT}/covenant-live.mp4`]);
   log(`film: ${OUT}/covenant-live.mp4 (and each clip as .webm)`);
-} catch (e) { log(`clips in ${OUT} (${clips.join(", ")}); ffmpeg not available to join them: apt install -y ffmpeg`); }
+} catch (e) { log(`clips in ${OUT} (${clips.join(", ")}); joining them failed (${String(e.message).split("\n")[0]}; is ffmpeg installed? apt install -y ffmpeg)`); }
