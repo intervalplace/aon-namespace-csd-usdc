@@ -191,7 +191,7 @@ async function trade(page, side, amount, done) {
   for (let i = 0; i < 40 && await btn.isDisabled(); i++) await sleep(500);
   if (await btn.isDisabled()) {
     await page.screenshot({ path: `${OUT}/stuck.png` });
-    throw new Error(`the ${side} button stays disabled: ${(await page.locator("section").first().innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 600)} (see ${OUT}/stuck.png)`);
+    throw new Error(`the ${side} button stays disabled: ${(await page.locator("section").filter({ has: page.locator("#csd-amount") }).first().innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 600)} (see ${OUT}/stuck.png)`);
   }
   await glide(page, btn);
   { const b = await btn.boundingBox(); if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height + 40, { steps: 15 }); } // (off the button's text)
