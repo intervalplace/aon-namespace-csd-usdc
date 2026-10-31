@@ -68,6 +68,10 @@ export type MarketMakerConfig = {
   buyConfirmations?: [number, number];  // accepted range for users' buys; default [10, 30]
   sellConfirmations?: number;   // what the bot signs when it buys; default 20 (it releases early anyway)
   safeConfirmations?: number;   // when a trusted payment stops counting as exposure; default 3
+  bigSaleUsdc?: bigint;         // sales above this (default 10 USDC) wait for bigSaleConfirmations (default 6) instead
+  bigSaleConfirmations?: number;
+  haltReorgDepth?: number;      // a CSD reorg this deep (default 2 blocks) stops buying CSD until --resume
+  haltConfirmations?: number;   // while stopped, paid sales are released only this deep (default 20)
   priceToleranceBps?: bigint;   // how far a signed price may lag the pool; default 50 (0.5%)
   sellPayWindowSecs?: number;   // a seller must pay within this long of the lock; default 180
   maxOpenUnpaid?: number;       // sells waiting for payment at once; default 3
@@ -117,7 +121,8 @@ type Offer = { hash: string; mid: string; at: number; poolKey?: string };
 type State = { pool: { usdc: string; csd: string }; nextKey: number; trades: Record<string, Trade>; lossUsdc: string; lastSplit?: number;
   offers?: { sell?: Offer; buy?: Offer }; liveOffers?: { hash: string; side: "sell" | "buy"; at: number }[]; aonQueue?: any[];
   seen?: Record<string, number>; rejectedBuys?: Record<string, Record<string, string>>;
-  declinedLocks?: Record<string, string>; declinedFromBlock?: string };
+  declinedLocks?: Record<string, string>; declinedFromBlock?: string;
+  halt?: { reason: string; at: number } };
 
 const ERC20 = [
   { type: "function", name: "allowance", stateMutability: "view", inputs: [{ type: "address" }, { type: "address" }], outputs: [{ type: "uint256" }] },
@@ -139,7 +144,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   const C = {
     spreadBps: 300n, feeUsdc: 250_000n, maxTradeUsdc: 30_000_000n, minTradeUsdc: 1_000_000n,
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
-    buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, priceToleranceBps: 50n,
+    buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, bigSaleUsdc: 10_000_000n, bigSaleConfirmations: 6, haltReorgDepth: 2, haltConfirmations: 20, priceToleranceBps: 50n,
     sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, sides: ["sell", "buy"] as ("sell" | "buy")[], sellExecutorFeeUsdc: 2_000_000n, watchtowerMs: 60_000, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
     inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
@@ -202,6 +207,17 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     .reduce((p, t) => afterSell(p, BigInt(t.csdAmount), BigInt(t.poolUsdc)), pool());
   const addLoss = (x: bigint, why: string) => { S.lossUsdc = String(BigInt(S.lossUsdc) + x); log(`[mm] LOSS ${Number(x) / 1e6} USDC: ${why}`); };
   // USDC already released for CSD payments that aren't confirmed yet
+  // The circuit breaker. Someone with most of CSD's hash power could sell CSD to the bot, take the
+  // USDC, and reorg the payment away; the loss limits stop that only before safeConfirmations.
+  // So a reorg of haltReorgDepth blocks, or any sale whose payment was reversed, stops the bot
+  // from buying CSD (selling CSD is safe either way) until its operator has looked and resumes it.
+  function haltBuying(reason: string) {
+    if (S.halt) return;
+    S.halt = { reason, at: now() }; save();
+    log(`[mm] STOPPED BUYING CSD: ${reason}. Selling CSD continues. Look into it, then resume: systemctl stop covenant-mm && npx tsx scripts/market-maker.ts --resume && systemctl start covenant-mm`);
+  }
+  // Blocks a paid sale's payment needs before its USDC is released without trust
+  const safeFor = (t: Trade) => S.halt ? C.haltConfirmations : BigInt(t.usdcAmount) > C.bigSaleUsdc ? C.bigSaleConfirmations : C.safeConfirmations;
   const exposure = () => Object.values(S.trades).reduce((s, t) => s + (t.kind === "sell" && t.status === "released" ? BigInt(t.usdcAmount) : 0n), 0n);
 
   // one trade at a time: coins, nonces and the pool stay consistent
@@ -318,10 +334,32 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   async function syncBlocks() {
     const tip = await node.tip(); if (tip.hash === tipHash) return;
     const from = Math.max(0, tip.height - WINDOW + 1);
-    for (let h = Math.max(from, tipHeight - 6); h <= tip.height; h++) {
+    // Re-read from a little below our tip; if even that block changed (a deep reorg), from further down
+    let start = Math.max(from, tipHeight - 6);
+    while (start > from && blocks.has(start)) {
+      const b = await (await tfetch(`${csdBase}/block/height/${start}`)).json();
+      if (!b?.ok) return;
+      if (b.hash === blocks.get(start)!.hash) break;
+      start = Math.max(from, start - 6);
+    }
+    let forkAt: number | null = null;
+    const got: [number, { hash: string; txids: string[] }][] = [];
+    for (let h = start; h <= tip.height; h++) {
       const b = await (await tfetch(`${csdBase}/block/height/${h}`)).json();
       if (!b?.ok) return; // node mid-reorg; try next tick
-      blocks.set(h, { hash: b.hash, txids: (b.txs ?? []).map((x: any) => String(x.txid).toLowerCase()) });
+      if (forkAt === null && blocks.has(h) && blocks.get(h)!.hash !== b.hash) forkAt = h;
+      got.push([h, { hash: b.hash, txids: (b.txs ?? []).map((x: any) => String(x.txid).toLowerCase()) }]);
+    }
+    for (const [h, b] of got) blocks.set(h, b);
+    if (forkAt !== null && tipHeight > 0) {
+      const depth = tipHeight - forkAt + 1;
+      log(`[mm] CSD reorg: ${depth} block(s) replaced from height ${forkAt}`);
+      if (depth >= C.haltReorgDepth) {
+        // (sales already released whose payment is no longer in a block are named, to check)
+        const gone = Object.values(S.trades).filter(t => t.kind === "sell" && (t.status === "released" || t.status === "done") && t.csdTxid
+          && (t.paidAt ?? 0) > now() - 86400 && ![...blocks.values()].some(b => b.txids.includes(t.csdTxid!.toLowerCase())));
+        haltBuying(`a CSD reorg replaced ${depth} blocks from height ${forkAt}` + (gone.length ? `; payments of released sales no longer in a block: ${gone.map(t => `${t.authHash} (${Number(t.usdcAmount) / 1e6} USDC, ${t.csdTxid})`).join(", ")}` : ""));
+      }
     }
     for (const h of [...blocks.keys()]) if (h < from || h > tip.height) blocks.delete(h);
     tipHeight = tip.height; tipHash = tip.hash; utxoCache.clear();
@@ -448,6 +486,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const stale = (o?: Offer) => !o || t - o.at > 1800 || o.poolKey !== poolKey;
     S.offers ??= {};
     for (const side of C.sides) {
+      if (side === "buy" && S.halt) continue; // stopped buying CSD: no new offer (the last one runs out within the hour)
       if (!stale(S.offers[side])) continue;
       // Each offer references the one it replaces, so anyone holding an old one can find the newest
       const o = await signed({ objectType: "offer", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(S.offers[side]?.hash),
@@ -556,6 +595,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // seller never pays, so opens are limited per client and overall, and the
   // pool only moves once the CSD is paid.
   function sellOpenLimits(ip: string, owners: string[] = []) {
+    if (S.halt) throw new HttpError(503, "SELLS_PAUSED"); // (the circuit breaker: see haltBuying)
     const sells = Object.values(S.trades).filter(t => t.kind === "sell");
     // Waiting: not paid yet, or paid but the payment isn't in a block (it may never be)
     const waiting = sells.filter(t => ((t.status === "opening" || t.status === "open") && !t.unpaidAt) || (t.status === "paid" && confirmations(t.csdTxid!) === 0));
@@ -682,7 +722,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // Instant only within the limits; otherwise the USDC is released after one CSD block
   // Any release before the payment has safeConfirmations blocks is trust, and obeys the same limits
   function earlyReleaseAllowed(t: Trade) {
-    if (confirmations(t.csdTxid!) >= C.safeConfirmations) return true;
+    if (confirmations(t.csdTxid!) >= safeFor(t)) return true;
+    if (S.halt) return false; // (stopped: nothing on trust)
     const amt = BigInt(t.usdcAmount), to = t.auth.sellerUsdcRecipient.toLowerCase();
     const recent = Object.values(S.trades).filter(o => o.kind === "sell" && o.trusted && o.auth.sellerUsdcRecipient.toLowerCase() === to && (o.paidAt ?? 0) > now() - 3600)
       .reduce((s, o) => s + BigInt(o.usdcAmount), 0n);
@@ -757,7 +798,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const msg = { authHash: t.authHash, sellerUsdcRecipient: getAddress(t.auth.sellerUsdcRecipient), usdcAmount: BigInt(t.usdcAmount),
       csdTxid: t.csdTxid!, lockedAt: BigInt(t.lockedAt!), deadline: BigInt((await chainNow()) + 900) };
     const sig = await account.signTypedData({ domain, types: EARLY_RELEASE_TYPES as any, primaryType: "CsdUsdcEarlyRelease", message: msg as any });
-    if (confirmations(t.csdTxid!) < C.safeConfirmations) { t.trusted = true; save(); }
+    if (confirmations(t.csdTxid!) < safeFor(t)) { t.trusted = true; save(); }
     t.releaseTx = await send("releaseEarly", [authTuple(t.auth), msg, sig]);
     log(`[mm] sell ${t.authHash}: release sent ${t.releaseTx}`);
     if (t.aon?.auth) {
@@ -878,7 +919,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
           }
           if (t.status === "released") {
             const c = confirmations(t.csdTxid!);
-            if (c >= C.safeConfirmations) { t.status = "done"; save(); }
+            if (c >= safeFor(t)) { t.status = "done"; save(); }
             else if (c === 0 && now() - (t.csdSentAt ?? 0) > 2 * C.rebroadcastSecs) {
               try { await broadcast(txFromNodeJson(t.csdTx)); t.csdSentAt = now(); save(); }
               catch (e: any) {
@@ -889,6 +930,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
                   const p = pool();
                   t.status = "reversed"; setPool(t.poolMoved ? { ...p, csd: p.csd - BigInt(t.csdAmount) } : { ...p, usdc: p.usdc - BigInt(t.poolUsdc) });
                   addLoss(BigInt(t.usdcAmount), `sell ${t.authHash}: payment ${t.csdTxid} was double-spent (${e.message})`); save();
+                  haltBuying(`sale ${t.authHash}: its payment ${t.csdTxid} was reversed after the USDC was released`);
                 }
               }
             }
@@ -979,6 +1021,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       }
       if (o.objectType === "request" && P.requestType === "csd_usdc_sale") {
         if (!C.sides.includes("buy")) return null; // not buying CSD
+        // (while stopped, requests are still answered: SELLS_PAUSED, so sellers' pages move on at once)
         const signers = saleSigners(o); if (!signers) return null;
         const id = saleDigest(P, BigInt(P.csdAmount), getAddress(P.usdcRecipient))!;
         return { kind: "sale", from: signers.join(","), id, known: signers.some(isKnown) };
@@ -1407,6 +1450,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   return {
     server, address: account.address, csdInventoryAddress: inventory.addr20, state: () => S, tick: () => serial(tick),
     watch: () => watch(), watchtower: () => serial(() => watchtower(true)),
+    resume: () => { delete S.halt; save(); log("[mm] buying CSD again"); },
     async stop() { stopped = true; await ticking.catch(() => {}); await watching.catch(() => {}); await new Promise(r => server.close(r)); },
   };
 }

@@ -221,6 +221,28 @@ Stop the bot, then `npx tsx scripts/market-maker.ts --top-up 500`: it prints
 the CSD that goes with 500 USDC at the current price. Send both to the bot's
 addresses, rerun with `--yes`, and start the bot again. The price doesn't move.
 
+## The circuit breaker
+
+When someone sells CSD to the bot, it releases their USDC early: within the loss limits before
+the payment has 3 CSD blocks (6 for sales over 10 USDC), and on its own after that. Someone
+with most of CSD's hash power could take the USDC and then reorg their payment away. So the
+bot stops buying CSD on its own when:
+
+- a CSD reorg replaces 2 or more blocks, or
+- a sale's payment is reversed after its USDC was released.
+
+The log says `STOPPED BUYING CSD` and why (and names any released sale whose payment is no
+longer in a block). Selling CSD to users goes on: that side is safe. Sellers are answered
+`SELLS_PAUSED`, the bot's buy offer isn't renewed, and sales already paid are released only
+once their payment has 20 blocks. It stays stopped across restarts until you've looked and
+resume it:
+
+```bash
+systemctl stop covenant-mm && npx tsx scripts/market-maker.ts --resume && systemctl start covenant-mm
+```
+
+So an attack costs the bot at most one sale (30 USDC at most), not the pool.
+
 ## Costs and limits
 
 - Each trade costs the bot two Ethereum transactions (lock + settle or

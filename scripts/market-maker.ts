@@ -25,6 +25,21 @@ if (process.argv.includes("--addresses")) {
   process.exit(0);
 }
 
+// After the circuit breaker stopped buying CSD (a deep CSD reorg, or a sale whose payment was
+// reversed; the log says which): once you've looked, stop the bot, then
+//   npx tsx scripts/market-maker.ts --resume      and start it again
+if (process.argv.includes("--resume")) {
+  const { readFileSync, writeFileSync, existsSync } = await import("node:fs");
+  const file = env("STATE_FILE", "./mm-state.json");
+  if (!existsSync(file)) { console.error(`no state file at ${file}`); process.exit(1); }
+  const S = JSON.parse(readFileSync(file, "utf8"));
+  if (!S.halt) { console.log("Buying CSD isn't stopped; nothing to do."); process.exit(0); }
+  console.log(`Stopped since ${new Date(S.halt.at * 1000).toISOString()}: ${S.halt.reason}`);
+  delete S.halt; writeFileSync(file, JSON.stringify(S, null, 1));
+  console.log("Cleared. Start the bot again; it buys CSD from its next offer.");
+  process.exit(0);
+}
+
 // Deepen the pool at the current price. Stop the bot first, send the USDC and
 // CSD to its addresses, then:  npx tsx scripts/market-maker.ts --top-up 500
 // (adds 500 USDC and the CSD that keeps the price; the command prints it)

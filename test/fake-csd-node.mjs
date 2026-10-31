@@ -83,6 +83,19 @@ export async function startFakeCsdNode({ port, bits = 0x207fffff, clock = () => 
   }
   // Test helper: a transaction disappears from the mempool (held up somewhere)
   function drop(txid) { const tx = mempool.get(txid); if (!tx) return; mempool.delete(txid); for (const i of tx.inputs) spentInMempool.delete(key(i.prevout.txid, i.prevout.vout)); }
+  // Test helper: a reorg. The last `depth` blocks are replaced by depth + 1 other blocks without
+  // their transactions (as if a miner with more hash power left them out)
+  let reorgs = 0;
+  function reorg(depth) {
+    const to = "0x" + (0x60 + (++reorgs % 16)).toString(16).repeat(20); // (different blocks each time)
+    blocks.splice(blocks.length - depth, depth);
+    utxos.clear(); mempool.clear(); spentInMempool.clear();
+    blocks.forEach((b, height) => b.txs.forEach((t, n) => {
+      if (n > 0) for (const i of t.tx.inputs) utxos.delete(key(i.prevout.txid, i.prevout.vout));
+      t.tx.outputs.forEach((o, v) => utxos.set(key(t.txid, v), { value: o.value, addr20: o.addr20, height, coinbase: n === 0 }));
+    }));
+    for (let i = 0; i <= depth; i++) mine({ rewardTo: to });
+  }
   // Test helper: a conflicting spend gets mined instead (a double spend)
   function doubleSpend(tx) {
     for (const i of tx.inputs) { const id = spentInMempool.get(key(i.prevout.txid, i.prevout.vout)); if (id) mempool.delete(id); }
@@ -120,5 +133,5 @@ export async function startFakeCsdNode({ port, bits = 0x207fffff, clock = () => 
   });
   await new Promise(r => server.listen(port, "127.0.0.1", r));
   mine(); // genesis
-  return { url: `http://127.0.0.1:${port}`, mine, doubleSpend, drop, submit, mempool, utxos, blocks, close: () => new Promise(r => server.close(r)), txToNodeJson };
+  return { url: `http://127.0.0.1:${port}`, mine, doubleSpend, reorg, drop, submit, mempool, utxos, blocks, close: () => new Promise(r => server.close(r)), txToNodeJson };
 }

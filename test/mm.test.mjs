@@ -464,6 +464,10 @@ console.log("\n[6] Double spends: an instant one is a capped loss; one that wasn
   check(tr(o.authHash).status === "reversed" && BigInt(mm.state().lossUsdc) === BigInt(o.usdcAmount), `bot records the ${Number(o.usdcAmount) / 1e6} USDC loss`);
   check(pool().csd === p0.csd && pool().usdc === p0.usdc - BigInt(tr(o.authHash).poolUsdc), "the pool counts the USDC as gone and no CSD as received");
   check((await get("/market")).limits.instantSells === false, "past the loss budget (1 USDC in this test) instant sales are off");
+  check(!!mm.state().halt && (await get("/market")).limits.sellsPaused === true && (await openSale(10n * 100_000_000n, await fresh(13))).error === "SELLS_PAUSED",
+    "a sale whose payment was reversed stops the bot buying CSD (circuit breaker): sales are refused, with an answer");
+  mm.resume();
+  check(!mm.state().halt && (await get("/market")).limits.sellsPaused === false, "until its operator resumes it");
   check((await openSale(10n * 100_000_000n)).error === "ADDRESS_FROM_A_DOUBLE_SPEND", "the cheater's address can't open another sale for a day");
   // Not instant now: a double-spent payment leaves the pool (and so the price) untouched
   const d = await openSale(10n * 100_000_000n, await fresh(11));
@@ -507,6 +511,19 @@ console.log("\n[6e] A buy someone else settled with the bot's proof (a copy bot,
   check(t.settleTx?.toLowerCase() === real.toLowerCase(), "the bot finds the transaction that settled it, from the contract's events");
   check(t.aon.receipt && obj(t.aon.receipt)?.payload.executionTx?.toLowerCase() === real.toLowerCase() && obj(t.aon.receipt)?.payload.method === "settleCsdUsdc",
     "and publishes the buy's receipt naming it"); }
+
+console.log("\n[6f] Circuit breaker: a deep CSD reorg stops buying CSD; a 1-block one doesn't");
+{ await mm.tick();
+  await syncClock(); csd.reorg(1); await mm.tick();
+  check(!mm.state().halt, "a 1-block reorg (it happens) changes nothing");
+  await syncClock(); csd.reorg(2); await mm.tick();
+  check(!!mm.state().halt && /reorg replaced 2 blocks/.test(mm.state().halt.reason), "a 2-block reorg stops the bot buying CSD, and says why");
+  check((await get("/market")).limits.sellsPaused === true && (await openSale(10n * 100_000_000n, await fresh(14))).error === "SELLS_PAUSED", "sales are refused while it's stopped");
+  const b = await signBuy({ csdAmount: 20n * 100_000_000n, usdcAmount: quoteBuy(pool(), 20n * 100_000_000n), key: userCsd.key(40) });
+  const r = await post("/buy", b.body);
+  check(r.http === 200 && r.accepted !== false, "but users can still buy CSD from it (that side is safe)");
+  mm.resume(); await mm.tick();
+  check(!mm.state().halt && (await get("/market")).limits.sellsPaused === false, "resumed by its operator"); }
 
 console.log("\n[6c] Open market: any maker's offers are found, even under junk, by following its chain of offers");
 { const first = [...aonNode.objects.values()].filter(o => o.objectType === "offer" && o.payload?.marketMaker === mmEvm.address && o.payload.offerType === "csd_usdc_sell_csd")
