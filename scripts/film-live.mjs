@@ -3,9 +3,13 @@
 // trade's signed receipt on the AON explorer. Everything on screen is real and on mainnet.
 //
 //   npm i --no-save playwright@1.47.2 && npx playwright install --with-deps chromium   (once)
-//   node scripts/film-live.mjs --new-key            # makes /root/film-key, prints its address
+//   npx tsx scripts/film-live.mjs --new-key           # makes /root/film-key, prints its address
 //   (send ~5 USDC to that address; no ETH needed)
-//   node scripts/film-live.mjs                      # films; writes /root/film/covenant-live.mp4
+//   npx tsx scripts/film-live.mjs                   # films; writes /root/film/covenant-live.mp4
+//
+// With CSD already in the film wallet, the buy and the sell are one continuous take (the sell
+// doesn't wait for the bought CSD's block). Its CSD address, to send some CSD to:
+//   npx tsx scripts/film-live.mjs --csd-address
 //
 // Env: FILM_KEY_FILE (/root/film-key), FILM_BUY (20 CSD), FILM_SELL ("max", or an amount of CSD), FILM_OUT (/root/film),
 // FILM_SITE (https://covenant.market/csd), FILM_RPC (https://ethereum-rpc.publicnode.com),
@@ -33,7 +37,25 @@ if (process.argv.includes("--new-key")) {
   console.log(`Film wallet: ${privateKeyToAccount(k).address}\nSend about 5 USDC there (Ethereum mainnet). No ETH needed.`); process.exit(0);
 }
 const account = privateKeyToAccount(readFileSync(KEY_FILE, "utf8").trim());
+const CSD_API = (process.env.FILM_CSD_API ?? "https://csd.aon.network").replace(/\/$/, "");
+// The site's CSD wallet for this key (derived from a signature, as the page does)
+async function csdAddress() {
+  const { deriveCsdWallet, CSD_WALLET_MESSAGE } = await import("../src/csd-wallet.ts");
+  return deriveCsdWallet(await account.signMessage({ message: CSD_WALLET_MESSAGE })).key(0).addr20.slice(2);
+}
+if (process.argv.includes("--csd-address")) {
+  console.log(`Film wallet's CSD address: ${await csdAddress()}\nSend it some CSD (e.g. 20) from your own wallet ("Send CSD" on covenant.market), then film once it's in a block.`);
+  process.exit(0);
+}
 log(`film wallet ${account.address}`);
+// CSD already there (in a block)? Then the buy and the sell are one continuous take
+let haveCsd = 0;
+try {
+  const r = await (await fetch(`${CSD_API}/utxos/${await csdAddress()}?available=true`)).json();
+  haveCsd = (r.utxos ?? []).reduce((s, u) => s + Number(u.value), 0) / 1e8;
+} catch (e) { log(`(couldn't check the film wallet's CSD: ${e.message})`); }
+const ONE_TAKE = haveCsd >= 1;
+log(ONE_TAKE ? `the film wallet has ${haveCsd} CSD: buy and sell in one take` : "no CSD in the film wallet yet: the sell waits for the bought CSD's block (cut)");
 
 // The wallet, as a browser extension would provide it: signs with the throwaway key, sends
 // everything else to a public RPC. It never sends a transaction (none is needed to trade).
@@ -176,6 +198,30 @@ async function trade(page, side, amount, done) {
 
 mkdirSync(OUT, { recursive: true });
 try {
+  if (ONE_TAKE) {
+    // One take: buy (the CSD shows within seconds), then sell what was already there
+    await take("1-trade", async page => {
+      await open(page);
+      await trade(page, "buy", BUY, /Bought/);
+      await sleep(1500);
+      await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
+      if (!(await page.getByText(/unconfirmed/).isVisible().catch(() => false))) {
+        await fastOn(page, "waiting for the CSD payment");
+        await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
+        await fastOff(page);
+      }
+      { const b = await page.getByText(/unconfirmed/).first().boundingBox().catch(() => null);
+        if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
+      await sleep(3500);
+      await page.locator(".banner[role=status]").getByRole("button", { name: "Dismiss" }).click().catch(() => {});
+      await trade(page, "sell", SELL, /Sold|is paid/);
+      await sleep(1500);
+      await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
+      { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox().catch(() => null);
+        if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
+      await sleep(5000);
+    });
+  } else {
   // 1. Buy: the CSD shows in the wallet within seconds
   await take("1-buy", async page => {
     await open(page);
@@ -213,6 +259,7 @@ try {
       if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
     await sleep(5000);
   });
+  }
 
   // (not filmed) the sale's signed receipt
   log("waiting for the sale's receipt…");
@@ -242,7 +289,7 @@ try {
 
 // One mp4 for posting (H.264, plays everywhere): each clip from where the page has loaded, with
 // the waits fast-forwarded (they carry the on-screen badge)
-const clips = ["1-buy", "2-sell", "3-receipt"].filter(c => existsSync(`${OUT}/${c}.webm`));
+const clips = ["1-trade", "1-buy", "2-sell", "3-receipt"].filter(c => existsSync(`${OUT}/${c}.webm`));
 try {
   const parts = [];
   clips.forEach((c, i) => {
