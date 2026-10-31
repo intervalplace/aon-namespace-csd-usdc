@@ -213,7 +213,10 @@ let ONE_TAKE = false;
 { const ctx = await context(), page = await ctx.newPage();
   try {
     await open(page);
-    await page.getByRole("radio", { name: "Sell CSD" }).click(); await sleep(4000);
+    await page.getByRole("radio", { name: "Sell CSD" }).click();
+    // (the wallet's balance shows "…" until it has looked through its addresses)
+    await page.waitForFunction(() => { const r = document.querySelector('section[aria-label="Your wallet"] .stat'); return r && r.textContent && r.textContent.trim() !== "…"; }, null, { timeout: 120_000 }).catch(() => log("(the wallet took long to load)"));
+    await sleep(3000);
     const panel = await page.locator("section").filter({ has: page.locator("#csd-amount") }).first().innerText();
     const have = Number((panel.match(/Available\s+([\d.,]+)\s*CSD/) ?? [])[1]?.replace(",", "") ?? 0);
     ONE_TAKE = have >= 1;
