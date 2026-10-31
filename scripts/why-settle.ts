@@ -61,7 +61,7 @@ const work = (target: bigint) => (1n << 256n) / (target + 1n);
 const need = BigInt(t.auth.minConfirmations) * work(BigInt(t.auth.csdMaxTarget));
 let have = work(bitsToTarget(Number(proof.header.bits))); const chain: any[] = [];
 let prevHash = headerHash(proof.header), linked = true, spacing: number[] = [], prevTime = Number(proof.header.time);
-for (let h = Number(proof.height) + 1; have < need && chain.length < 120; h++) {
+for (let h = Number(proof.height) + 1; (have < need || chain.length + 1 < Number(t.auth.minConfirmations)) && chain.length < 120; h++) {
   const b = await (await fetch(`${CSD}/block/height/${h}`)).json();
   if (!b?.header?.bits) break;
   if (String(b.header.prev).toLowerCase() !== prevHash) linked = false;
@@ -69,6 +69,7 @@ for (let h = Number(proof.height) + 1; have < need && chain.length < 120; h++) {
   chain.push(b.header); have += work(bitsToTarget(Number(b.header.bits)));
 }
 ok(have >= need, "enough work after the payment at the signed difficulty", `${chain.length} headers`);
+ok(chain.length + 1 >= Number(t.auth.minConfirmations), "at least minConfirmations blocks", `${chain.length + 1} of ${t.auth.minConfirmations}`);
 ok(linked, "the headers link up by hash");
 const minGap = Math.min(...spacing);
 ok(minGap >= 60, "CSD's 60-second spacing between consecutive blocks", `smallest gap ${minGap}s, gaps ${spacing.slice(0, 25).join(",")}`);

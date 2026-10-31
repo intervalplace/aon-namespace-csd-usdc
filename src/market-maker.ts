@@ -742,15 +742,16 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     if (S.trades[t.authHash] && confirmations(t.csdTxid!) < conf) return;
     const proof = await (await tfetch(`${csdBase}/proof/tx/${t.csdTxid}`)).json();
     if (!proof?.ok) return;
-    // Enough following headers to reach the work the user signed for
+    // Enough following headers to reach the work the user signed for, and at least
+    // minConfirmations blocks in all (the contract checks both)
     const work = (target: bigint) => (1n << 256n) / (target + 1n);
     const need = BigInt(conf) * work(BigInt(t.auth.csdMaxTarget));
     let have = work(bitsToTarget(Number(proof.header.bits))); const chainH: any[] = [];
-    for (let h = Number(proof.height) + 1; have < need && chainH.length < 120; h++) {
+    for (let h = Number(proof.height) + 1; (have < need || chainH.length + 1 < conf) && chainH.length < 120; h++) {
       const hd = await node.headerAt(h); if (!hd?.bits) return; // not enough blocks yet
       chainH.push(hd); have += work(bitsToTarget(Number(hd.bits)));
     }
-    if (have < need) return;
+    if (have < need || chainH.length + 1 < conf) return;
     proof.confirmation_chain = chainH;
     t.proofJson = proof;
     return send("settleCsdUsdc", [authTuple(t.auth), t.authSig, spvProofTuple(proof)]);
