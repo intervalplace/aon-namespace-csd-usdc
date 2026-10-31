@@ -157,25 +157,26 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   const chain = defineChain({ id: C.chainId, name: `evm-${C.chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: rpcUrls } } });
   const account = privateKeyToAccount(C.privateKey);
   const pub = createPublicClient({ chain, transport: transport() });
-  // Our signed transactions go to the private relay when there is one; everything else (gas,
-  // fees, reads) to the normal RPC
+  // Settlements (they pay an executor fee, which copy bots take from the public mempool) go to the
+  // private relay when there is one; everything else goes out normally, which lands sooner
+  // (a lock or a release has nothing in it for a copier)
   const priv = C.privateTxRpc ? createPublicClient({ chain, transport: viemHttp(C.privateTxRpc) }) : null;
-  const wallet = createWalletClient({ account, chain, transport: priv
-    ? custom({ request: ({ method, params }: any) => (method === "eth_sendRawTransaction" ? priv : pub).request({ method, params } as any) })
-    : transport() });
+  const wallet = createWalletClient({ account, chain, transport: transport() });
+  const privWallet = priv ? createWalletClient({ account, chain,
+    transport: custom({ request: ({ method, params }: any) => (method === "eth_sendRawTransaction" ? priv : pub).request({ method, params } as any) }) }) : wallet;
   // Nonces are ours to count: the public RPC can't see transactions waiting at a private relay.
   // A relay drops a transaction that would revert (someone settled first), so a nonce that
-  // hasn't been mined after 3 minutes is reused.
+  // hasn't been mined after 2 minutes is reused (the transactions after it wait until then).
   let nextNonce = 0; const sentAt = new Map<number, number>();
   async function nonce(): Promise<number> {
     const [mined, pending] = await Promise.all([
       pub.getTransactionCount({ address: account.address, blockTag: "latest" }),
       pub.getTransactionCount({ address: account.address, blockTag: "pending" })]);
     for (const n of [...sentAt.keys()]) if (n < mined) sentAt.delete(n);
-    if (sentAt.size && Math.min(...sentAt.values()) < Date.now() - 180_000) { sentAt.clear(); nextNonce = mined; }
+    if (sentAt.size && Math.min(...sentAt.values()) < Date.now() - 120_000) { sentAt.clear(); nextNonce = mined; }
     const n = Math.max(nextNonce, pending); nextNonce = n + 1; sentAt.set(n, Date.now()); return n;
   }
-  const write = async (p: any): Promise<Hex> => wallet.writeContract({ ...p, nonce: await nonce() });
+  const write = async (p: any): Promise<Hex> => (p.functionName === "settleCsdUsdc" ? privWallet : wallet).writeContract({ ...p, nonce: await nonce() });
   const settlement = getAddress(C.settlement), usdc = getAddress(C.usdc);
   const domain = { name: "AON CSD/USDC", version: "4", chainId: C.chainId, verifyingContract: settlement } as const;
   const AUTH_TYPES = csdUsdcNamespace.types!() as any;

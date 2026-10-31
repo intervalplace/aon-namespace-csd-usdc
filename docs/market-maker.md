@@ -173,7 +173,7 @@ ALLOWED_ORIGINS=https://covenant.market
 AON_NODE_URL=http://127.0.0.1:8787    # AON node(s), comma-separated: trades are requested and answered there
 SIDES=sell,buy                        # or just "sell" (only sell CSD) or "buy"
 MIN_ETH=0.005                         # below this ETH balance no new trades are taken
-# PRIVATE_TX_RPC=https://rpc.flashbots.net/fast   # the default on mainnet: the bot's own transactions skip the
+# PRIVATE_TX_RPC=https://rpc.flashbots.net/fast   # the default on mainnet: the bot's settlements skip the
 #                                     # public mempool, so copy bots can't take its executor fee ("off" to disable)
 WATCHTOWER_MS=60000                   # look for other makers' unreleased sales to settle for their sellers (0: off)
 ```

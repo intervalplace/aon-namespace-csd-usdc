@@ -199,7 +199,11 @@ async function trade(page, side, amount, done) {
   await sleep(1500); // (the first steps play at normal speed)
   await fastOn(page, "waiting for Ethereum");
   const banner = page.locator(".banner[role=status]");
-  await banner.filter({ hasText: done }).waitFor({ timeout: 180_000 }).catch(async () => { throw new Error(`no "${done}": ${await banner.textContent().catch(() => "no banner")}`); });
+  await banner.filter({ hasText: done }).waitFor({ timeout: 240_000 }).catch(async () => {
+    await page.screenshot({ path: `${OUT}/stuck.png` }).catch(() => {});
+    const step = await page.locator("section").filter({ has: page.locator("#csd-amount") }).locator("button.btn-lg").last().innerText({ timeout: 2000 }).catch(() => "?");
+    throw new Error(`no "${done}": ${await banner.textContent({ timeout: 2000 }).catch(() => "no banner")}; the button says "${step}" (see ${OUT}/stuck.png)`);
+  });
   await fastOff(page);
   log(`${side}: ${(await banner.textContent())?.replace("Dismiss", "").trim()}`);
 }
