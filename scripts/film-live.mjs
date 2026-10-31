@@ -210,6 +210,8 @@ async function trade(page, side, amount, done) {
 }
 
 mkdirSync(OUT, { recursive: true });
+// (clips from an earlier run would otherwise be joined into this film)
+for (const f of readdirSync(OUT)) if (/^(\d-[a-z]+\.webm|covenant-live\.mp4|list\.txt|stuck\.png)$/.test(f) || f.startsWith("raw-")) rmSync(`${OUT}/${f}`, { recursive: true, force: true });
 try {
   if (ONE_TAKE) {
     // One take: buy (the CSD shows within seconds), then sell what was already there
@@ -299,10 +301,27 @@ try {
     await scrollTo(page, page.getByRole("region", { name: "Your trades" })); await sleep(2500);
     await glide(page, page.getByRole("region", { name: "Your trades" }).getByRole("link", { name: /Receipt/ }).first(), false); await sleep(1200);
     await page.goto(receiptUrl, { waitUntil: "networkidle" }).catch(() => {});
-    await page.waitForFunction(() => document.body.innerText.length > 200, null, { timeout: 30_000 }).catch(() => log("(the explorer page looks empty)"));
-    await page.mouse.move(W - 120, H / 2, { steps: 20 }); await sleep(4000);
-    await page.evaluate(async () => { for (let i = 0; i < 60; i++) { window.scrollBy(0, 8); await new Promise(r => setTimeout(r, 30)); } });
-    await sleep(4000);
+    // The explorer shows the receipt with the objects it links to (the offer, the order, the
+    // payment…), each a collapsed row; the receipt's own row is opened to show what it says
+    const root = page.locator(".result .gnode.root .ghead");
+    if (await root.waitFor({ timeout: 30_000 }).then(() => true, () => false)) {
+      await scrollTo(page, page.locator(".result")); await sleep(2500);
+      await glide(page, root); await sleep(1500);
+      const pre = page.locator(".result .gnode.root pre");
+      await page.mouse.move(W - 140, H / 2, { steps: 20 }); await sleep(2500);
+      // read down through it slowly
+      await page.evaluate(async () => {
+        const el = document.querySelector(".result .gnode.root pre"); if (!el) return;
+        const to = el.getBoundingClientRect().bottom + window.scrollY - window.innerHeight + 60, from = window.scrollY;
+        if (to <= from) return;
+        const n = Math.max(40, Math.round((to - from) / 6));
+        for (let i = 1; i <= n; i++) { window.scrollTo(0, from + (to - from) * i / n); await new Promise(r => setTimeout(r, 30)); }
+      });
+      await sleep(4000);
+    } else {
+      log("(the explorer didn't show the receipt's graph)");
+      await page.mouse.move(W - 120, H / 2, { steps: 20 }); await sleep(5000);
+    }
   }, 2); else log("no receipt within the wait; filmed the buy and the sell only");
 } finally { await browser.close(); }
 
