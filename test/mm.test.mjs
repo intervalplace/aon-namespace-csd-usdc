@@ -488,6 +488,15 @@ console.log("\n[6d] A sale that was already final when the bot thought its relea
   check(t.status === "done" && t.releaseTx?.toLowerCase() === rel.toLowerCase(), "the bot finds the transaction that really released it, from the contract's events");
   check(t.aon.receipt && obj(t.aon.receipt)?.payload.executionTx?.toLowerCase() === rel.toLowerCase(), "and publishes the receipt naming it"); }
 
+console.log("\n[6e] A buy someone else settled with the bot's proof (a copy bot, say) still gets its receipt");
+{ const t = Object.values(mm.state().trades).find(x => x.kind === "buy" && x.status === "settled" && x.aon?.receipt && x.settleTx);
+  const real = t.settleTx;
+  t.settleTx = undefined; delete t.aon.receipt; delete t.finalLooked; // (as when the copy landed first and ours never did)
+  await mm.tick(); await mm.tick();
+  check(t.settleTx?.toLowerCase() === real.toLowerCase(), "the bot finds the transaction that settled it, from the contract's events");
+  check(t.aon.receipt && obj(t.aon.receipt)?.payload.executionTx?.toLowerCase() === real.toLowerCase() && obj(t.aon.receipt)?.payload.method === "settleCsdUsdc",
+    "and publishes the buy's receipt naming it"); }
+
 console.log("\n[6c] Open market: any maker's offers are found, even under junk, by following its chain of offers");
 { const first = [...aonNode.objects.values()].filter(o => o.objectType === "offer" && o.payload?.marketMaker === mmEvm.address && o.payload.offerType === "csd_usdc_sell_csd")
     .sort((a, b) => a.createdAt - b.createdAt)[0];

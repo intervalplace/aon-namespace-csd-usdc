@@ -457,6 +457,15 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   }
   // Receipts are signed, so nobody else's "receipt" can pass for one
   const receipting = new Set<string>();
+  // A buy is final: publish the payment proof (when we built one) and the receipt
+  async function buySettled(t: Trade) {
+    if (t.proofJson && !t.aon?.proof) {
+      const pr = finalizeObject({ objectType: "proof", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(t.aon?.auth),
+        payload: { proofType: "csd_payment", txid: t.csdTxid, minConfirmations: Number(t.auth.minConfirmations), proof: t.proofJson } } as any);
+      t.aon = { ...t.aon, proof: pr.objectHash }; t.proofJson = undefined; save(); queueObject(pr);
+    }
+    await publishReceipt(t, { executionTx: t.settleTx, method: "settleCsdUsdc", executorFeeAmount: t.auth.executorFeeAmount });
+  }
   async function publishReceipt(t: Trade, extra: Record<string, unknown>) {
     if (t.aon?.receipt || receipting.has(t.authHash)) return;
     receipting.add(t.authHash);
@@ -788,6 +797,13 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
         const f = await finalTx(t.authHash).catch(() => null);
         if (f) { t.releaseTx = f.tx; save(); log(`[mm] sell ${t.authHash}: found its release ${f.tx}`); }
       }
+      // A buy someone else settled with our proof (anyone may submit it; we were paid all the
+      // same): find their transaction once, so the buy still gets its proof and receipt
+      if (t.kind === "buy" && t.status === "settled" && t.csdTxid && !t.aon?.receipt && !t.finalLooked) {
+        const f = await finalTx(t.authHash).catch(() => undefined); // a failed read is tried again next pass
+        if (f !== undefined) { t.finalLooked = true; save(); }
+        if (f && !f.early) { t.settleTx = f.tx; save(); log(`[mm] buy ${t.authHash}: settled by ${f.tx}`); await buySettled(t); }
+      }
       if (FINAL.has(t.status) && !(t.status === "done" && t.releaseTx && !t.aon?.receipt)) {
         // A lock that looked failed but got mined after all (someone rebroadcast it): honour it
         if (t.kind === "buy" && t.status === "lock_failed" && !t.lateLock && now() - t.createdAt < 3 * 3600 && await view("usdcLocked", t.authHash).catch(() => false)) {
@@ -806,18 +822,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
             const r = await pub.getTransactionReceipt({ hash: t.settleTx }).catch(() => null);
             if (r?.status === "success") {
               t.status = "settled"; save(); log(`[mm] buy ${t.authHash} settled (${t.settleTx})`);
-              {
-                const pr = finalizeObject({ objectType: "proof", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(t.aon?.auth),
-                  payload: { proofType: "csd_payment", txid: t.csdTxid, minConfirmations: Number(t.auth.minConfirmations), proof: t.proofJson } } as any);
-                t.aon = { ...t.aon, proof: pr.objectHash }; t.proofJson = undefined; save(); queueObject(pr);
-                await publishReceipt(t, { executionTx: t.settleTx, method: "settleCsdUsdc", executorFeeAmount: t.auth.executorFeeAmount });
-              }
+              await buySettled(t);
               continue;
             }
             if (r) { t.settleTx = undefined; save(); } else continue; // reverted: try again; pending: wait
           }
-          // Someone else settled it (anyone may submit the proof): we were paid all the same
-          if (await view("finalizedAuthorization", t.authHash)) { t.status = "settled"; save(); continue; }
+          // Someone else settled it (anyone may submit the proof): we were paid all the same.
+          // The next pass finds their transaction and publishes the receipt.
+          if (await view("finalizedAuthorization", t.authHash)) { t.status = "settled"; t.settleTx = undefined; save(); continue; }
           if (!(await view("usdcLocked", t.authHash))) {
             t.status = "refunded"; setPool({ ...pool(), usdc: pool().usdc - BigInt(t.poolUsdc) });
             addLoss(BigInt(t.usdcAmount), `buy ${t.authHash} refunded before settlement`); save();
