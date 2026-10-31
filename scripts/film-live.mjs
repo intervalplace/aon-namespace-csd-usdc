@@ -193,8 +193,9 @@ async function trade(page, side, amount, done) {
     await page.screenshot({ path: `${OUT}/stuck.png` });
     throw new Error(`the ${side} button stays disabled: ${(await page.locator("section").filter({ has: page.locator("#csd-amount") }).first().innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 600)} (see ${OUT}/stuck.png)`);
   }
+  const bb = await btn.boundingBox({ timeout: 5000 }).catch(() => null); // (taken before the click: the button's label changes then)
   await glide(page, btn);
-  { const b = await btn.boundingBox(); if (b) await page.mouse.move(b.x + b.width / 2, b.y + b.height + 40, { steps: 15 }); } // (off the button's text)
+  if (bb) await page.mouse.move(bb.x + bb.width / 2, bb.y + bb.height + 40, { steps: 15 }); // (off the button's text)
   await sleep(1500); // (the first steps play at normal speed)
   await fastOn(page, "waiting for Ethereum");
   const banner = page.locator(".banner[role=status]");
