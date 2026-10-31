@@ -13,7 +13,7 @@
 //
 // Env: FILM_KEY_FILE (/root/film-key), FILM_BUY (20 CSD), FILM_SELL ("max", or an amount of CSD), FILM_OUT (/root/film),
 // FILM_SITE (https://covenant.market/csd), FILM_RPC (https://ethereum-rpc.publicnode.com),
-// FILM_W/FILM_H (1600x900), FILM_FAST (8: waits play 8x faster, marked on screen; 1: real time)
+// FILM_SELL_FIRST (1: sell first and buy with the USDC it brings; for a film wallet low on USDC), FILM_W/FILM_H (1600x900), FILM_FAST (8: waits play 8x faster, marked on screen; 1: real time)
 
 import { chromium } from "playwright";
 import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
@@ -24,6 +24,7 @@ const KEY_FILE = process.env.FILM_KEY_FILE ?? "/root/film-key";
 const SITE = process.env.FILM_SITE ?? "https://covenant.market/csd";
 const RPC = process.env.FILM_RPC ?? "https://ethereum-rpc.publicnode.com";
 const OUT = process.env.FILM_OUT ?? "/root/film";
+const SELL_FIRST = process.env.FILM_SELL_FIRST === "1"; // sell first, then buy with what it brought
 const BUY = process.env.FILM_BUY ?? "20", SELL = process.env.FILM_SELL ?? "max"; // "max": sells all of it
 const CHAIN = Number(process.env.FILM_CHAIN ?? 1);
 const FAST = Number(process.env.FILM_FAST ?? 8); // waits (Ethereum blocks) play this many times faster, with a badge saying so
@@ -188,7 +189,7 @@ async function trade(page, side, amount, done) {
   await sleep(2800); // the price, average and price-after update
   const btn = page.getByRole("button", { name: side === "buy" ? "Buy CSD" : "Sell CSD", exact: true }).last();
   await btn.waitFor({ state: "visible" });
-  for (let i = 0; i < 40 && await btn.isDisabled(); i++) await sleep(500);
+  for (let i = 0; i < 120 && await btn.isDisabled(); i++) await sleep(500); // (up to a minute: e.g. a sale's USDC still arriving)
   if (await btn.isDisabled()) {
     await page.screenshot({ path: `${OUT}/stuck.png` });
     throw new Error(`the ${side} button stays disabled: ${(await page.locator("section").filter({ has: page.locator("#csd-amount") }).first().innerText().catch(() => "")).replace(/\s+/g, " ").slice(0, 600)} (see ${OUT}/stuck.png)`);
@@ -214,24 +215,30 @@ try {
     // One take: buy (the CSD shows within seconds), then sell what was already there
     await take("1-trade", async page => {
       await open(page);
-      await trade(page, "buy", BUY, /Bought/);
-      await sleep(1500);
-      await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
-      if (!(await page.getByText(/unconfirmed/).isVisible().catch(() => false))) {
-        await fastOn(page, "waiting for the CSD payment");
-        await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
-        await fastOff(page);
+      const steps = { buy: async () => {
+        await trade(page, "buy", BUY, /Bought/);
+        await sleep(1500);
+        await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
+        if (!(await page.getByText(/unconfirmed/).isVisible().catch(() => false))) {
+          await fastOn(page, "waiting for the CSD payment");
+          await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
+          await fastOff(page);
+        }
+        { const b = await page.getByText(/unconfirmed/).first().boundingBox({ timeout: 3000 }).catch(() => null);
+          if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
+        await sleep(3500);
+      }, sell: async () => {
+        await trade(page, "sell", SELL, /Sold|is paid/);
+        await sleep(1500);
+        await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
+        { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox({ timeout: 3000 }).catch(() => null);
+          if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
+        await sleep(5000);
+      } };
+      for (const [i, side] of (SELL_FIRST ? ["sell", "buy"] : ["buy", "sell"]).entries()) {
+        if (i > 0) { await sleep(1500); await page.locator(".banner[role=status]").getByRole("button", { name: "Dismiss" }).click().catch(() => {}); }
+        await steps[side]();
       }
-      { const b = await page.getByText(/unconfirmed/).first().boundingBox({ timeout: 3000 }).catch(() => null);
-        if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
-      await sleep(3500);
-      await page.locator(".banner[role=status]").getByRole("button", { name: "Dismiss" }).click().catch(() => {});
-      await trade(page, "sell", SELL, /Sold|is paid/);
-      await sleep(1500);
-      await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
-      { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox({ timeout: 3000 }).catch(() => null);
-        if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
-      await sleep(5000);
     });
   } else {
   // 1. Buy: the CSD shows in the wallet within seconds
