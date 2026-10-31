@@ -37,7 +37,7 @@ if (process.argv.includes("--new-key")) {
   console.log(`Film wallet: ${privateKeyToAccount(k).address}\nSend about 5 USDC there (Ethereum mainnet). No ETH needed.`); process.exit(0);
 }
 const account = privateKeyToAccount(readFileSync(KEY_FILE, "utf8").trim());
-const CSD_API = (process.env.FILM_CSD_API ?? "https://csd.aon.network").replace(/\/$/, "");
+const CSD_API = (process.env.FILM_CSD_API ?? "https://mm.covenant.market/api/csd").replace(/\/$/, "");
 // The site's CSD wallet for this key (derived from a signature, as the page does)
 async function csdAddress() {
   const { deriveCsdWallet, CSD_WALLET_MESSAGE } = await import("../src/csd-wallet.ts");
