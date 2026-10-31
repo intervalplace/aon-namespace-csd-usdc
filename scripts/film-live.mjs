@@ -218,14 +218,14 @@ try {
         await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
         await fastOff(page);
       }
-      { const b = await page.getByText(/unconfirmed/).first().boundingBox().catch(() => null);
+      { const b = await page.getByText(/unconfirmed/).first().boundingBox({ timeout: 3000 }).catch(() => null);
         if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
       await sleep(3500);
       await page.locator(".banner[role=status]").getByRole("button", { name: "Dismiss" }).click().catch(() => {});
       await trade(page, "sell", SELL, /Sold|is paid/);
       await sleep(1500);
       await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
-      { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox().catch(() => null);
+      { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox({ timeout: 3000 }).catch(() => null);
         if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
       await sleep(5000);
     });
@@ -241,7 +241,7 @@ try {
       await page.getByText(/unconfirmed/).waitFor({ timeout: 90_000 }).catch(() => log("(the CSD didn't show as unconfirmed within 90 s)"));
       await fastOff(page);
     }
-    { const b = await page.getByText(/unconfirmed/).first().boundingBox().catch(() => null); // the pointer beside it, not over it
+    { const b = await page.getByText(/unconfirmed/).first().boundingBox({ timeout: 3000 }).catch(() => null); // the pointer beside it, not over it
       if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
     await sleep(4500);
   });
@@ -263,7 +263,7 @@ try {
     await trade(page, "sell", SELL, /Sold|is paid/);
     await sleep(1500);
     await scrollTo(page, page.getByRole("region", { name: "Your wallet" }));
-    { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox().catch(() => null);
+    { const b = await page.getByRole("region", { name: "Your wallet" }).getByText(/USDC arriving|^USDC$/).first().boundingBox({ timeout: 3000 }).catch(() => null);
       if (b) await page.mouse.move(b.x - 26, b.y + b.height / 2, { steps: 30 }); }
     await sleep(5000);
   });
