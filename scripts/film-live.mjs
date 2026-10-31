@@ -93,16 +93,21 @@ const INJECT = `(() => {
 })();`;
 
 const browser = await chromium.launch();
-let state;
+// The browser's memory (the wallet's address count, its trades) is kept between runs
+const STATE_FILE = `${OUT}/browser-state.json`;
+let state = existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, "utf8")) : undefined;
 async function context(record) {
   const ctx = await browser.newContext({ viewport: { width: W, height: H }, deviceScaleFactor: 1, colorScheme: "light", locale: "en-GB", timezoneId: "Europe/Oslo",
     ...(state ? { storageState: state } : {}), ...(record ? { recordVideo: { dir: `${OUT}/raw-${record}`, size: { width: W, height: H } } } : {}) });
   await ctx.exposeFunction("__film", async (m, p) => { try { return await wallet(m, p); } catch (e) { return { __err: true, message: e.message, code: e.code ?? -32603 }; } });
   await ctx.addInitScript(INJECT);
+  // (a browser new to this wallet looks further ahead for its CSD, in case of gaps between addresses)
+  await ctx.addInitScript(k => { try { if (!localStorage.getItem(k)) localStorage.setItem(k, "40"); } catch {} }, `covenant.csd.v1.${account.address.toLowerCase()}.next`);
   return ctx;
 }
 async function done(ctx, record) {
   state = await ctx.storageState(); await ctx.close();
+  try { writeFileSync(STATE_FILE, JSON.stringify(state)); } catch {}
   if (!record) return;
   const dir = `${OUT}/raw-${record}`, f = readdirSync(dir).find(x => x.endsWith(".webm"));
   renameSync(`${dir}/${f}`, `${OUT}/${record}.webm`); rmSync(dir, { recursive: true, force: true });
