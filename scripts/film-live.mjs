@@ -148,7 +148,14 @@ async function take(name, fn, tries = 4) {
 }
 // Moves the pointer there smoothly, then clicks
 async function glide(page, loc, click = true) {
-  await loc.scrollIntoViewIfNeeded(); const b = await loc.boundingBox(); if (!b) throw new Error("not visible");
+  // (the page re-renders as prices and balances update: look again rather than give up)
+  let b = null;
+  for (let i = 0; i < 8 && !b; i++) {
+    await loc.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    b = await loc.boundingBox({ timeout: 5000 }).catch(() => null);
+    if (!b) await sleep(1000);
+  }
+  if (!b) throw new Error(`not on the page: ${loc}`);
   await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2, { steps: 30 }); await sleep(450);
   if (click) await loc.click();
 }
