@@ -246,3 +246,17 @@ export function csdNode(base: string, fetchImpl: typeof fetch = fetch) {
     },
   };
 }
+
+// Is a payment someone published really on its way to `to`, before it's in a block? It must be
+// the transaction it says, pay `to` at least `amount`, be properly signed, and the CSD node must
+// hold it in its mempool or take it now (the node checks its coins are real and in a block;
+// anything made up is refused). A conflicting spend of the same coins by the sender could still
+// win the next block, so this is "on its way", not final: show it as unconfirmed.
+export async function incomingPaymentLooksReal(node: ReturnType<typeof csdNode>, csdTxJson: unknown, txid: string, to: Hex, amount: bigint): Promise<boolean> {
+  let tx: CsdTx;
+  try { tx = txFromNodeJson(csdTxJson); } catch { return false; }
+  if (csdTxid(tx).toLowerCase() !== txid.toLowerCase()) return false;
+  if (tx.outputs.filter(o => o.addr20.toLowerCase() === to.toLowerCase()).reduce((s, o) => s + o.value, 0n) < amount) return false;
+  if (!csdInputSigners(tx)) return false;
+  try { await node.submit(tx); return true; } catch (e: any) { return /already present/i.test(String(e?.message)); }
+}

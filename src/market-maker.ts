@@ -109,7 +109,7 @@ type Trade = {
   owners?: string[]; swept?: boolean; sweepTxid?: Hex;      // sell: the addresses that signed for them; our key emptied
   trusted?: boolean;                                        // sell: released before its payment had safeConfirmations
   request?: any; proofJson?: any;                           // sell: the seller's signed request; buy: the proof that settled it
-  aon?: { offer?: string; request?: string; auth?: string; proof?: string; release?: string; receipt?: string };
+  aon?: { offer?: string; request?: string; auth?: string; proof?: string; release?: string; receipt?: string; payment?: string };
   payBy?: number; unpaidAt?: number; paidAt?: number;       // sell: payment deadline; when it lapsed
   releaseTx?: Hex; settleTx?: Hex; instant?: boolean; direct?: boolean; error?: string;
 };
@@ -270,6 +270,18 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     t.csdTxid = p.txid; t.csdTx = txToNodeJson(p.tx); t.csdSentAt = now(); save();
     try { await broadcast(p.tx); t.error = undefined; } catch (e: any) { t.error = `CSD broadcast failed, will retry: ${e.message}`; log(`[mm] ${t.error}`); }
     save();
+    await publishBuyPayment(t);
+  }
+  // The buy's CSD payment, signed and published next to the buyer's order, so their page can
+  // show the CSD at once, before it's in a block (the page checks it against the CSD network)
+  async function publishBuyPayment(t: Trade) {
+    if (!t.csdTx) return;
+    try {
+      const o = await signed({ objectType: "payment", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(t.aon?.auth, t.authHash),
+        payload: { paymentType: "csd_usdc_buy_payment", authHash: t.authHash, csdTxid: t.csdTxid, csdTx: t.csdTx } });
+      t.aon = { ...t.aon, payment: o.objectHash }; save();
+      try { await aonPut(o); } catch { queueObject(o); }
+    } catch (e: any) { log(`[mm] AON payment for ${t.authHash}: ${e.message}`); }
   }
   // Moves CSD received for finished sales into the inventory address, so the
   // bot doesn't have to look up more and more addresses

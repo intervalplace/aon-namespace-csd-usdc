@@ -6,7 +6,7 @@ import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { startFakeCsdNode } from "./fake-csd-node.mjs";
 import { startFakeAonNode } from "./fake-aon-node.mjs";
 import { buyAuthorizationObject, saleRequestObject, salePaymentObject, aonApi, objectSigner } from "../src/aon-client.ts";
-import { deriveCsdWallet, csdNode, buildPayment, csdAddressProof, addr20ToBytes32, bitsToTarget, txToNodeJson, CSD_WALLET_MESSAGE, csdSaleRequestDigest, csdSignDigest } from "../src/csd-wallet.ts";
+import { deriveCsdWallet, csdNode, buildPayment, csdAddressProof, addr20ToBytes32, bitsToTarget, txToNodeJson, CSD_WALLET_MESSAGE, csdSaleRequestDigest, csdSignDigest, incomingPaymentLooksReal } from "../src/csd-wallet.ts";
 import { startMarketMaker } from "../src/market-maker.ts";
 import { quoteBuy, quoteSell, midPrice } from "../src/pool.ts";
 import { csdUsdcNamespace } from "../src/namespace.ts";
@@ -236,6 +236,17 @@ console.log("\n[2c] Over AON the permit is public: locks by others, and fake res
   const r = await A.response(ao.objectHash, mmEvm.address, 10_000);
   check(r.accepted === true && r.error === undefined, "a fake response from someone else is ignored; the market maker's own says accepted");
   check(tr(a.hash).status === "locked" && tr(a.hash).csdTxid && !tr(a.hash).lockTx, "the lock was already there (someone used the public permit), so the bot just sent the CSD");
+  { let pay = null; await until(async () => (pay = await A.buyPayment(ao.objectHash, a.hash, [mmEvm.address])));
+    check(pay?.csdTxid === tr(a.hash).csdTxid.toLowerCase() && !(await A.buyPayment(ao.objectHash, a.hash, [user.address])),
+      "the bot publishes the buy's CSD payment on AON next to the order, signed (only the maker's signature counts)");
+    const to = userCsd.key(30).addr20;
+    check(csd.mempool.has(pay.csdTxid) && await incomingPaymentLooksReal(userNode, pay.csdTx, pay.csdTxid, to, csdAmount),
+      "before any CSD block, the page can check it's real (right transaction, pays the order's address, coins in a block, in the mempool) and show the CSD at once");
+    check(!(await incomingPaymentLooksReal(userNode, pay.csdTx, pay.csdTxid, to, csdAmount + 1n)) && !(await incomingPaymentLooksReal(userNode, pay.csdTx, pay.csdTxid, "0x" + "ab".repeat(20), 1n))
+      && !(await incomingPaymentLooksReal(userNode, pay.csdTx, "0x" + "00".repeat(32), to, 1n)),
+      "but not for more than it pays, for another address, or under another txid");
+    const madeUp = buildPayment({ utxos: [{ txid: "0x" + "77".repeat(32), vout: 0, value: 50n * 100_000_000n, key: userCsd.key(35) }], to: [{ value: csdAmount, addr20: to }], change: userCsd.key(35).addr20 });
+    check(!(await incomingPaymentLooksReal(userNode, txToNodeJson(madeUp.tx), madeUp.txid, to, csdAmount)), "and not for a payment of coins that don't exist (the CSD node refuses it)"); }
   // A buy the market maker declines, locked anyway by someone: refunded to the buyer when the lock expires
   const b = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount) * 9n / 10n, key: userCsd.key(31) });
   const rb = await post("/buy", b.body);

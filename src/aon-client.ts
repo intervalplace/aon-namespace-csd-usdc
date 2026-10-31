@@ -156,6 +156,18 @@ export function aonApi(base: string, fetchImpl: typeof fetch = fetch) {
       }
       return null;
     },
+    // The market maker's signed CSD payment for a buy, published as soon as it's sent (before
+    // it's in a block). Only the maker's word: check it against the CSD network before counting it.
+    async buyPayment(authObjectHash: string, authHash: string, marketMakers: string[]): Promise<{ csdTxid: string; csdTx: any } | null> {
+      const mm = marketMakers.map(a => a.toLowerCase());
+      const found = (await this.inbound(authObjectHash)).filter(o => o.objectType === "payment" && o.payload?.paymentType === "csd_usdc_buy_payment"
+        && String(o.payload?.authHash).toLowerCase() === authHash.toLowerCase()).sort((a, b) => Number(b.createdAt) - Number(a.createdAt));
+      for (const o of found) {
+        const signer = await objectSigner(o);
+        if (signer && mm.includes(signer.toLowerCase())) return { csdTxid: String(o.payload.csdTxid).toLowerCase(), csdTx: o.payload.csdTx };
+      }
+      return null;
+    },
     // Waits for the market maker's signed response to one of our objects
     async response(toHash: string, marketMaker: string, timeoutMs = 45_000): Promise<any> {
       const end = Date.now() + timeoutMs;
