@@ -103,7 +103,7 @@ type Trade = {
   csdTxid?: Hex; csdTx?: any; csdSentAt?: number;           // buy: our payment; sell: the user's
   keyIndex?: number; csdAddr?: Hex; ip?: string;            // sell: our receiving key; the client (signer) who opened it
   coins?: string[]; poolMoved?: boolean;                    // sell: the coins the seller will pay with ("txid:vout")
-  requestDigest?: Hex; lateLock?: boolean;                  // sell: the signed request it answers; buy: locked too late to pay against
+  requestDigest?: Hex; lateLock?: boolean; finalLooked?: boolean;                  // sell: the signed request it answers; buy: locked too late to pay against
   owners?: string[]; swept?: boolean; sweepTxid?: Hex;      // sell: the addresses that signed for them; our key emptied
   trusted?: boolean;                                        // sell: released before its payment had safeConfirmations
   request?: any; proofJson?: any;                           // sell: the seller's signed request; buy: the proof that settled it
@@ -672,9 +672,37 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     return tradeView(t);
   }
 
+  // The transaction that finalized a trade (released early or settled with a proof), from the
+  // contract's events: so a sale that turned out to be final already still gets its receipt
+  const FINAL_EVENTS = [
+    parseAbiItem("event CsdUsdcReleasedEarly(bytes32 indexed authHash, bytes32 indexed csdTxid, address indexed buyer, address sellerUsdcRecipient, address usdc, uint256 usdcAmount, uint256 csdAmount)"),
+    parseAbiItem("event CsdUsdcAuthorizationFinalized(bytes32 indexed authHash, bytes32 indexed csdTxid)"),
+  ];
+  async function finalTx(authHash: Hex): Promise<{ tx: Hex; early: boolean } | null> {
+    const latest = await pub.getBlockNumber({ cacheTime: 0 });
+    let chunk = BigInt(Math.max(1, C.logChunkBlocks));
+    for (let to = latest, scanned = 0n; to > 0n && scanned < 50_000n; ) {
+      const from = to - chunk + 1n > 0n ? to - chunk + 1n : 0n;
+      let found: any = null;
+      try {
+        for (const ev of FINAL_EVENTS) {
+          const ls = await pub.getLogs({ address: settlement, event: ev as any, args: { authHash } as any, fromBlock: from, toBlock: to });
+          if (ls.length) { found = { tx: ls[ls.length - 1].transactionHash as Hex, early: ev === FINAL_EVENTS[0] }; break; }
+        }
+      } catch { if (chunk > 1n) { chunk /= 2n; continue; } throw new Error("LOGS_UNAVAILABLE"); }
+      if (found) return found;
+      scanned += to - from + 1n; to = from - 1n;
+    }
+    return null;
+  }
   async function release(t: Trade) {
     const [locked, fin] = await Promise.all([view("usdcLocked", t.authHash), view("finalizedAuthorization", t.authHash)]);
-    if (fin) { t.status = "done"; save(); return; } // the seller settled it themselves
+    if (fin) {
+      // Already final (an earlier release of ours, or the seller settled it): find that transaction for the receipt
+      const f = await finalTx(t.authHash).catch(() => null);
+      if (f) { t.releaseTx = f.tx; if (!f.early) t.direct = false; }
+      t.status = "done"; save(); return;
+    }
     if (!locked) {
       // Our lock was refunded (anyone may, once it expires) after the seller paid: pay them directly.
       // Marked first, so a crash mid-way can never pay twice (it's then left for the operator to check).
@@ -690,6 +718,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const sig = await account.signTypedData({ domain, types: EARLY_RELEASE_TYPES as any, primaryType: "CsdUsdcEarlyRelease", message: msg as any });
     if (confirmations(t.csdTxid!) < C.safeConfirmations) { t.trusted = true; save(); }
     t.releaseTx = await send("releaseEarly", [authTuple(t.auth), msg, sig]);
+    log(`[mm] sell ${t.authHash}: release sent ${t.releaseTx}`);
     if (t.aon?.auth) {
       try {
         const authObj = await buildCsdUsdcAuthorizationObject({ authorization: t.auth, signature: t.authSig, domain, types: AUTH_TYPES, references: ref(t.aon.request, t.aon.offer) });
@@ -731,6 +760,13 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const tNow = await chainNow();
     await syncBlocks();
     for (const t of Object.values(S.trades)) {
+      // A finished sale with no release transaction on record (it was final before the bot saw its
+      // own release go through): find it once, so the sale gets its receipt
+      if (t.kind === "sell" && t.status === "done" && !t.releaseTx && !t.aon?.receipt && !t.finalLooked) {
+        t.finalLooked = true; save();
+        const f = await finalTx(t.authHash).catch(() => null);
+        if (f) { t.releaseTx = f.tx; save(); log(`[mm] sell ${t.authHash}: found its release ${f.tx}`); }
+      }
       if (FINAL.has(t.status) && !(t.status === "done" && t.releaseTx && !t.aon?.receipt)) {
         // A lock that looked failed but got mined after all (someone rebroadcast it): honour it
         if (t.kind === "buy" && t.status === "lock_failed" && !t.lateLock && now() - t.createdAt < 3 * 3600 && await view("usdcLocked", t.authHash).catch(() => false)) {
@@ -785,7 +821,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
           }
           if ((t.status === "released" || t.status === "done") && t.releaseTx && !t.aon?.receipt) {
             const r = await pub.getTransactionReceipt({ hash: t.releaseTx }).catch(() => null);
-            if (r?.status === "reverted") { log(`[mm] release ${t.releaseTx} reverted; retrying`); t.status = "paid"; t.releaseTx = undefined; save(); }
+            if (r?.status === "reverted") {
+              // A duplicate of a release that already went through reverts: then the trade is final, not unpaid
+              if (await view("finalizedAuthorization", t.authHash)) {
+                const f = await finalTx(t.authHash).catch(() => null);
+                log(`[mm] release ${t.releaseTx} reverted, but the sale is already final${f ? ` (${f.tx})` : ""}`);
+                t.releaseTx = f?.tx; t.status = "done"; save();
+              } else { log(`[mm] release ${t.releaseTx} reverted; retrying`); t.status = "paid"; t.releaseTx = undefined; save(); }
+            }
             else if (r?.status === "success") await publishReceipt(t, { executionTx: t.releaseTx, method: t.direct ? "direct_transfer" : "releaseEarly" });
           }
           if (t.status === "released") {
@@ -1301,7 +1344,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     let raw = "";
     for await (const chunk of req) { raw += chunk; if (raw.length > 65_536) { res.writeHead(413, headers); return res.end(); } }
     try {
-      const body = raw ? JSON.parse(raw) : undefined;
+      let body: any; try { body = raw ? JSON.parse(raw) : undefined; } catch { throw new HttpError(400, "BAD_JSON"); } // (scanners post junk)
       const out = await route(req, body);
       res.writeHead(200, headers); res.end(JSON.stringify(out, (_, v) => typeof v === "bigint" ? String(v) : v));
     } catch (e: any) {

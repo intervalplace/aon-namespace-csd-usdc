@@ -481,6 +481,13 @@ console.log("\n[6b] CSD received for finished sales is swept into the bot's main
   const done = Object.values(mm.state().trades).filter(t => t.kind === "sell" && t.status === "done");
   check(done.length >= 3 && done.every(t => t.swept), `all ${done.length} finished sales' addresses are emptied and no longer looked up`); }
 
+console.log("\n[6d] A sale that was already final when the bot thought its release failed still gets its receipt");
+{ const t = mm.state().trades[sold.authHash], rel = t.releaseTx;
+  t.status = "paid"; t.releaseTx = undefined; delete t.aon.receipt; // (as after a duplicate release reverted)
+  await mm.tick(); await mm.tick();
+  check(t.status === "done" && t.releaseTx?.toLowerCase() === rel.toLowerCase(), "the bot finds the transaction that really released it, from the contract's events");
+  check(t.aon.receipt && obj(t.aon.receipt)?.payload.executionTx?.toLowerCase() === rel.toLowerCase(), "and publishes the receipt naming it"); }
+
 console.log("\n[6c] Open market: any maker's offers are found, even under junk, by following its chain of offers");
 { const first = [...aonNode.objects.values()].filter(o => o.objectType === "offer" && o.payload?.marketMaker === mmEvm.address && o.payload.offerType === "csd_usdc_sell_csd")
     .sort((a, b) => a.createdAt - b.createdAt)[0];
