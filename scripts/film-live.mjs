@@ -49,14 +49,6 @@ if (process.argv.includes("--csd-address")) {
   process.exit(0);
 }
 log(`film wallet ${account.address}`);
-// CSD already there (in a block)? Then the buy and the sell are one continuous take
-let haveCsd = 0;
-try {
-  const r = await (await fetch(`${CSD_API}/utxos/${await csdAddress()}?available=true`)).json();
-  haveCsd = (r.utxos ?? []).reduce((s, u) => s + Number(u.value), 0) / 1e8;
-} catch (e) { log(`(couldn't check the film wallet's CSD: ${e.message})`); }
-const ONE_TAKE = haveCsd >= 1;
-log(ONE_TAKE ? `the film wallet has ${haveCsd} CSD: buy and sell in one take` : "no CSD in the film wallet yet: the sell waits for the bought CSD's block (cut)");
 
 // The wallet, as a browser extension would provide it: signs with the throwaway key, sends
 // everything else to a public RPC. It never sends a transaction (none is needed to trade).
@@ -210,6 +202,19 @@ async function trade(page, side, amount, done) {
 }
 
 mkdirSync(OUT, { recursive: true });
+// CSD ready to sell already? (asked of the page, which counts all the wallet's addresses) Then the
+// buy and the sell are one continuous take
+let ONE_TAKE = false;
+{ const ctx = await context(), page = await ctx.newPage();
+  try {
+    await open(page);
+    await page.getByRole("radio", { name: "Sell CSD" }).click(); await sleep(4000);
+    const panel = await page.locator("section").filter({ has: page.locator("#csd-amount") }).first().innerText();
+    const have = Number((panel.match(/Available\s+([\d.,]+)\s*CSD/) ?? [])[1]?.replace(",", "") ?? 0);
+    ONE_TAKE = have >= 1;
+    log(ONE_TAKE ? `the film wallet has ${have} CSD ready to sell: buy and sell in one take` : "no CSD ready to sell in the film wallet: the sell waits for the bought CSD's block (cut)");
+  } catch (e) { log(`(couldn't check the film wallet's CSD: ${String(e.message).split("\n")[0]})`); }
+  await done(ctx); }
 // (clips from an earlier run would otherwise be joined into this film)
 for (const f of readdirSync(OUT)) if (/^(\d-[a-z]+\.webm|covenant-live\.mp4|list\.txt|stuck\.png)$/.test(f) || f.startsWith("raw-")) rmSync(`${OUT}/${f}`, { recursive: true, force: true });
 try {
