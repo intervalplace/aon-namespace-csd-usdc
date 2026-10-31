@@ -50,6 +50,9 @@ if (process.argv.includes("--top-up")) {
 const mm = await startMarketMaker({
   rpcUrl:        env("AON_EVM_RPC_URL"),
   chainId:       Number(env("CHAIN_ID", "1")),
+  // Our own transactions go through Flashbots Protect on mainnet, out of sight of copy bots
+  // that would take the executor fee ("off" sends them to AON_EVM_RPC_URL)
+  privateTxRpc:  ((v) => v === "off" ? "" : v)(process.env.PRIVATE_TX_RPC || (env("CHAIN_ID", "1") === "1" ? "https://rpc.flashbots.net/fast" : "")),
   privateKey:    env("MM_PRIVATE_KEY") as Hex,
   settlement:    getAddress(env("SETTLEMENT_CONTRACT")),
   usdc:          getAddress(env("USDC_ADDRESS", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),

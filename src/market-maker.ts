@@ -32,10 +32,10 @@ import http from "node:http";
 import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
-  createPublicClient, createWalletClient, decodeFunctionData, defineChain, fallback, getAddress, hashTypedData, http as viemHttp, recoverAddress, parseAbiItem,
+  createPublicClient, createWalletClient, custom, decodeFunctionData, defineChain, fallback, getAddress, hashTypedData, http as viemHttp, recoverAddress, parseAbiItem,
   keccak256, maxUint256, toHex, type Hex,
 } from "viem";
-import { privateKeyToAccount, nonceManager } from "viem/accounts";
+import { privateKeyToAccount } from "viem/accounts";
 import {
   csdNode, deriveCsdWallet, buildPayment, csdTxid, csdAddressProof, addr20ToBytes32, bitsToTarget, bytesToHex, hash160,
   suggestedMaxTarget, txToNodeJson, txFromNodeJson, csdInputSigners, hexToBytes, csdSaleRequestDigest, csdSignerAddress, type CsdKey, type CsdTx, type CsdUtxo,
@@ -48,6 +48,8 @@ import { buildCsdUsdcAuthorizationObject, buildCsdUsdcEarlyReleaseObject } from 
 
 export type MarketMakerConfig = {
   rpcUrl: string; chainId: number; privateKey: Hex;
+  privateTxRpc?: string;        // where to send our own transactions, e.g. Flashbots Protect, so copy bots
+                                // can't take the executor fee off the public mempool; "" = the normal RPC
   settlement: Hex; usdc: Hex; csdApi: string; csdGenesis: Hex;
   csdSeed: Hex;                 // secret: the bot's CSD keys are derived from it
   stateFile: string; port: number; host?: string;
@@ -148,9 +150,27 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   const rpcUrls = C.rpcUrl.split(",").map(u => u.trim()).filter(Boolean);
   const transport = () => rpcUrls.length > 1 ? fallback(rpcUrls.map(u => viemHttp(u)), { retryCount: 1 }) : viemHttp(rpcUrls[0]);
   const chain = defineChain({ id: C.chainId, name: `evm-${C.chainId}`, nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 }, rpcUrls: { default: { http: rpcUrls } } });
-  const account = privateKeyToAccount(C.privateKey, { nonceManager });
+  const account = privateKeyToAccount(C.privateKey);
   const pub = createPublicClient({ chain, transport: transport() });
-  const wallet = createWalletClient({ account, chain, transport: transport() });
+  // Our signed transactions go to the private relay when there is one; everything else (gas,
+  // fees, reads) to the normal RPC
+  const priv = C.privateTxRpc ? createPublicClient({ chain, transport: viemHttp(C.privateTxRpc) }) : null;
+  const wallet = createWalletClient({ account, chain, transport: priv
+    ? custom({ request: ({ method, params }: any) => (method === "eth_sendRawTransaction" ? priv : pub).request({ method, params } as any) })
+    : transport() });
+  // Nonces are ours to count: the public RPC can't see transactions waiting at a private relay.
+  // A relay drops a transaction that would revert (someone settled first), so a nonce that
+  // hasn't been mined after 3 minutes is reused.
+  let nextNonce = 0; const sentAt = new Map<number, number>();
+  async function nonce(): Promise<number> {
+    const [mined, pending] = await Promise.all([
+      pub.getTransactionCount({ address: account.address, blockTag: "latest" }),
+      pub.getTransactionCount({ address: account.address, blockTag: "pending" })]);
+    for (const n of [...sentAt.keys()]) if (n < mined) sentAt.delete(n);
+    if (sentAt.size && Math.min(...sentAt.values()) < Date.now() - 180_000) { sentAt.clear(); nextNonce = mined; }
+    const n = Math.max(nextNonce, pending); nextNonce = n + 1; sentAt.set(n, Date.now()); return n;
+  }
+  const write = async (p: any): Promise<Hex> => wallet.writeContract({ ...p, nonce: await nonce() });
   const settlement = getAddress(C.settlement), usdc = getAddress(C.usdc);
   const domain = { name: "AON CSD/USDC", version: "4", chainId: C.chainId, verifyingContract: settlement } as const;
   const AUTH_TYPES = csdUsdcNamespace.types!() as any;
@@ -302,10 +322,10 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
 
   // ── EVM ──────────────────────────────────────────────────────────────────
   if ((await pub.readContract({ address: usdc, abi: ERC20, functionName: "allowance", args: [account.address, settlement] })) < 10n ** 15n)
-    await pub.waitForTransactionReceipt({ hash: await wallet.writeContract({ address: usdc, abi: ERC20, functionName: "approve", args: [settlement, maxUint256] }) });
+    await pub.waitForTransactionReceipt({ hash: await write({ address: usdc, abi: ERC20, functionName: "approve", args: [settlement, maxUint256] }) });
   async function send(functionName: string, args: any[]): Promise<Hex> {
     await pub.simulateContract({ account, address: settlement, abi: settlementAbi, functionName: functionName as any, args: args as any });
-    return wallet.writeContract({ address: settlement, abi: settlementAbi, functionName: functionName as any, args: args as any });
+    return write({ address: settlement, abi: settlementAbi, functionName: functionName as any, args: args as any });
   }
   // Acts as soon as a lock is mined (the loop is the backup)
   function watchLock(t: Trade) {
@@ -708,7 +728,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       // Marked first, so a crash mid-way can never pay twice (it's then left for the operator to check).
       if (t.direct) { log(`[mm] sell ${t.authHash}: a direct payment may already have been sent; check ${t.auth.sellerUsdcRecipient} by hand`); return; }
       t.direct = true; save();
-      t.releaseTx = await wallet.writeContract({ address: usdc, abi: ERC20, functionName: "transfer", args: [getAddress(t.auth.sellerUsdcRecipient), BigInt(t.usdcAmount)] });
+      t.releaseTx = await write({ address: usdc, abi: ERC20, functionName: "transfer", args: [getAddress(t.auth.sellerUsdcRecipient), BigInt(t.usdcAmount)] });
       t.status = "released"; save();
       log(`[mm] sell ${t.authHash}: lock was refunded; paid the seller directly (${t.releaseTx})`);
       return;

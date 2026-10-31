@@ -55,7 +55,7 @@ const STATE = "/tmp/claude-0/mm-test-state.json"; rmSync(STATE, { force: true })
 const logs = [];
 const aonNode = await startFakeAonNode({ port: 18993 }), A = aonApi(aonNode.url);
 const published = { find: (f) => [...aonNode.objects.values()].find(f) };
-const mmCfg = { rpcUrl: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: MM_SEED,
+const mmCfg = { rpcUrl: RPC, privateTxRpc: RPC, chainId: 31337, privateKey: MM_KEY, settlement, usdc, csdApi: csd.url, csdGenesis: GENESIS, csdSeed: MM_SEED,
   stateFile: STATE, port: 18990, allowedOrigins: ["https://covenant.market"], initialPool: { usdc: 150_000_000n, csd: 1000n * 100_000_000n },
   maxUnconfirmedUsdc: 10_000_000n, maxLossUsdc: 1_000_000n, sellPayWindowSecs: 8, trustProxy: true,
   pollMs: 60_000, watchMs: 600_000, rebroadcastSecs: 1, declinedCheckMs: 0, newBuysPerMinute: 1000, log: (...a) => logs.push(a.join(" ")), aonNodeUrl: aonNode.url };
