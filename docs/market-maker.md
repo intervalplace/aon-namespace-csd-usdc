@@ -221,6 +221,13 @@ Stop the bot, then `npx tsx scripts/market-maker.ts --top-up 500`: it prints
 the CSD that goes with 500 USDC at the current price. Send both to the bot's
 addresses, rerun with `--yes`, and start the bot again. The price doesn't move.
 
+## Moving the price
+
+If CSD trades at another price elsewhere, move the bot's price there before someone profits from
+the difference at its expense. Stop the bot, then `npx tsx scripts/market-maker.ts --set-price 0.139`:
+it shows the change (the pool's USDC stays; it counts the CSD that gives that price), and
+`--yes` makes it. Start the bot again.
+
 ## The circuit breaker
 
 When someone sells CSD to the bot, it releases their USDC early: within the loss limits before
