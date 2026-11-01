@@ -111,6 +111,38 @@ several) to read and publish on, Node 20, and your own funds:
   POOL_CSD is your starting price); USDC arrives as you sell.
 - **Buy only** (`SIDES=buy`): just USDC.
 
+### Selling only, at your price (CSD and no USDC)
+
+Say you mined 50,000 CSD and want to sell it for at least 0.20 USDC each, with no
+USDC to start with. A sell-only maker does that:
+
+```bash
+SIDES=sell
+POOL_CSD=50000      # what you're selling
+POOL_USDC=10000     # 50,000 × 0.20: only sets your floor price; no USDC needed
+```
+
+- **No USDC needed.** A sell-only maker never pays out USDC: buyers lock theirs, it
+  sends them CSD, and it's paid with a proof. Its USDC balance is only ever checked
+  when it buys CSD, which it doesn't. `POOL_USDC` is just a number that sets the price.
+- **It never sells below your floor.** Only buyers trade with it, and every buy moves
+  its price up. It starts at 0.20 plus the spread (`SPREAD_BPS`, 3% by default).
+- **It climbs as it sells.** The price after selling a share *s* of `POOL_CSD` is the
+  floor ÷ (1 − *s*)²: about +23% after a tenth, ×1.8 after a quarter, ×4 after half.
+  So the bigger `POOL_CSD` is next to what sells, the flatter your price. If the
+  market's price rises past yours, the buyers come to you first; if it falls below
+  your floor, they don't, and you simply wait.
+- **To lower it later** (say you'll accept 0.18 after all), stop the bot and run
+  `--set-price 0.18`; to raise it, the same with a higher price.
+- **You need a little ETH** (start with about 0.05): the bot sends each sale's
+  Ethereum transactions (locking the buyer's USDC with their permit, then settling
+  with the proof). The fee it charges each trade (`FEE_USDC`, 0.25 USDC by default)
+  pays for that over time.
+- **The CSD goes in the bot's CSD address** (`--addresses` prints it); the bot splits
+  it into pieces so it can pay several buyers within one CSD block.
+
+The USDC it earns accumulates in its Ethereum address; send it on whenever you like.
+
 What the site checks, since it doesn't trust any maker:
 
 - **Proven makers get the orders.** A maker counts once a trade of theirs has
