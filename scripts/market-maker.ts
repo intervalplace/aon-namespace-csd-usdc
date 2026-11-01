@@ -40,9 +40,9 @@ if (process.argv.includes("--resume")) {
   process.exit(0);
 }
 
-// Move the price to the market's (say it trades at 0.139 elsewhere): keeps the pool's USDC and sets
-// how much CSD it counts, so the price is the one given. Leftover CSD stays in the bot's wallet,
-// unused (send more USDC and --top-up later to use it). Stop the bot first, then
+// Move the price to the market's (say it trades at 0.139 elsewhere): counts less of one side of the
+// pool, so the price is the one given; the rest stays in the bot's wallet, unused (--top-up later
+// puts it back to work). Stop the bot first, then
 //   npx tsx scripts/market-maker.ts --set-price 0.139   (prints the change; add --yes to make it)
 if (process.argv.includes("--set-price")) {
   const { readFileSync, writeFileSync, existsSync } = await import("node:fs");
@@ -52,12 +52,15 @@ if (process.argv.includes("--set-price")) {
   const price = Number(process.argv[process.argv.indexOf("--set-price") + 1]);
   if (!(price > 0)) { console.error("usage: --set-price <USDC per CSD>, e.g. --set-price 0.139"); process.exit(1); }
   const pu = BigInt(S.pool.usdc), pc = BigInt(S.pool.csd);
-  const csd = BigInt(Math.round(Number(pu) * 100 / price)); // (USDC has 6 decimals, CSD 8)
+  // Never counts more of either side than the pool has: at a higher price it counts less CSD, at a
+  // lower one less USDC (the rest stays in the bot's wallet, unused; --top-up puts it back to work)
+  let usdc = pu, csd = BigInt(Math.round(Number(pu) * 100 / price)); // (USDC has 6 decimals, CSD 8)
+  if (csd > pc) { csd = pc; usdc = BigInt(Math.round(Number(pc) * price / 100)); }
   const now = (Number(pu) / 1e6) / (Number(pc) / 1e8);
   console.log(`Pool: ${Number(pu) / 1e6} USDC + ${Number(pc) / 1e8} CSD, price ${now.toFixed(4)}.`);
-  console.log(`New:  ${Number(pu) / 1e6} USDC + ${Number(csd) / 1e8} CSD, price ${price}.` + (csd < pc ? ` (${(Number(pc - csd) / 1e8).toFixed(2)} CSD stays in the wallet, unused)` : ` (needs ${(Number(csd - pc) / 1e8).toFixed(2)} more CSD in the bot's wallet)`));
+  console.log(`New:  ${Number(usdc) / 1e6} USDC + ${Number(csd) / 1e8} CSD, price ${price}.` + (csd < pc ? ` (${(Number(pc - csd) / 1e8).toFixed(2)} CSD stays in the wallet, unused)` : usdc < pu ? ` (${(Number(pu - usdc) / 1e6).toFixed(2)} USDC stays in the wallet, unused)` : ""));
   if (!process.argv.includes("--yes")) { console.log("Rerun with --yes to make the change, then start the bot."); process.exit(0); }
-  S.pool = { usdc: String(pu), csd: String(csd) };
+  S.pool = { usdc: String(usdc), csd: String(csd) };
   writeFileSync(file, JSON.stringify(S, null, 1));
   console.log("Done. Start the bot again; its next offers quote the new price.");
   process.exit(0);

@@ -225,7 +225,8 @@ addresses, rerun with `--yes`, and start the bot again. The price doesn't move.
 
 If CSD trades at another price elsewhere, move the bot's price there before someone profits from
 the difference at its expense. Stop the bot, then `npx tsx scripts/market-maker.ts --set-price 0.139`:
-it shows the change (the pool's USDC stays; it counts the CSD that gives that price), and
+it shows the change (it counts less of one side, so the price is the one given; the rest stays in
+the bot's wallet), and
 `--yes` makes it. Start the bot again.
 
 ## The circuit breaker
