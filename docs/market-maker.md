@@ -143,6 +143,31 @@ POOL_USDC=10000     # 50,000 × 0.20: only sets your floor price; no USDC needed
 
 The USDC it earns accumulates in its Ethereum address; send it on whenever you like.
 
+### Buying only, up to your price (USDC and no CSD)
+
+The mirror image: say you want to buy up to 50,000 CSD at 0.10 or less, holding
+only USDC. A buy-only maker is a standing bid:
+
+```bash
+SIDES=buy
+POOL_USDC=5000      # the USDC you'll spend: real, in the bot's Ethereum address
+POOL_CSD=50000      # 5,000 ÷ 0.10: only sets your top price; no CSD needed
+```
+
+- **It never pays above your ceiling.** Only sellers trade with it, and every sale
+  moves its price down. It starts at 0.10 minus the spread.
+- **It falls as it buys.** After spending a share *s* of `POOL_USDC`, its price is
+  the ceiling × (1 − *s*)²: about −19% after a tenth, −44% after a quarter.
+- **No CSD needed**; it arrives as you buy (and is swept into the bot's CSD address).
+- **This side carries the risk.** It releases USDC early, before a seller's CSD
+  has many blocks on top, within the loss limits and the circuit breaker described
+  below. Run your own bot for this rather than trusting someone else's.
+- **Large amounts take many trades.** Each trade is at most 30 USDC, and all open
+  locks across every maker share a 300 USDC limit (releases are quick, so they clear
+  fast): 5,000 USDC is about 170 trades, each a seller choosing to sell to you.
+- **Besides the pool:** about 0.05 ETH for gas, and room for the 2 USDC executor fee
+  locked with each open sale (it comes back when the bot releases the sale).
+
 What the site checks, since it doesn't trust any maker:
 
 - **Proven makers get the orders.** A maker counts once a trade of theirs has
