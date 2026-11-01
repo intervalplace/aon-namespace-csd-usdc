@@ -139,11 +139,17 @@ address they don't control.
 Settlement is self-contained, so it runs on Ethereum mainnet next to the
 ETH market with nothing to keep running: no header oracle, no relayer.
 
-- The buyer signs `csdMaxTarget` in the authorization: every block in the
-  proof must be at least that hard. This is the buyer's protection: an
-  interface sets it from CSD's real difficulty read from a node of its own,
-  not from the market maker (covenant.market allows at most 10% easier than
-  the live difficulty).
+- The buyer (whoever pays the USDC: the party at risk) signs `csdMaxTarget`,
+  the easiest difficulty the proof may count at: the blocks in it must carry,
+  together, at least `minConfirmations` blocks' worth of work at that
+  difficulty (a total, not a rule for each block, since real CSD blocks vary).
+  This is the buyer's protection, so the buyer's side sets it from CSD's real
+  difficulty, never from the other party: when you buy CSD on covenant.market
+  your page reads it from an independent CSD node and allows at most 10% easier
+  (or, if that node can't be reached, a fixed bound in the release); when you
+  sell, the market maker pays the USDC and signs it, and your page checks it
+  isn't harder than about 10% below the real difficulty, so you could always
+  prove your payment yourself.
 - `settleCsdUsdc` gets the payment transaction (parsed strictly, every byte
   accounted for), its merkle path, the payment block and the next blocks
   (`minConfirmations` or more). It checks they link up by hash, each has
@@ -157,6 +163,12 @@ ETH market with nothing to keep running: no header oracle, no relayer.
 - The seller checks the signed difficulty isn't above the real one before
   paying (otherwise real blocks wouldn't qualify); `checkHeaderChain` lets
   anyone pre-check a run of real headers.
+- Two comments in the deployed contract's source are older than the rest and
+  say more than the code does: the header's "typically ~3/4 of CSD's current
+  difficulty" (interfaces now allow 10%), and the `csdMaxTarget` field's
+  "every confirming block must have target <= this" (the code checks the total
+  work, as above). The source stays as deployed so it keeps matching the
+  verified contract; this section is the current description.
 
 ## Limits
 
