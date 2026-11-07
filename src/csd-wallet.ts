@@ -189,6 +189,12 @@ export function csdSaleRequestDigest(r: { csdAmount: bigint; usdcRecipient: stri
   const coins = r.coins.map(c => `${c.txid.toLowerCase()}:${c.vout}`).join(",");
   return keccak_256(utf8(`covenant.market CSD sale request v1|${r.csdAmount}|${r.usdcRecipient.toLowerCase()}|${r.validUntil}|${coins}`));
 }
+// What a market maker signs with each CSD key whose coins it offers to sell: "this address is
+// mine". Interfaces check it, then read the address's coins themselves, so the liquidity they show is
+// what's really there, not what an offer says.
+export function csdReservesDigest(marketMaker: string): Bytes {
+  return keccak_256(utf8(`covenant.market CSD reserves v1|${marketMaker.toLowerCase()}`));
+}
 // Signs any 32-byte digest in the same format as csdAddressProof
 export function csdSignDigest(key: CsdKey, digest: Bytes): { pubKey: Hex; sig: Hex } {
   const s = secp256k1.sign(digest, key.priv, { lowS: true });

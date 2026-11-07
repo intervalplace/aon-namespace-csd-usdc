@@ -38,7 +38,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import {
   csdNode, deriveCsdWallet, buildPayment, csdTxid, csdAddressProof, addr20ToBytes32, bitsToTarget, bytesToHex, hash160,
-  suggestedMaxTarget, txToNodeJson, txFromNodeJson, csdInputSigners, hexToBytes, csdSaleRequestDigest, csdSignerAddress, type CsdKey, type CsdTx, type CsdUtxo,
+  suggestedMaxTarget, txToNodeJson, txFromNodeJson, csdInputSigners, hexToBytes, csdSaleRequestDigest, csdSignerAddress, csdSignDigest, csdReservesDigest, type CsdKey, type CsdTx, type CsdUtxo,
 } from "./csd-wallet.js";
 import { settlementAbi, authTuple, spvProofTuple } from "./executors/evmCsdUsdcSettlement.js";
 import { csdUsdcNamespace, EARLY_RELEASE_TYPES } from "./namespace.js";
@@ -482,7 +482,13 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   }
   // The bot's standing quotes, re-published when the price moves 1% or every 30 minutes
   async function refreshOffers() {
-    const p = quotePool(), mid = midPrice(p), t = now(), poolKey = `${p.usdc}:${p.csd}`;
+    const p = quotePool(), mid = midPrice(p), t = now();
+    // Where its CSD is, each address signed for: interfaces read those coins themselves (its USDC is
+    // at its Ethereum address, which needs no proof)
+    const reserves = ownKeys().slice(0, 50).map(k => ({ addr: k.addr20, sig: csdSignDigest(k, csdReservesDigest(account.address)).sig }));
+    // (not part of the key: a sale brings CSD to a new address and moves the pool too, and a sweep
+    // only moves coins into the inventory address, which is always listed, so nothing is left out)
+    const poolKey = `${p.usdc}:${p.csd}`;
     // A new offer whenever the pool changes (so the book on AON is always the real price), or every 30 minutes
     const stale = (o?: Offer) => !o || t - o.at > 1800 || o.poolKey !== poolKey;
     S.offers ??= {};
@@ -493,7 +499,8 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
       const o = await signed({ objectType: "offer", schemaVersion: "1", namespace: NS, createdAt: Date.now(), references: ref(S.offers[side]?.hash),
         payload: { offerType: side === "sell" ? "csd_usdc_sell_csd" : "csd_usdc_buy_csd", marketMaker: account.address, settlementContract: settlement, usdc,
           csdGenesisHash: C.csdGenesis, pricing: "pool", poolUsdc: String(p.usdc), poolCsd: String(p.csd), midUsdcPerCsd: String(mid),
-          spreadBps: String(C.spreadBps), feeUsdc: String(C.feeUsdc), minTradeUsdc: String(C.minTradeUsdc), maxTradeUsdc: String(C.maxTradeUsdc), validBefore: t + 3600 } });
+          spreadBps: String(C.spreadBps), feeUsdc: String(C.feeUsdc), minTradeUsdc: String(C.minTradeUsdc), maxTradeUsdc: String(C.maxTradeUsdc), validBefore: t + 3600,
+          ...(side === "sell" ? { reserves: { csd: reserves } } : {}) } });
       // Published before anyone can reference it
       try { await aonPut(o); } catch { queueObject(o); }
       S.offers[side] = { hash: o.objectHash!, mid: String(mid), at: t, poolKey };

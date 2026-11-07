@@ -6,7 +6,7 @@ import { privateKeyToAccount, generatePrivateKey } from "viem/accounts";
 import { startFakeCsdNode } from "./fake-csd-node.mjs";
 import { startFakeAonNode } from "./fake-aon-node.mjs";
 import { buyAuthorizationObject, saleRequestObject, salePaymentObject, aonApi, objectSigner } from "../src/aon-client.ts";
-import { deriveCsdWallet, csdNode, buildPayment, csdAddressProof, addr20ToBytes32, bitsToTarget, txToNodeJson, CSD_WALLET_MESSAGE, csdSaleRequestDigest, csdSignDigest, incomingPaymentLooksReal } from "../src/csd-wallet.ts";
+import { deriveCsdWallet, csdNode, buildPayment, csdAddressProof, addr20ToBytes32, bitsToTarget, txToNodeJson, CSD_WALLET_MESSAGE, csdSaleRequestDigest, csdSignDigest, csdSignerAddress, csdReservesDigest, incomingPaymentLooksReal } from "../src/csd-wallet.ts";
 import { startMarketMaker } from "../src/market-maker.ts";
 import { quoteBuy, quoteSell, midPrice } from "../src/pool.ts";
 import { csdUsdcNamespace } from "../src/namespace.ts";
@@ -524,6 +524,18 @@ console.log("\n[6f] Circuit breaker: a deep CSD reorg stops buying CSD; a 1-bloc
   check(r.http === 200 && r.accepted !== false, "but users can still buy CSD from it (that side is safe)");
   mm.resume(); await mm.tick();
   check(!mm.state().halt && (await get("/market")).limits.sellsPaused === false, "resumed by its operator"); }
+
+console.log("\n[6b2] Reserves: a sell offer names where its CSD is, each address signed for");
+{ const o = aonNode.objects.get(mm.state().offers.sell.hash.toLowerCase()) ?? aonNode.objects.get(mm.state().offers.sell.hash);
+  const rs = o?.payload?.reserves?.csd ?? [];
+  check(rs.length >= 1, "the latest sell offer lists its CSD addresses");
+  check(rs.every(r => csdSignerAddress(csdReservesDigest(mmEvm.address), r.sig) === r.addr), "each is signed by the key that owns it, for this maker");
+  check(rs.every(r => csdSignerAddress(csdReservesDigest("0x" + "11".repeat(20)), r.sig) !== r.addr), "and the signature doesn't hold for another maker");
+  const node = csdNode(csd.url); let held = 0n;
+  for (const r of rs) for (const c of await node.utxosAt(r.addr, true)) held += c.value;
+  check(held > 0n, `the coins at those addresses can be counted by anyone (${Number(held) / 1e8} CSD)`);
+  const buys = [...aonNode.objects.values()].filter(o => o.objectType === "offer" && o.payload?.marketMaker === mmEvm.address && o.payload.offerType === "csd_usdc_buy_csd");
+  check(buys.every(b => !b.payload.reserves), "a buy offer needs none: its USDC is at the maker's own Ethereum address"); }
 
 console.log("\n[6c] Open market: any maker's offers are found, even under junk, by following its chain of offers");
 { const first = [...aonNode.objects.values()].filter(o => o.objectType === "offer" && o.payload?.marketMaker === mmEvm.address && o.payload.offerType === "csd_usdc_sell_csd")
