@@ -17,6 +17,12 @@ const usdcUnits = (x: string) => BigInt(Math.round(Number(x) * 1e6));
 const csdUnits = (x: string) => BigInt(Math.round(Number(x) * 1e8));
 
 if (process.argv.includes("--new-seed")) { console.log("MM_CSD_SEED=0x" + randomBytes(32).toString("hex")); process.exit(0); }
+// Both of a new maker's keys at once, as lines for its settings file
+if (process.argv.includes("--new-keys")) {
+  console.log("MM_PRIVATE_KEY=0x" + randomBytes(32).toString("hex"));
+  console.log("MM_CSD_SEED=0x" + randomBytes(32).toString("hex"));
+  process.exit(0);
+}
 if (process.argv.includes("--addresses")) {
   const evm = privateKeyToAccount(env("MM_PRIVATE_KEY") as Hex).address;
   const csd = deriveCsdWallet(env("MM_CSD_SEED") as Hex).key(0).addr20;
@@ -95,7 +101,8 @@ const mm = await startMarketMaker({
   // would take the executor fee ("off" sends them to AON_EVM_RPC_URL like everything else)
   privateTxRpc:  ((v) => v === "off" ? "" : v)(process.env.PRIVATE_TX_RPC || (env("CHAIN_ID", "1") === "1" ? "https://rpc.flashbots.net/fast" : "")),
   privateKey:    env("MM_PRIVATE_KEY") as Hex,
-  settlement:    getAddress(env("SETTLEMENT_CONTRACT")),
+  // the CsdUsdcSettlement on mainnet; set it for any other chain
+  settlement:    getAddress(env("SETTLEMENT_CONTRACT", env("CHAIN_ID", "1") === "1" ? "0x8863f0c477a30bb5a2077c813f42250d7fbefcb9" : undefined)),
   usdc:          getAddress(env("USDC_ADDRESS", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")),
   csdApi:        env("CSD_API_URL", "http://127.0.0.1:8887"),
   csdGenesis:    env("CSD_GENESIS_HASH", "0x00000052c2821f71b19c3d79dfabfb12d4076ba15d83b47d008e582aad6c0d52") as Hex,

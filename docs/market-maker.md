@@ -7,6 +7,94 @@ one Ethereum block (~12 s) in either direction, with no CSD confirmations to
 wait for and no ETH needed by the user. No consensus change and no custody of
 user funds: the bot is a trader with a key, CSD and USDC.
 
+## Quick start: your own maker
+
+Everything below runs on your own computer or server, with your own keys. Your
+funds stay in your own wallets until someone trades with you. These steps use
+public nodes, so there's nothing else to install; for real amounts, read
+[Your own nodes](#your-own-nodes) below.
+
+You need Node 20 or newer, and git.
+
+**1. Get the code and make keys**
+
+```bash
+git clone https://github.com/intervalplace/aon-namespace-csd-usdc && cd aon-namespace-csd-usdc && npm ci
+npx tsx scripts/market-maker.ts --new-keys
+```
+
+It prints two lines, `MM_PRIVATE_KEY=…` (the maker's Ethereum key) and
+`MM_CSD_SEED=…` (its CSD wallet). They are the maker's money: keep them secret,
+and back them up somewhere offline.
+
+**2. Settings**
+
+Make a file `maker.env` next to the code (`chmod 600 maker.env`):
+
+```bash
+MM_PRIVATE_KEY=0x...                  # from step 1
+MM_CSD_SEED=0x...                     # from step 1
+AON_EVM_RPC_URL=https://...           # any Ethereum mainnet RPC; a keyed one (Alchemy, Infura…) is more reliable
+POOL_USDC=100                         # your pool: POOL_USDC ÷ POOL_CSD is your starting price,
+POOL_CSD=1000                         #   so set it to the market price (here 0.10 USDC per CSD)
+SIDES=sell,buy                        # or "sell" (only sell CSD) or "buy" (only buy it)
+STATE_FILE=./maker-state.json         # the maker's memory: back it up too
+AON_NODE_URL=https://explorer.aon.network,https://node2.aon.network,https://node3.aon.network,https://node4.aon.network
+CSD_API_URL=https://csd.aon.network
+```
+
+**3. Fund it**
+
+```bash
+set -a; . ./maker.env; set +a
+npx tsx scripts/market-maker.ts --addresses
+```
+
+Send what your pool says to the two addresses it prints: the CSD to the CSD
+address, and the USDC plus about 0.02 ETH (for gas) to the Ethereum address.
+Add a few USDC beyond `POOL_USDC`: each open sale locks a 2 USDC fee until it
+settles.
+
+**4. Run it**
+
+```bash
+npx tsx scripts/market-maker.ts
+```
+
+It splits its CSD into 20 coins, then publishes its offers on AON. Within a
+minute they're in the order book on covenant.market, next to everyone else's.
+Keep it running (in `tmux`, or as a service: [Running it](#running-it)); when
+it stops, its offers simply expire.
+
+A new maker gets only small trades, up to 5 USDC and only when it has the best
+price, until its first trade settles on Ethereum. After that it gets
+full-size trades like any other.
+
+From then on:
+- **Reprice** when the market moves: `--set-price 0.12` ([Moving the price](#moving-the-price)).
+- **Add funds**: `--top-up` ([Deepening the pool](#deepening-the-pool)).
+- **Read the safety stop:** [The circuit breaker](#the-circuit-breaker).
+
+### Your own nodes
+
+The quick start trusts two public nodes. Before putting real amounts in,
+replace them with your own:
+
+- **The CSD node** is the one that matters. When someone sells CSD to your
+  maker, the maker takes the node's word that the CSD payment arrived and then
+  releases USDC. A node you don't control could claim a payment that never
+  happened. The maker's loss limits cap the damage (`MAX_INSTANT_USDC`,
+  `MAX_LOSS_USDC`), but your own node removes the risk. Build the node from
+  [compute-substrate](https://github.com/compute-substrate/compute-substrate),
+  let it sync, and set `CSD_API_URL=http://127.0.0.1:8887`. Keep the public node
+  as a second place to broadcast your payments: `CSD_BROADCAST_APIS=https://csd.aon.network`.
+  (When your maker sells CSD, there's no such trust: the contract itself checks
+  the CSD chain's proof of work before it pays you.)
+- **The AON node** only carries messages. Every offer and answer is signed, so
+  a public node can't forge one, only fail to deliver. Running your own
+  ([AON](https://github.com/intervalplace/aon)) makes your maker independent of
+  anyone else's uptime. List it first: `AON_NODE_URL=http://127.0.0.1:8787,https://explorer.aon.network`.
+
 ## Price
 
 The bot's price is its pool: **USDC held ÷ CSD held**, plus a spread (3% by
@@ -222,7 +310,7 @@ npx tsx scripts/market-maker.ts --new-seed      # → MM_CSD_SEED, keep it secre
 AON_EVM_RPC_URL=https://...           # mainnet RPC
 MM_PRIVATE_KEY=0x...                  # a NEW key used only by the bot
 MM_CSD_SEED=0x...                     # from --new-seed
-SETTLEMENT_CONTRACT=0x...             # the deployed CsdUsdcSettlement
+# SETTLEMENT_CONTRACT=0x...           # only off mainnet: on mainnet it's the CsdUsdcSettlement at 0x8863…cb9
 POOL_USDC=150
 POOL_CSD=1000
 STATE_FILE=/var/lib/covenant-mm/state.json

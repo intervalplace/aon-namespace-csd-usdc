@@ -13,7 +13,7 @@ Ethereum contract checks CSD's proof of work itself. No bridge, no custody, no
 fork, no oracle.
 
 **An open market.** There is no list of approved market makers. Anyone with
-CSD or USDC can run [`scripts/market-maker.ts`](docs/market-maker.md#run-your-own)
+CSD or USDC can run [`scripts/market-maker.ts`](docs/market-maker.md#quick-start-your-own-maker) (four steps)
 (or their own), publish signed offers on AON, and interfaces route each trade to
 the best price. A user never has to trust a maker: a buyer's USDC only reaches
 one with a proof that the CSD was paid, and a seller's CSD only leaves their

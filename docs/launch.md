@@ -13,7 +13,7 @@ Two A records (and AAAA if the servers have IPv6):
 ## 2. spill2: the independent CSD node over HTTPS
 
 The site reads CSD's current difficulty from here, not from the market maker,
-and also broadcasts sellers' payments here. Only the cheap calls are exposed.
+and also broadcasts sellers' payments here. Market makers without their own CSD node use it too.
 Add to `/etc/caddy/Caddyfile`:
 
 ```
@@ -25,7 +25,9 @@ csd.aon.network {
 	handle @preflight {
 		respond 204
 	}
-	@api path /tip /block/height/* /tx/submit
+	# what a market maker needs too (docs/market-maker.md, Quick start); the node answers
+	# lookups from its index and turns excess load away with 503 + Retry-After
+	@api path /tip /block/height/* /tx/submit /utxos/* /tx/* /proof/tx/*
 	handle @api {
 		reverse_proxy 127.0.0.1:8887
 	}
