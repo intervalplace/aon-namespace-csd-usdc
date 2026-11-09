@@ -124,6 +124,22 @@ const mm = await startMarketMaker({
   minEthWei:     BigInt(Math.round(Number(env("MIN_ETH", "0.005")) * 1e6)) * 10n ** 12n, // new trades stop below this
   // Requests arrive over AON and every trade is published there
   aonNodeUrl:    env("AON_NODE_URL", "http://127.0.0.1:8787"),
+  drain:         process.argv.includes("--drain"),
 });
+
+// --drain: before stopping the bot (to change its price, update it, move it), finish the trades
+// that are open and take no new ones, then exit. Stopping in the middle of a buy can cost its CSD:
+// the buy must be proven before its lock runs out, or the buyer gets the USDC back as well.
+//   npx tsx scripts/market-maker.ts --drain
+if (process.argv.includes("--drain")) {
+  console.log("[mm] draining: no new offers or trades; exits once the open trades are finished");
+  let last = "";
+  setInterval(async () => {
+    const open = mm.openTrades();
+    const line = open.map(t => `${t.kind} ${t.authHash.slice(0, 10)} ${t.status}`).join(", ");
+    if (line !== last) { last = line; console.log(open.length ? `[mm] waiting on ${open.length}: ${line}` : "[mm] nothing open"); }
+    if (!open.length) { await mm.stop(); console.log("[mm] drained; safe to stop, reprice or update now"); process.exit(0); }
+  }, 10_000);
+}
 
 for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, async () => { await mm.stop(); process.exit(0); });

@@ -71,7 +71,7 @@ price, until its first trade settles on Ethereum. After that it gets
 full-size trades like any other.
 
 From then on:
-- **Reprice** when the market moves: `--set-price 0.12` ([Moving the price](#moving-the-price)).
+- **Reprice** when the market moves: stop with `--drain`, then `--set-price 0.12` ([Moving the price](#moving-the-price)).
 - **Add funds**: `--top-up` ([Deepening the pool](#deepening-the-pool)).
 - **Read the safety stop:** [The circuit breaker](#the-circuit-breaker).
 
@@ -369,7 +369,11 @@ addresses, rerun with `--yes`, and start the bot again. The price doesn't move.
 ## Moving the price
 
 If CSD trades at another price elsewhere, move the bot's price there before someone profits from
-the difference at its expense. Stop the bot, then `npx tsx scripts/market-maker.ts --set-price 0.139`:
+the difference at its expense. Stop the bot the safe way first: run it with `--drain` (instead of
+the running one), which takes no new trades and exits once the open ones are finished. Stopping it
+in the middle of a buy can cost that buy's CSD: the bot must prove its CSD payment before the
+buyer's lock runs out, or the buyer gets the USDC back as well. Then
+`npx tsx scripts/market-maker.ts --set-price 0.139`:
 it shows the change (it counts less of one side, so the price is the one given; the rest stays in
 the bot's wallet), and
 `--yes` makes it. Start the bot again.

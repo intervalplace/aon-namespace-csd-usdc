@@ -71,6 +71,7 @@ export type MarketMakerConfig = {
   bigSaleUsdc?: bigint;         // sales above this (default 10 USDC) wait for bigSaleConfirmations (default 6) instead
   bigSaleConfirmations?: number;
   haltReorgDepth?: number;      // a CSD reorg this deep (default 2 blocks) stops buying CSD until --resume
+  drain?: boolean;              // finish open trades but take no new ones (see openTrades; scripts' --drain)
   haltConfirmations?: number;   // while stopped, paid sales are released only this deep (default 20)
   priceToleranceBps?: bigint;   // how far a signed price may lag the pool; default 50 (0.5%)
   sellPayWindowSecs?: number;   // a seller must pay within this long of the lock; default 180
@@ -233,6 +234,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // Below the reserve, new trades are declined so what's left goes to those.
   let lowGasLogged = 0;
   async function needGas() {
+    if (C.drain) throw new HttpError(503, "MARKET_MAKER_PAUSED"); // draining: finishing what's open, nothing new
     const eth = await pub.getBalance({ address: account.address });
     if (eth >= C.minEthWei) return;
     if (Date.now() - lowGasLogged > 600_000) { lowGasLogged = Date.now(); log(`[mm] LOW GAS: ${Number(eth) / 1e18} ETH; not taking new trades until topped up`); }
@@ -493,6 +495,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     const stale = (o?: Offer) => !o || t - o.at > 1800 || o.poolKey !== poolKey;
     S.offers ??= {};
     for (const side of C.sides) {
+      if (C.drain) continue; // draining: no new offers (the last ones run out on their own)
       if (side === "buy" && S.halt) continue; // stopped buying CSD: no new offer (the last one runs out within the hour)
       if (!stale(S.offers[side])) continue;
       // Each offer references the one it replaces, so anyone holding an old one can find the newest
@@ -1459,6 +1462,11 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     server, address: account.address, csdInventoryAddress: inventory.addr20, state: () => S, tick: () => serial(tick),
     watch: () => watch(), watchtower: () => serial(() => watchtower(true)),
     resume: () => { delete S.halt; save(); log("[mm] buying CSD again"); },
+    // Trades that still need this bot: a buy until it's settled or refunded (it must prove its CSD
+    // payment before the lock runs out), a sale until its USDC is released or refunded
+    openTrades: () => Object.values(S.trades).filter(t => t.kind === "buy"
+      ? ["locking", "opening", "locked"].includes(t.status)
+      : ["opening", "open", "paid"].includes(t.status)).map(t => ({ kind: t.kind, authHash: t.authHash, status: t.status })),
     async stop() { stopped = true; await ticking.catch(() => {}); await watching.catch(() => {}); await new Promise(r => server.close(r)); },
   };
 }

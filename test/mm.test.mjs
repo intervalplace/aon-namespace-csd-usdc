@@ -608,6 +608,14 @@ console.log("\n[8] Watchtower: a maker that never releases a paid sale; another 
     console.log(`    (settling with a proof of ${o.authorization.minConfirmations} confirmations used ${gas} gas)`); }
   await tower.stop(); rmSync(STATE + ".tower", { force: true }); }
 
+// [drain] A draining bot (--drain, for a safe stop) publishes no offers and takes no trades
+{ const d = await startMarketMaker({ ...mmCfg, privateKey: "0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356", csdSeed: "0x" + "72".repeat(32),
+    stateFile: STATE + ".drain", port: mmCfg.port + 7, drain: true, log: () => {} });
+  check(!d.state().offers?.sell && !d.state().offers?.buy, "a draining bot publishes no offers");
+  check(Array.isArray(d.openTrades()) && d.openTrades().length === 0, "and has nothing open, so --drain would exit at once");
+  check(Array.isArray(mm.openTrades()), "the running bot reports its open trades for --drain");
+  await d.stop(); rmSync(STATE + ".drain", { force: true }); }
+
 await mm.stop(); await csd.close(); await aonNode.close();
 if (logs.some(l => l.includes("INTERNAL"))) console.log(logs.join("\n"));
 console.log(`\nAll ${pass} market-maker checks passed.`);
