@@ -369,8 +369,8 @@ addresses, rerun with `--yes`, and start the bot again. The price doesn't move.
 ## Moving the price
 
 If CSD trades at another price elsewhere, move the bot's price there before someone profits from
-the difference at its expense. Stop the bot the safe way first: run it with `--drain` (instead of
-the running one), which takes no new trades and exits once the open ones are finished. Stopping it
+the difference at its expense. Stop the bot the safe way first: stop it and start it again right away
+with `--drain`, which picks up the open trades, takes no new ones and exits once they're finished. Stopping it
 in the middle of a buy can cost that buy's CSD: the bot must prove its CSD payment before the
 buyer's lock runs out, or the buyer gets the USDC back as well. Then
 `npx tsx scripts/market-maker.ts --set-price 0.139`:
