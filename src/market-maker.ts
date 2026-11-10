@@ -92,6 +92,7 @@ export type MarketMakerConfig = {
   inventoryPieces?: number;     // CSD is kept split into this many coins; default 20
   pollMs?: number;              // default 5000
   rebroadcastSecs?: number;     // resend a CSD payment not mined after this long; default 900
+  settleRetrySecs?: number;     // forget a settlement transaction never mined after this long; default 1200
   nodeTimeoutMs?: number;       // default 10000
   aonNodeUrl: string;           // the AON node(s) the bot reads requests from and publishes to (comma-separated for several)
   watchMs?: number;             // how often AON is checked for new requests; default 1000
@@ -116,7 +117,7 @@ type Trade = {
   request?: any; proofJson?: any;                           // sell: the seller's signed request; buy: the proof that settled it
   aon?: { offer?: string; request?: string; auth?: string; proof?: string; release?: string; receipt?: string; payment?: string };
   payBy?: number; unpaidAt?: number; paidAt?: number;       // sell: payment deadline; when it lapsed
-  releaseTx?: Hex; settleTx?: Hex; instant?: boolean; direct?: boolean; error?: string;
+  releaseTx?: Hex; settleTx?: Hex; settleSentAt?: number; instant?: boolean; direct?: boolean; error?: string;
 };
 type Offer = { hash: string; mid: string; at: number; poolKey?: string };
 type State = { pool: { usdc: string; csd: string }; nextKey: number; trades: Record<string, Trade>; lossUsdc: string; lastSplit?: number;
@@ -147,7 +148,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
     maxUnconfirmedUsdc: 60_000_000n, maxInstantPerRecipientUsdc: 30_000_000n, maxLossUsdc: 30_000_000n, minUserCsdFee: 1000n,
     buyConfirmations: [10, 30] as [number, number], sellConfirmations: 20, safeConfirmations: 3, bigSaleUsdc: 10_000_000n, bigSaleConfirmations: 6, haltReorgDepth: 2, haltConfirmations: 20, priceToleranceBps: 50n,
     sellPayWindowSecs: 180, maxOpenUnpaid: 3, maxUnpaidPerHour: 2, maxUnpaidPerDay: 10, coinBanSecs: 86400, maxRequestsPerMinute: 20, maxAonChecksPerPass: 10, declinedCheckMs: 60_000, minEthWei: 5_000_000_000_000_000n, sides: ["sell", "buy"] as ("sell" | "buy")[], sellExecutorFeeUsdc: 2_000_000n, watchtowerMs: 60_000, logChunkBlocks: 500, newBuysPerMinute: 6, lateLockSlackSecs: 300,
-    inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
+    inventoryPieces: 20, pollMs: 5000, watchMs: 1000, rebroadcastSecs: 900, settleRetrySecs: 1200, nodeTimeoutMs: 10_000, broadcastApis: [] as string[], trustProxy: false,
     log: console.log, ...cfg,
   };
   const log = C.log;
@@ -827,7 +828,7 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
   // ── background: settle, release, refund, watch payments ─────────────────
   async function settleBuy(t: Trade) {
     const tx = await settleWith(t);
-    if (tx) { t.settleTx = tx; save(); }
+    if (tx) { t.settleTx = tx; t.settleSentAt = now(); save(); }
   }
   // Settles an authorization with a proof of the CSD payment t.csdTxid (once it has the confirmations)
   async function settleWith(t: Trade): Promise<Hex | undefined> {
@@ -889,7 +890,14 @@ export async function startMarketMaker(cfg: MarketMakerConfig) {
               await buySettled(t);
               continue;
             }
-            if (r) { t.settleTx = undefined; save(); } else continue; // reverted: try again; pending: wait
+            if (r) { t.settleTx = undefined; save(); } // reverted: try again
+            // Never mined: a private relay (Flashbots) drops a transaction it doesn't include, and
+            // then no receipt ever comes. Waiting on it forever would also skip the refund below, so
+            // after a while (or once the lock has run out) forget it and look at the contract again.
+            else if (tNow > Number(t.lockedUntil) + 30 || now() - (t.settleSentAt ?? 0) > C.settleRetrySecs) {
+              log(`[mm] buy ${t.authHash}: settlement ${t.settleTx} was never mined; looking again`);
+              t.settleTx = undefined; save();
+            } else continue; // pending: wait
           }
           // Someone else settled it (anyone may submit the proof): we were paid all the same.
           // The next pass finds their transaction and publishes the receipt.

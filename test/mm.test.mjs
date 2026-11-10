@@ -563,6 +563,30 @@ console.log("\n[7] Restart: state survives, CSD proxy works for the in-site wall
   const send2 = buildPayment({ utxos: coins, to: [{ value: 100_000_000n, addr20: "0x" + "ab".repeat(20) }], change: uKey.addr20 });
   check((await userNode.submit(send2.tx)) === send2.txid, "the in-site wallet sends CSD through the proxy"); }
 
+console.log("\n[6g] A settlement the private relay dropped (no receipt, ever) doesn't stall the buy (after the offer tests: it moves the clock)");
+{ const csdAmount = 15n * 100_000_000n;
+  // lock still open: the bot forgets the lost transaction after a while and settles again
+  const b = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount), key: userCsd.key(60) });
+  check((await post("/buy", b.body)).accepted !== false, "a buy is accepted");
+  await until(() => tr(b.hash).status === "locked" && tr(b.hash).csdTxid);
+  const lost = "0x" + "5e".repeat(32);
+  tr(b.hash).settleTx = lost; tr(b.hash).settleSentAt = Math.floor(Date.now() / 1000); // (sent, then dropped by the relay)
+  await mine(10); await mm.tick(); await mm.tick();
+  check(tr(b.hash).status === "locked" && tr(b.hash).settleTx === lost, "at first the bot waits for it, as for any pending transaction");
+  tr(b.hash).settleSentAt -= 1300; await mm.tick(); await mm.tick();
+  await until(() => tr(b.hash).status === "settled");
+  check(tr(b.hash).status === "settled" && tr(b.hash).settleTx !== lost && logs.some(l => l.includes(`settlement ${lost} was never mined`)),
+    "after 20 minutes with no receipt it forgets it, settles again, and says so");
+  // lock already run out: it stops waiting at once, and the buyer gets the refund
+  const c = await signBuy({ csdAmount, usdcAmount: quoteBuy(pool(), csdAmount), key: userCsd.key(61) });
+  check((await post("/buy", c.body)).accepted !== false, "another buy is accepted");
+  await until(() => tr(c.hash).status === "locked" && tr(c.hash).csdTxid);
+  tr(c.hash).settleTx = lost; tr(c.hash).settleSentAt = Math.floor(Date.now() / 1000);
+  const u0 = await bal(user.address);
+  await rpc("evm_increaseTime", [200 * 60]); await rpc("evm_mine"); await mm.tick(); await mm.tick(); await mm.tick();
+  await until(() => tr(c.hash).status === "refunded");
+  check(tr(c.hash).status === "refunded" && await bal(user.address) > u0, "past the lock it forgets the lost transaction, refunds the buyer and marks the buy refunded"); }
+
 console.log("\n[8] Watchtower: a maker that never releases a paid sale; another bot settles it for the seller");
 { const o = await openSale(10n * 100_000_000n, await fresh(71));
   check(o.http === 200 && o.authorization.executorFeeAmount === "2000000", "each sale's lock carries a 2 USDC executor fee (back to the maker when it releases)");
