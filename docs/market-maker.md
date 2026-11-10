@@ -71,7 +71,7 @@ price, until its first trade settles on Ethereum. After that it gets
 full-size trades like any other.
 
 From then on:
-- **Reprice** when the market moves: stop with `--drain`, then `--set-price 0.12` ([Moving the price](#moving-the-price)).
+- **Reprice** when the market moves: stop with `--drain`, then `--set-price 0.12 --from-wallet` ([Moving the price](#moving-the-price)).
 - **Add funds**: `--top-up` ([Deepening the pool](#deepening-the-pool)).
 - **Read the safety stop:** [The circuit breaker](#the-circuit-breaker).
 
@@ -377,6 +377,20 @@ buyer's lock runs out, or the buyer gets the USDC back as well. Then
 it shows the change (it counts less of one side, so the price is the one given; the rest stays in
 the bot's wallet), and
 `--yes` makes it. Start the bot again.
+
+Plain `--set-price` only ever counts less: moving the price up and then down again drops a slice
+of each side, and after a few moves the pool is a fraction of what the wallet holds. To count
+everything instead, add `--from-wallet`:
+
+```bash
+npx tsx scripts/market-maker.ts --set-price 0.06 --from-wallet        # shows the change
+npx tsx scripts/market-maker.ts --set-price 0.06 --from-wallet --yes  # makes it
+```
+
+It reads what the bot actually holds (its USDC on Ethereum and its CSD on the CSD node, less
+0.1 CSD kept for payment fees) and sets the deepest pool those allow at that price. One side is
+always the limit: what's left of the other stays in the wallet, and it says how much. It refuses
+while a trade is open, so drain first.
 
 ## The circuit breaker
 

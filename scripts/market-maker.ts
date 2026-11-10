@@ -50,6 +50,9 @@ if (process.argv.includes("--resume")) {
 // pool, so the price is the one given; the rest stays in the bot's wallet, unused (--top-up later
 // puts it back to work). Stop the bot first, then
 //   npx tsx scripts/market-maker.ts --set-price 0.139   (prints the change; add --yes to make it)
+// With --from-wallet it starts from what the wallet actually holds instead of the current pool, so
+// the pool is the deepest the bot's USDC and CSD allow at that price. Repricing up and down then
+// never shrinks it. Drain first: it refuses while a trade is open.
 if (process.argv.includes("--set-price")) {
   const { readFileSync, writeFileSync, existsSync } = await import("node:fs");
   const file = env("STATE_FILE", "./mm-state.json");
@@ -57,13 +60,33 @@ if (process.argv.includes("--set-price")) {
   const S = JSON.parse(readFileSync(file, "utf8"));
   const price = Number(process.argv[process.argv.indexOf("--set-price") + 1]);
   if (!(price > 0)) { console.error("usage: --set-price <USDC per CSD>, e.g. --set-price 0.139"); process.exit(1); }
-  const pu = BigInt(S.pool.usdc), pc = BigInt(S.pool.csd);
+  let pu = BigInt(S.pool.usdc), pc = BigInt(S.pool.csd);
+  if (process.argv.includes("--from-wallet")) {
+    const open = Object.values<any>(S.trades ?? {}).filter(t => t.kind === "buy" ? ["locking", "opening", "locked"].includes(t.status) : ["opening", "open", "paid"].includes(t.status));
+    if (open.length) { console.error(`${open.length} trade(s) still open; run with --drain first, then try again.`); process.exit(1); }
+    const { createPublicClient, http } = await import("viem");
+    const { csdNode } = await import("../src/csd-wallet.js");
+    const evm = privateKeyToAccount(env("MM_PRIVATE_KEY") as Hex).address;
+    const pub = createPublicClient({ transport: http(env("AON_EVM_RPC_URL")) });
+    const usdcAddr = getAddress(env("USDC_ADDRESS", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
+    const wu = await pub.readContract({ address: usdcAddr, abi: [{ type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ type: "address" }], outputs: [{ type: "uint256" }] }] as const, functionName: "balanceOf", args: [evm] }) as bigint;
+    // the inventory key, plus any sale keys whose CSD hasn't been swept into it yet
+    const keys = deriveCsdWallet(env("MM_CSD_SEED") as Hex);
+    const idx = [0, ...Object.values<any>(S.trades ?? {}).filter(t => t.kind === "sell" && t.keyIndex !== undefined && !t.swept && ["released", "done", "paid"].includes(t.status)).map(t => Number(t.keyIndex))];
+    const node = csdNode(env("CSD_API_URL", "http://127.0.0.1:8887"));
+    let wc = 0n;
+    for (const i of [...new Set(idx)]) for (const u of await node.utxosAt(keys.key(i).addr20, true)) wc += u.value;
+    const keepCsd = 10_000_000n; // 0.1 CSD left out for payment fees
+    console.log(`Wallet: ${Number(wu) / 1e6} USDC + ${Number(wc) / 1e8} CSD.`);
+    pu = wu; pc = wc > keepCsd ? wc - keepCsd : 0n;
+    if (pu <= 0n || pc <= 0n) { console.error("The wallet needs both USDC and CSD for a pool."); process.exit(1); }
+  }
   // Never counts more of either side than the pool has: at a higher price it counts less CSD, at a
   // lower one less USDC (the rest stays in the bot's wallet, unused; --top-up puts it back to work)
   let usdc = pu, csd = BigInt(Math.round(Number(pu) * 100 / price)); // (USDC has 6 decimals, CSD 8)
   if (csd > pc) { csd = pc; usdc = BigInt(Math.round(Number(pc) * price / 100)); }
-  const now = (Number(pu) / 1e6) / (Number(pc) / 1e8);
-  console.log(`Pool: ${Number(pu) / 1e6} USDC + ${Number(pc) / 1e8} CSD, price ${now.toFixed(4)}.`);
+  const cu = BigInt(S.pool.usdc), cc = BigInt(S.pool.csd);
+  console.log(`Pool: ${Number(cu) / 1e6} USDC + ${Number(cc) / 1e8} CSD, price ${((Number(cu) / 1e6) / (Number(cc) / 1e8)).toFixed(4)}.`);
   console.log(`New:  ${Number(usdc) / 1e6} USDC + ${Number(csd) / 1e8} CSD, price ${price}.` + (csd < pc ? ` (${(Number(pc - csd) / 1e8).toFixed(2)} CSD stays in the wallet, unused)` : usdc < pu ? ` (${(Number(pu - usdc) / 1e6).toFixed(2)} USDC stays in the wallet, unused)` : ""));
   if (!process.argv.includes("--yes")) { console.log("Rerun with --yes to make the change, then start the bot."); process.exit(0); }
   S.pool = { usdc: String(usdc), csd: String(csd) };
