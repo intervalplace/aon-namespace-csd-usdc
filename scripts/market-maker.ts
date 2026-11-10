@@ -64,10 +64,12 @@ if (process.argv.includes("--set-price")) {
   if (process.argv.includes("--from-wallet")) {
     const open = Object.values<any>(S.trades ?? {}).filter(t => t.kind === "buy" ? ["locking", "opening", "locked"].includes(t.status) : ["opening", "open", "paid"].includes(t.status));
     if (open.length) { console.error(`${open.length} trade(s) still open; run with --drain first, then try again.`); process.exit(1); }
-    const { createPublicClient, http } = await import("viem");
+    const { createPublicClient, http, fallback } = await import("viem");
     const { csdNode } = await import("../src/csd-wallet.js");
     const evm = privateKeyToAccount(env("MM_PRIVATE_KEY") as Hex).address;
-    const pub = createPublicClient({ transport: http(env("AON_EVM_RPC_URL")) });
+    // (AON_EVM_RPC_URL may list several, comma-separated, as the bot itself allows)
+    const urls = env("AON_EVM_RPC_URL").split(",").map(u => u.trim()).filter(Boolean);
+    const pub = createPublicClient({ transport: urls.length > 1 ? fallback(urls.map(u => http(u)), { retryCount: 1 }) : http(urls[0]) });
     const usdcAddr = getAddress(env("USDC_ADDRESS", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"));
     const wu = await pub.readContract({ address: usdcAddr, abi: [{ type: "function", name: "balanceOf", stateMutability: "view", inputs: [{ type: "address" }], outputs: [{ type: "uint256" }] }] as const, functionName: "balanceOf", args: [evm] }) as bigint;
     // the inventory key, plus any sale keys whose CSD hasn't been swept into it yet

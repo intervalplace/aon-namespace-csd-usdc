@@ -28,7 +28,7 @@ csd.mine({ rewardTo: inv, reward: 48_000n * 100_000_000n }); // 48,000 CSD
 
 const dir = mkdtempSync(join(tmpdir(), "mm-")), state = join(dir, "state.json");
 const run = (...args) => new Promise(res => execFile(process.execPath, ["--import", "tsx", fileURLToPath(new URL("../scripts/market-maker.ts", import.meta.url)), ...args],
-  { env: { ...process.env, MM_PRIVATE_KEY: MM_KEY, MM_CSD_SEED: SEED, AON_EVM_RPC_URL: RPC, USDC_ADDRESS: usdc, CSD_API_URL: csd.url, STATE_FILE: state } },
+  { env: { ...process.env, MM_PRIVATE_KEY: MM_KEY, MM_CSD_SEED: SEED, AON_EVM_RPC_URL: `http://127.0.0.1:1,${RPC}`, USDC_ADDRESS: usdc, CSD_API_URL: csd.url, STATE_FILE: state } },
   (err, out, errOut) => res({ code: err ? err.code ?? 1 : 0, out: out + errOut })));
 const pool = () => JSON.parse(readFileSync(state, "utf8")).pool;
 
